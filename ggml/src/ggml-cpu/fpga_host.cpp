@@ -14,8 +14,8 @@
 #include <unordered_map>
 
 // ================= CẤU HÌNH ĐỊA CHỈ (KV260 Bare-metal) =================
-constexpr uint64_t KERNEL_CTRL_BASE = 0xA0000000; 
-constexpr size_t   KERNEL_CTRL_SIZE = 65536; 
+constexpr uint64_t KERNEL_CTRL_BASE = 0x0400000000; 
+constexpr size_t   KERNEL_CTRL_SIZE = 4294967296; 
 
 // [THAY ĐỔI QUAN TRỌNG]
 // Dời địa chỉ vùng nhớ vật lý lên 2GB (0x80000000)
