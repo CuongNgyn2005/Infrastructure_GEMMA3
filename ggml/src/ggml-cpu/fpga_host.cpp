@@ -84,8 +84,6 @@ bool fpga_host_init(const std::string &xclbin_path, const std::string &kernel_na
     std::cout << "[DEBUG] mmap control base success: " << map_base << "\n";
     // NẾU NÓ CHẾT Ở DÒNG DƯỚI ĐÂY -> Lỗi do Bitstream/Cấu hình Vivado
     std::cout << "[DEBUG] Try to read Control Reg (0x00)...\n";
-    uint32_t status = reg_read(0x00); 
-    std::cout << "[DEBUG] Init: Control Reg (0x00) = 0x" << std::hex << status << std::dec << "\n";
     // Reset state
     g_buffers.clear();
     g_tensor_map.clear();
