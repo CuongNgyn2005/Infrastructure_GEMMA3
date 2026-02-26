@@ -1222,6 +1222,10 @@ void ggml_compute_forward_mul_mat(
 
     //  ---
 #ifdef USE_FPGA
+if (fpga_try_matmul(dst->src[0], dst->src[1], dst)) {
+        return; 
+    }
+   /*
     if (fpga_ready()) {
         struct ggml_tensor * src0 = dst->src[0]; // Ma trận A (Activation)
         struct ggml_tensor * src1 = dst->src[1]; // Ma trận B (Weight)
@@ -1319,6 +1323,7 @@ void ggml_compute_forward_mul_mat(
             }
         }
     }
+        */
 #endif
     // --- END TASK 5 (FPGA HOOK) ---
     const struct ggml_tensor * src0 = dst->src[0]; // ma tran nguon thu nhat 

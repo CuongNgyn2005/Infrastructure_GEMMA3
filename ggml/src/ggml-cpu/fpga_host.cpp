@@ -311,6 +311,115 @@ void* fpga_get_virt_addr(int idx) {
     if (idx < 0 || idx >= (int)g_buffers.size()) return nullptr;
     return g_buffers[idx].virt_addr;
 }
+// =========================================================================
+// PHẦN THÊM VÀO CHO BƯỚC 2: HÀM ALL-IN-ONE (LAZY OFFLOAD + COMPUTE)
+// =========================================================================
+#include "ggml.h"
+#include <vector>
+
+// Định nghĩa cấu trúc khối Q8_0 chuẩn của ggml (để tách d và qs)
+#ifndef QK8_0
+#define QK8_0 32
+typedef struct {
+    ggml_fp16_t d;      // scale (2 bytes)
+    int8_t  qs[QK8_0];  // quants (32 bytes)
+} block_q8_0;
+#endif
+
+// Hàm này được gọi từ file ggml-cpu.c (đó là lý do có extern "C")
+extern "C" int fpga_try_matmul(const struct ggml_tensor * weight, const struct ggml_tensor * activ, struct ggml_tensor * dst) {
+    if (!fpga_ready()) return 0;
+
+    // 1. Kiểm tra chính xác kiểu dữ liệu (Weight phải là Q8_0, Activation là F32, Đầu ra là F32)
+    if (weight->type != GGML_TYPE_Q8_0 || activ->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return 0; // Trả về 0 để CPU tự tính
+    }
+
+    const std::string s_name = weight->name;
+    BO_Pair bos_B = fpga_get_bo_idx_for_name(s_name);
+
+    // ==========================================================
+    // BƯỚC A: LAZY REPACK (Đẩy Weight xuống FPGA nếu chưa có)
+    // ==========================================================
+    if ((bos_B.d < 0 || bos_B.qs < 0) && weight->data != nullptr) {
+        size_t nelements = ggml_nelements(weight);
+        size_t n_blocks = nelements / 32;
+        
+        size_t size_d = n_blocks * 2; 
+        size_t size_qs = nelements;
+
+        // Cấp phát vector tạm trên CPU để tách d và qs
+        std::vector<uint16_t> temp_d(n_blocks); 
+        std::vector<int8_t> temp_qs(nelements);
+
+        const block_q8_0* src_data = (const block_q8_0*)weight->data;
+
+        // Tách Scale (d) và Quants (qs) từ data gốc
+        for (size_t i = 0; i < n_blocks; ++i) {
+            temp_d[i] = src_data[i].d; 
+            for (int j = 0; j < 32; ++j) {
+                temp_qs[i*32 + j] = src_data[i].qs[j]; 
+            }
+        }
+
+        // Xin RAM trên FPGA
+        int bo_d_idx = fpga_alloc_bo(size_d);
+        int bo_qs_idx = fpga_alloc_bo(size_qs);
+        
+        if (bo_d_idx >= 0 && bo_qs_idx >= 0) {
+            // Ghi dữ liệu xuống FPGA
+            fpga_bo_write(bo_d_idx, temp_d.data(), size_d);
+            fpga_bo_write(bo_qs_idx, temp_qs.data(), size_qs);
+            
+            // Lưu lại index để lần sau không cần nạp lại
+            fpga_register_tensor_bo(s_name, bo_d_idx, bo_qs_idx);
+            bos_B = {bo_d_idx, bo_qs_idx};
+            
+            printf("[FPGA] Lazy Offloaded Weight: %s (d=%zu bytes, qs=%zu bytes)\n", s_name.c_str(), size_d, size_qs);
+        } else {
+            printf("[FPGA-WARN] Het RAM FPGA khi cap phat cho %s\n", s_name.c_str());
+            return 0; // Lỗi RAM FPGA, fallback CPU
+        }
+    }
+
+    // ==========================================================
+    // BƯỚC B: TÍNH TOÁN TRÊN FPGA
+    // ==========================================================
+    if (bos_B.d >= 0 && bos_B.qs >= 0) {
+        // Lấy buffer toàn cục cho Activation (A) và Kết quả (C)
+        int bo_A_idx = fpga_get_global_bo_A_idx();
+        int bo_C_idx = fpga_get_global_bo_C_idx();
+
+        if (bo_A_idx >= 0 && bo_C_idx >= 0) {
+            // Lấy đúng Kích thước chuẩn từ 2 ma trận theo cấu trúc GGML
+            const int K = weight->ne[0];
+            const int N = weight->ne[1];
+            const int M = activ->ne[1]; // M là Batch Size / Token Count
+
+            // Kiểm tra khớp chiều ma trận
+            if (activ->ne[0] != K || dst->ne[0] != N || dst->ne[1] != M) {
+                 return 0; // Nếu kích thước lạ, trả về CPU tính
+            }
+
+            // Ghi Activation (đầu vào) xuống FPGA
+            size_t bytes_A = ggml_nbytes(activ);
+            if (fpga_bo_write(bo_A_idx, activ->data, bytes_A)) {
+                
+                // Kích hoạt Kernel (Chạy nhân ma trận)
+                if (fpga_run_matmul(bo_A_idx, bos_B.d, bos_B.qs, bo_C_idx, M, K, N)) {
+                    
+                    // Đọc kết quả C về CPU
+                    size_t bytes_C = ggml_nbytes(dst);
+                    if (fpga_bo_read(bo_C_idx, dst->data, bytes_C)) {
+                        return 1; // 1 = FPGA ĐÃ TÍNH XONG THÀNH CÔNG!
+                    }
+                }
+            }
+        }
+    }
+
+    return 0; // Nếu có bất kỳ bước nào thất bại, trả về 0 để CPU làm nốt
+}
 /*
 #include "fpga_host.h"
 #include <fcntl.h>

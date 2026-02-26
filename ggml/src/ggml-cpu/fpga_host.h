@@ -1,3 +1,4 @@
+/*
 #ifndef FPGA_HOST_H
 #define FPGA_HOST_H
 
@@ -47,4 +48,46 @@ int fpga_get_global_bo_C_idx();
 // --- KET THUC TASK 4 -------- 
 void* fpga_get_virt_addr(int idx); 
 void* fpga_get_virt_addr(int idx); 
+#endif // FPGA_HOST_H
+*/
+#ifndef FPGA_HOST_H
+#define FPGA_HOST_H
+
+// Các include C++ chỉ nằm trong block này
+#ifdef __cplusplus
+#include <string>
+#include <cstddef>
+
+bool fpga_host_init(const std::string &xclbin_path, const std::string &kernel_name, std::string &err);
+void fpga_host_shutdown();
+bool fpga_ready();
+int fpga_alloc_bo(size_t bytes, int bank = 0);
+bool fpga_bo_write(int idx, const void * src, size_t nbytes);
+bool fpga_bo_read(int idx, void * dst, size_t nbytes);
+bool fpga_run_matmul(int bo_A, int bo_B_d, int bo_B_qs, int bo_C, int M, int K, int N);
+
+struct BO_Pair { int d; int qs; };
+void fpga_register_tensor_bo(const std::string &name, int bo_d_idx, int bo_qs_idx);
+BO_Pair fpga_get_bo_idx_for_name(const std::string &name);
+
+bool fpga_create_global_buffers(size_t n_ctx, size_t n_ff, std::string &err);
+int fpga_get_global_bo_A_idx();
+int fpga_get_global_bo_C_idx();
+void* fpga_get_virt_addr(int idx);
+#endif // __cplusplus
+
+// --- API DÀNH RIÊNG CHO GGML-CPU.C (Chuẩn C thuần) ---
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+struct ggml_tensor;
+
+// Trả về 1 nếu FPGA đã xử lý thành công, trả về 0 nếu cần fallback về CPU
+int fpga_try_matmul(const struct ggml_tensor * weight, const struct ggml_tensor * activ, struct ggml_tensor * dst);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif // FPGA_HOST_H
