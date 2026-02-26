@@ -1227,47 +1227,89 @@ void ggml_compute_forward_mul_mat(
         struct ggml_tensor * src1 = dst->src[1]; // Ma trận B (Weight)
 
         // ĐIỀU KIỆN KÍCH HOẠT FPGA:
-        // A là Float32, B là Q8_0, C là Float32 (Đã cập nhật theo kernel mới của bạn)
         if (src0->type == GGML_TYPE_F32 && 
             src1->type == GGML_TYPE_Q8_0 &&
             dst->type  == GGML_TYPE_F32) {
 
-            // Lấy 2 Buffer Object (BO) của trọng số B (Data và Scale)
+            // Lấy 2 Buffer Object (BO) của trọng số B
             BO_Pair bos_B = fpga_get_bo_idx_for_name(src1->name);
 
-            // Kiểm tra xem trọng số này đã được đẩy xuống FPGA chưa (Task 3)
+            // ==============================================================
+            // BƯỚC 1: LAZY REPACK & OFFLOAD (Làm thay Task 3 cũ)
+            // Nếu bos_B.d < 0 nghĩa là tensor này chưa được đẩy xuống FPGA
+            // ==============================================================
+            if ((bos_B.d < 0 || bos_B.qs < 0) && src1->data != nullptr) {
+                const std::string s_name = src1->name;
+                size_t nelements = ggml_nelements(src1);
+                size_t n_blocks = nelements / 32; // QK8_0 = 32
+                
+                size_t size_d = n_blocks * 2; 
+                size_t size_qs = nelements;
+
+                // Cấp phát Buffer tạm trên CPU để tách d và qs
+                std::vector<uint16_t> temp_d(n_blocks); 
+                std::vector<int8_t> temp_qs(nelements);
+
+                const block_q8_0* src_data = (const block_q8_0*)src1->data;
+
+                // Tách Scale (d) và Quants (qs)
+                for (size_t i = 0; i < n_blocks; ++i) {
+                    temp_d[i] = src_data[i].d; 
+                    for (int j = 0; j < 32; ++j) {
+                        temp_qs[i*32 + j] = src_data[i].qs[j]; 
+                    }
+                }
+
+                // Cấp phát và ghi xuống FPGA
+                int bo_d_idx = fpga_alloc_bo(size_d);
+                int bo_qs_idx = fpga_alloc_bo(size_qs);
+                
+                if (bo_d_idx >= 0 && bo_qs_idx >= 0) {
+                    fpga_bo_write(bo_d_idx, temp_d.data(), size_d);
+                    fpga_bo_write(bo_qs_idx, temp_qs.data(), size_qs);
+                    
+                    // Lưu lại để lần sau không phải nạp lại nữa
+                    fpga_register_tensor_bo(s_name, bo_d_idx, bo_qs_idx);
+                    bos_B = {bo_d_idx, bo_qs_idx}; // Cập nhật lại bos_B ngay lập tức
+                    
+                    printf("[FPGA] Lazy Offloaded Tensor: %s (d=%zu, qs=%zu)\n", s_name.c_str(), size_d, size_qs);
+                } else {
+                    FPGA_LOG_WARN("Loi cap phat RAM FPGA cho Tensor %s", s_name.c_str());
+                }
+            }
+
+            // ==============================================================
+            // BƯỚC 2: CHẠY KERNEL TÍNH TOÁN (Giữ nguyên logic của bạn)
+            // ==============================================================
             if (bos_B.d >= 0 && bos_B.qs >= 0) {
-                // Lấy BO toàn cục cho A và C (Task 4)
                 int bo_A_idx = fpga_get_global_bo_A_idx();
                 int bo_C_idx = fpga_get_global_bo_C_idx();
 
                 if (bo_A_idx < 0 || bo_C_idx < 0) {
                     FPGA_LOG_WARN("BOs toan cuc A/C khong hop le. Fallback ve CPU.");
                 } else {
-                    // Lấy kích thước ma trận
                     const int M = src0->ne[1];
                     const int K = src0->ne[0];
                     const int N = src1->ne[1];
 
-                    // Kiểm tra sơ bộ kích thước tensor để đảm bảo khớp
                     if (src1->ne[0] != K || dst->ne[1] != M || dst->ne[0] != N) {
                          FPGA_LOG_WARN("Kich thuoc tensor khong khop (%s). Fallback ve CPU.", dst->name);
                     } else {
-                        // 1. Ghi dữ liệu A (src0) xuống FPGA
+                        // 2.1 Ghi dữ liệu A (Activation) xuống FPGA
                         size_t bytes_A = ggml_nbytes(src0);
                         if (!fpga_bo_write(bo_A_idx, src0->data, bytes_A)) {
                             FPGA_LOG_WARN("Loi ghi BO A (%s).", dst->name);
                         } else {
-                            // 2. Chạy kernel trên FPGA
+                            // 2.2 Chạy kernel trên FPGA
                             if (!fpga_run_matmul(bo_A_idx, bos_B.d, bos_B.qs, bo_C_idx, M, K, N)) {
                                 FPGA_LOG_WARN("Loi chay kernel (%s).", dst->name);
                             } else {
-                                // 3. Đọc kết quả C về CPU
+                                // 2.3 Đọc kết quả C về CPU
                                 size_t bytes_C = ggml_nbytes(dst);
                                 if (!fpga_bo_read(bo_C_idx, dst->data, bytes_C)) {
                                     FPGA_LOG_WARN("Loi doc BO C (%s).", dst->name);
                                 } else {
-                                    // THÀNH CÔNG! Bỏ qua tính toán CPU
+                                    // THÀNH CÔNG RỰC RỠ! Kết thúc hàm tại đây, bỏ qua CPU
                                     return; 
                                 }
                             }
