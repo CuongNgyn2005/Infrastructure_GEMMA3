@@ -253,7 +253,7 @@ BO_Pair fpga_get_bo_idx_for_name(const std::string &name) {
     }
     return {-1, -1};
 }
-
+/*
 bool fpga_create_global_buffers(size_t n_ctx, size_t n_ff, std::string &err) {
     // A và C đều là float (4 bytes)
     size_t bytes_A = n_ctx * n_ff * 4;
@@ -273,6 +273,39 @@ int fpga_get_global_bo_A_idx() { return g_bo_A_idx; }
 int fpga_get_global_bo_C_idx() { return g_bo_C_idx; }
 
 // Helper để ghi trực tiếp (Tránh OOM)
+void* fpga_get_virt_addr(int idx) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (idx < 0 || idx >= (int)g_buffers.size()) return nullptr;
+    return g_buffers[idx].virt_addr;
+}
+    */
+   bool fpga_create_global_buffers(size_t n_ctx, size_t n_ff, std::string &err) {
+    // Hàm này giờ không cần làm gì nữa vì ta sẽ cấp phát tự động ở dưới
+    return true; 
+}
+
+static std::mutex s_global_bo_mtx;
+
+int fpga_get_global_bo_A_idx() {
+    std::lock_guard<std::mutex> lk(s_global_bo_mtx);
+    if (g_bo_A_idx < 0) {
+        // Cấp phát 64MB (Dư sức chứa cho các ma trận cực lớn)
+        g_bo_A_idx = fpga_alloc_bo(64 * 1024 * 1024); 
+        printf("[FPGA] Lazy Allocated Global BO A (64MB)\n");
+    }
+    return g_bo_A_idx;
+}
+
+int fpga_get_global_bo_C_idx() {
+    std::lock_guard<std::mutex> lk(s_global_bo_mtx);
+    if (g_bo_C_idx < 0) {
+        // Cấp phát 64MB cho ma trận kết quả
+        g_bo_C_idx = fpga_alloc_bo(64 * 1024 * 1024);
+        printf("[FPGA] Lazy Allocated Global BO C (64MB)\n");
+    }
+    return g_bo_C_idx;
+}
+
 void* fpga_get_virt_addr(int idx) {
     std::lock_guard<std::mutex> lk(g_mutex);
     if (idx < 0 || idx >= (int)g_buffers.size()) return nullptr;
