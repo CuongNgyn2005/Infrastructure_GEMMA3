@@ -221,7 +221,8 @@ int main(int argc, char ** argv) {
     ctx = llama_init.context.get();
 
     // --- BẮT ĐẦU CODE TASK 4 ---
-#ifdef USE_FPGA
+
+ /*#ifdef USE_FPGA
     if (fpga_ready() && model != nullptr) {
         // LAY HPARAM TU MODEL VUA LOAD 
        // const auto & hparams = llama_model_get_hparams(model);
@@ -246,6 +247,7 @@ int main(int argc, char ** argv) {
         }
     }
 #endif
+*/
     // --- END  TASK 4 ---
 
     if (model == NULL) {
