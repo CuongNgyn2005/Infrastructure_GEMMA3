@@ -1222,6 +1222,12 @@ void ggml_compute_forward_mul_mat(
 
     //  ---
 #ifdef USE_FPGA
+// Thêm dòng in này để biết file .c có nhận cờ USE_FPGA không
+    static int hook_count = 0;
+    if (hook_count < 5) { // Chỉ in 5 lần cho đỡ trôi màn hình
+        printf("\n[DEBUG-HOOK] Da vao hook FPGA trong ggml-cpu.c!\n");
+        hook_count++;
+    }
 if (fpga_try_matmul(dst->src[0], dst->src[1], dst)) {
         return; 
     }
