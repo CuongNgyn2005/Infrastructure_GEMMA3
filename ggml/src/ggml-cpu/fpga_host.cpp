@@ -446,7 +446,7 @@ extern "C" int fpga_try_matmul(const struct ggml_tensor * weight, const struct g
                         return 1; // 1 = FPGA ĐÃ TÍNH XONG THÀNH CÔNG!
                     }
                         */
-                printf("[FPGA] Kich hoat Kernel MatMul (M=%d, K=%d, N=%d)...\n", M, K, N);
+                       printf("[FPGA] Kich hoat Kernel MatMul (M=%d, K=%d, N=%d)...\n", M, K, N);
                 if (fpga_run_matmul(bo_A_idx, bos_B.d, bos_B.qs, bo_C_idx, M, K, N)) {
                     
                     // printf("[FPGA] Kernel chay xong! Dang doc C ve CPU...\n");
@@ -455,6 +455,7 @@ extern "C" int fpga_try_matmul(const struct ggml_tensor * weight, const struct g
                         printf("[FPGA] Tinh toan hoan tat!\n");
                         return 1; // THÀNH CÔNG!
                     }
+                }
                 }
             }
         }
