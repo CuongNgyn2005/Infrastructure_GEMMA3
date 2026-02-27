@@ -329,7 +329,13 @@ typedef struct {
 // Hàm này được gọi từ file ggml-cpu.c (đó là lý do có extern "C")
 extern "C" int fpga_try_matmul(const struct ggml_tensor * weight, const struct ggml_tensor * activ, struct ggml_tensor * dst) {
     if (!fpga_ready()) return 0;
-
+// --- BẮT ĐẦU SPY CODE ---
+    static int spy_count = 0;
+    if (spy_count < 10) { // In ra thông tin 10 ma trận đầu tiên đi qua đây
+        printf("[FPGA-SPY] Tensor: %s | Weight_Type: %d (Q8_0=%d) | Activ_Type: %d (F32=%d) | Dst_Type: %d\n", 
+               weight->name, weight->type, GGML_TYPE_Q8_0, activ->type, GGML_TYPE_F32, dst->type);
+        spy_count++;
+    }
     // 1. Kiểm tra chính xác kiểu dữ liệu (Weight phải là Q8_0, Activation là F32, Đầu ra là F32)
     if (weight->type != GGML_TYPE_Q8_0 || activ->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return 0; // Trả về 0 để CPU tự tính
