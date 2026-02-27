@@ -12,7 +12,27 @@
 #include <iostream>
 #include <cstring>
 #include <unordered_map>
-
+// =======================================================================
+// HÀM COPY AN TOÀN CHO ARM64 BAREMETAL (Chống Bus Error)
+// =======================================================================
+static void safe_io_memcpy(void* dst, const void* src, size_t n) {
+    volatile uint32_t* d32 = (volatile uint32_t*)dst;
+    const uint32_t* s32 = (const uint32_t*)src;
+    size_t n32 = n / 4;
+    
+    // Copy từng khối 4-byte (Bypass NEON SIMD của ARM)
+    for (size_t i = 0; i < n32; i++) {
+        d32[i] = s32[i];
+    }
+    
+    // Copy các byte lẻ còn lại (nếu có)
+    volatile uint8_t* d8 = (volatile uint8_t*)(d32 + n32);
+    const uint8_t* s8 = (const uint8_t*)(s32 + n32);
+    size_t n8 = n % 4;
+    for (size_t i = 0; i < n8; i++) {
+        d8[i] = s8[i];
+    }
+}
 // ================= CẤU HÌNH ĐỊA CHỈ (KV260 Bare-metal) =================
 constexpr uint64_t KERNEL_CTRL_BASE = 0xA0000000;
 constexpr size_t   KERNEL_CTRL_SIZE = 65536;
@@ -169,7 +189,10 @@ bool fpga_bo_write(int idx, const void * src, size_t nbytes) {
     if (idx < 0 || idx >= (int)g_buffers.size()) return false;
     MemBuffer &buf = g_buffers[idx];
     if (nbytes > buf.size) nbytes = buf.size;
-    std::memcpy(buf.virt_addr, src, nbytes);
+    
+    // ĐỔI SANG HÀM AN TOÀN TRÁNH BUS ERROR
+    safe_io_memcpy(buf.virt_addr, src, nbytes);
+    
     return true;
 #else
     return false;
@@ -182,7 +205,10 @@ bool fpga_bo_read(int idx, void * dst, size_t nbytes) {
     if (idx < 0 || idx >= (int)g_buffers.size()) return false;
     MemBuffer &buf = g_buffers[idx];
     if (nbytes > buf.size) nbytes = buf.size;
-    std::memcpy(dst, buf.virt_addr, nbytes);
+    
+    // ĐỔI SANG HÀM AN TOÀN TRÁNH BUS ERROR
+    safe_io_memcpy(dst, buf.virt_addr, nbytes);
+    
     return true;
 #else
     return false;
@@ -415,9 +441,19 @@ extern "C" int fpga_try_matmul(const struct ggml_tensor * weight, const struct g
                 if (fpga_run_matmul(bo_A_idx, bos_B.d, bos_B.qs, bo_C_idx, M, K, N)) {
                     
                     // Đọc kết quả C về CPU
-                    size_t bytes_C = ggml_nbytes(dst);
+                    /*size_t bytes_C = ggml_nbytes(dst);
                     if (fpga_bo_read(bo_C_idx, dst->data, bytes_C)) {
                         return 1; // 1 = FPGA ĐÃ TÍNH XONG THÀNH CÔNG!
+                    }
+                        */
+                printf("[FPGA] Kich hoat Kernel MatMul (M=%d, K=%d, N=%d)...\n", M, K, N);
+                if (fpga_run_matmul(bo_A_idx, bos_B.d, bos_B.qs, bo_C_idx, M, K, N)) {
+                    
+                    // printf("[FPGA] Kernel chay xong! Dang doc C ve CPU...\n");
+                    size_t bytes_C = ggml_nbytes(dst);
+                    if (fpga_bo_read(bo_C_idx, dst->data, bytes_C)) {
+                        printf("[FPGA] Tinh toan hoan tat!\n");
+                        return 1; // THÀNH CÔNG!
                     }
                 }
             }
