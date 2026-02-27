@@ -1,6 +1,6 @@
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
-
+#define USE_FPGA 1 
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "traits.h"
