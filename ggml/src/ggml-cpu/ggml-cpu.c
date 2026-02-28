@@ -1228,7 +1228,7 @@ void ggml_compute_forward_mul_mat(
         printf("\n[DEBUG-HOOK] Da vao hook FPGA trong ggml-cpu.c!\n");
         hook_count++;
     }
-if (fpga_try_matmul(dst->src[0], dst->src[1], dst)) {
+if (fpga_try_matmul(dst->src[0], dst->src[1], dst,params->ith)) {
         return; 
     }
    /*
