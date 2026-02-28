@@ -84,8 +84,7 @@ extern "C" {
 struct ggml_tensor;
 
 // Trả về 1 nếu FPGA đã xử lý thành công, trả về 0 nếu cần fallback về CPU
-int fpga_try_matmul(const struct ggml_tensor * weight, const struct ggml_tensor * activ, struct ggml_tensor * dst);
-
+int fpga_try_matmul(const struct ggml_tensor * weight, const struct ggml_tensor * activ, struct ggml_tensor * dst, int ith);
 #ifdef __cplusplus
 }
 #endif
