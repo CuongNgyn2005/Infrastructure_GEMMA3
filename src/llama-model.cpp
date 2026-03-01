@@ -2320,7 +2320,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     // 'new_tensor' là tensor vừa được tạo, dữ liệu của nó (new_tensor->data)
                     // bây giờ đã ở trên CPU.
                   // --- BẮT ĐẦU CODE TASK 3 (ĐÃ SỬA LỖI LOG) ---
-#ifdef USE_FPGA
+ /*#ifdef USE_FPGA
     if (fpga_ready() && new_tensor != nullptr) {
         if (new_tensor->type == GGML_TYPE_Q8_0) {
             
@@ -2376,6 +2376,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 #endif
+*/
 // ...
                     // --- KẾT THÚC CODE TASK 3 ---
                     
