@@ -64,12 +64,13 @@ int fpga_alloc_bo(size_t bytes, int bank = 0);
 bool fpga_bo_write(int idx, const void * src, size_t nbytes);
 bool fpga_bo_read(int idx, void * dst, size_t nbytes);
 
-// [SỬA LỖI]: Trả về đúng 3 con trỏ A, B, C thay vì tách B
-bool fpga_run_matmul(int bo_A, int bo_B, int bo_C, int M, int K, int N);
+// [TRẢ VỀ 4 CON TRỎ CHO KHỚP VỚI KERNEL HLS CŨ]
+bool fpga_run_matmul(int bo_A, int bo_B_d, int bo_B_qs, int bo_C, int M, int K, int N);
 
-// [SỬA LỖI]: Đăng ký 1 BO cho Tensor (Không dùng BO_Pair nữa)
-void fpga_register_tensor_bo(const std::string &name, int bo_idx);
-int fpga_get_bo_idx_for_name(const std::string &name);
+// Trả về BO_Pair
+struct BO_Pair { int d; int qs; };
+void fpga_register_tensor_bo(const std::string &name, int bo_d_idx, int bo_qs_idx);
+BO_Pair fpga_get_bo_idx_for_name(const std::string &name);
 
 bool fpga_create_global_buffers(size_t n_ctx, size_t n_ff, std::string &err);
 int fpga_get_global_bo_A_idx();

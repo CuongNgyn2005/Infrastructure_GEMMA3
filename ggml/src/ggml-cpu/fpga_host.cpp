@@ -1,4 +1,3 @@
-// FPGA host implementation.
 #include "fpga_host.h"
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -30,12 +29,10 @@ static std::vector<MemBuffer> g_buffers;
 static uint64_t g_current_phy_offset = 0;
 static std::mutex g_mutex;
 static bool g_ready = false;
-static std::unordered_map<std::string, int> g_tensor_map; 
+static std::unordered_map<std::string, BO_Pair> g_tensor_map; 
 
 static int g_bo_A_idx = -1;
 static int g_bo_C_idx = -1;
-
-// Khóa riêng cho Global BO để tránh Deadlock
 static std::mutex s_global_bo_mtx;
 
 // --- HÀM COPY AN TOÀN BAREMETAL ARM ---
@@ -43,15 +40,11 @@ static void safe_io_memcpy(void* dst, const void* src, size_t n) {
     volatile uint32_t* d32 = (volatile uint32_t*)dst;
     const uint32_t* s32 = (const uint32_t*)src;
     size_t n32 = n / 4;
-    for (size_t i = 0; i < n32; i++) {
-        d32[i] = s32[i];
-    }
+    for (size_t i = 0; i < n32; i++) { d32[i] = s32[i]; }
     volatile uint8_t* d8 = (volatile uint8_t*)(d32 + n32);
     const uint8_t* s8 = (const uint8_t*)(s32 + n32);
     size_t n8 = n % 4;
-    for (size_t i = 0; i < n8; i++) {
-        d8[i] = s8[i];
-    }
+    for (size_t i = 0; i < n8; i++) { d8[i] = s8[i]; }
 }
 
 static void reg_write(int offset, uint32_t value) {
@@ -73,14 +66,11 @@ bool fpga_host_init(const std::string &xclbin_path, const std::string &kernel_na
     std::lock_guard<std::mutex> lk(g_mutex);
 #ifdef USE_FPGA
     (void)xclbin_path; (void)kernel_name;
-    
     if ((g_mem_fd = open("/dev/mem", O_RDWR | O_SYNC)) == -1) {
         err = "Cannot open /dev/mem"; return false;
     }
     void* map_base = mmap(0, KERNEL_CTRL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, g_mem_fd, KERNEL_CTRL_BASE);
-    if (map_base == MAP_FAILED) {
-        close(g_mem_fd); return false;
-    }
+    if (map_base == MAP_FAILED) { close(g_mem_fd); return false; }
     g_ctrl_base_virt = map_base;
     g_buffers.clear(); g_tensor_map.clear(); g_current_phy_offset = 0;
     
@@ -147,75 +137,77 @@ bool fpga_bo_read(int idx, void * dst, size_t nbytes) {
 #endif
 }
 
-bool fpga_run_matmul(int bo_A, int bo_B, int bo_C, int M, int K, int N) {
+// [GỬI 4 CON TRỎ VÀO ĐÚNG TỌA ĐỘ AXI CỦA BITSTREAM CŨ]
+bool fpga_run_matmul(int bo_A, int bo_B_d, int bo_B_qs, int bo_C, int M, int K, int N) {
     std::lock_guard<std::mutex> lk(g_mutex);
 #ifdef USE_FPGA
     if (!g_ready) return false;
     
-    uint64_t addr_A = g_buffers[bo_A].phy_addr + VIVADO_MASTER_OFFSET;
-    uint64_t addr_B = g_buffers[bo_B].phy_addr + VIVADO_MASTER_OFFSET;
-    uint64_t addr_C = g_buffers[bo_C].phy_addr + VIVADO_MASTER_OFFSET;
+    uint64_t addr_A    = g_buffers[bo_A].phy_addr + VIVADO_MASTER_OFFSET;
+    uint64_t addr_B_d  = g_buffers[bo_B_d].phy_addr + VIVADO_MASTER_OFFSET;
+    uint64_t addr_B_qs = g_buffers[bo_B_qs].phy_addr + VIVADO_MASTER_OFFSET;
+    uint64_t addr_C    = g_buffers[bo_C].phy_addr + VIVADO_MASTER_OFFSET;
 
     reg_write(0x10, (uint32_t)(addr_A & 0xFFFFFFFF)); 
     reg_write(0x14, (uint32_t)(addr_A >> 32));
     
-    reg_write(0x1c, (uint32_t)(addr_B & 0xFFFFFFFF)); 
-    reg_write(0x20, (uint32_t)(addr_B >> 32));
+    reg_write(0x1c, (uint32_t)(addr_B_d & 0xFFFFFFFF)); 
+    reg_write(0x20, (uint32_t)(addr_B_d >> 32));
     
-    reg_write(0x28, (uint32_t)(addr_C & 0xFFFFFFFF)); 
-    reg_write(0x2c, (uint32_t)(addr_C >> 32));
+    reg_write(0x28, (uint32_t)(addr_B_qs & 0xFFFFFFFF)); 
+    reg_write(0x2c, (uint32_t)(addr_B_qs >> 32));
+
+    reg_write(0x34, (uint32_t)(addr_C & 0xFFFFFFFF)); 
+    reg_write(0x38, (uint32_t)(addr_C >> 32));
     
-    reg_write(0x34, (uint32_t)M); 
-    reg_write(0x3c, (uint32_t)K); 
-    reg_write(0x44, (uint32_t)N);
+    reg_write(0x40, (uint32_t)M); 
+    reg_write(0x48, (uint32_t)K); 
+    reg_write(0x50, (uint32_t)N);
 
     // Kích hoạt kernel
     reg_write(0x00, 1);
 
-    // Đợi kernel tính xong
     int timeout = 10000000;
     while (timeout-- > 0) {
         if ((reg_read(0x00) & 0x6)) return true;
     }
     printf("\n[FPGA-ERROR] Timeout Kernel!\n");
+    fflush(stdout); // Ép in lỗi ra màn hình ngay lập tức
     return false;
 #else
     return false;
 #endif
 }
 
-void fpga_register_tensor_bo(const std::string &name, int bo_idx) {
+void fpga_register_tensor_bo(const std::string &name, int bo_d_idx, int bo_qs_idx) {
     std::lock_guard<std::mutex> lk(g_mutex);
-    g_tensor_map[name] = bo_idx;
+    g_tensor_map[name] = {bo_d_idx, bo_qs_idx};
 }
 
-int fpga_get_bo_idx_for_name(const std::string &name) {
+BO_Pair fpga_get_bo_idx_for_name(const std::string &name) {
     std::lock_guard<std::mutex> lk(g_mutex);
     auto it = g_tensor_map.find(name);
     if (it != g_tensor_map.end()) return it->second;
-    return -1;
+    return {-1, -1};
 }
 
 bool fpga_create_global_buffers(size_t n_ctx, size_t n_ff, std::string &err) {
     (void)n_ctx; (void)n_ff; (void)err; return true; 
 }
 
-// [FIX DEADLOCK]: Sử dụng s_global_bo_mtx thay vì g_mutex
 int fpga_get_global_bo_A_idx() {
     std::lock_guard<std::mutex> lk(s_global_bo_mtx); 
     if (g_bo_A_idx < 0) {
-        g_bo_A_idx = fpga_alloc_bo(64 * 1024 * 1024); 
-        printf("[FPGA] Allocated Global BO A (64MB)\n");
+        // Giảm xuống 16MB để tiết kiệm RAM vật lý cho FPGA
+        g_bo_A_idx = fpga_alloc_bo(16 * 1024 * 1024); 
     }
     return g_bo_A_idx;
 }
 
-// [FIX DEADLOCK]: Sử dụng s_global_bo_mtx thay vì g_mutex
 int fpga_get_global_bo_C_idx() {
     std::lock_guard<std::mutex> lk(s_global_bo_mtx);
     if (g_bo_C_idx < 0) {
-        g_bo_C_idx = fpga_alloc_bo(64 * 1024 * 1024);
-        printf("[FPGA] Allocated Global BO C (64MB)\n");
+        g_bo_C_idx = fpga_alloc_bo(16 * 1024 * 1024);
     }
     return g_bo_C_idx;
 }
@@ -226,8 +218,16 @@ void* fpga_get_virt_addr(int idx) {
     return g_buffers[idx].virt_addr;
 }
 
+#ifndef QK8_0
+#define QK8_0 32
+typedef struct {
+    ggml_fp16_t d;
+    int8_t  qs[QK8_0];
+} block_q8_0;
+#endif
+
 // =========================================================================
-// HÀM XỬ LÝ CHÍNH ĐÃ GỠ DEADLOCK
+// HÀM XỬ LÝ CHÍNH KHÔI PHỤC REPACK (KHỚP BITSTREAM CŨ)
 // =========================================================================
 extern "C" int fpga_try_matmul(const struct ggml_tensor * weight, const struct ggml_tensor * activ, struct ggml_tensor * dst, int ith) {
     if (!fpga_ready()) return 0;
@@ -239,37 +239,58 @@ extern "C" int fpga_try_matmul(const struct ggml_tensor * weight, const struct g
     const int M = activ->ne[1]; 
     if (activ->ne[0] != K || dst->ne[0] != N || dst->ne[1] != M) return 0;
 
+    // Chặn đa luồng
     if (ith != 0) { return 1; }
 
     const std::string s_name = weight->name;
-    int bo_B_idx = fpga_get_bo_idx_for_name(s_name);
+    BO_Pair bos_B = fpga_get_bo_idx_for_name(s_name);
 
-    if (bo_B_idx < 0 && weight->data != nullptr) {
-        size_t bytes_B = ggml_nbytes(weight); 
-        bo_B_idx = fpga_alloc_bo(bytes_B);
+    if ((bos_B.d < 0 || bos_B.qs < 0) && weight->data != nullptr) {
+        size_t nelements = ggml_nelements(weight);
+        size_t n_blocks = nelements / 32;
+        size_t size_d = n_blocks * 2; 
+        size_t size_qs = nelements;
+
+        // Repack ra CPU RAM (Sẽ không OOM vì ta đã cài SWAP)
+        std::vector<uint16_t> temp_d(n_blocks); 
+        std::vector<int8_t> temp_qs(nelements);
+        const block_q8_0* src_data = (const block_q8_0*)weight->data;
+
+        for (size_t i = 0; i < n_blocks; ++i) {
+            temp_d[i] = src_data[i].d; 
+            for (int j = 0; j < 32; ++j) {
+                temp_qs[i*32 + j] = src_data[i].qs[j]; 
+            }
+        }
+
+        int bo_d_idx = fpga_alloc_bo(size_d);
+        int bo_qs_idx = fpga_alloc_bo(size_qs);
         
-        if (bo_B_idx >= 0) {
-            fpga_bo_write(bo_B_idx, weight->data, bytes_B);
-            fpga_register_tensor_bo(s_name, bo_B_idx);
-            printf("[FPGA] Offloaded Weight: %s (%zu bytes)\n", s_name.c_str(), bytes_B);
+        if (bo_d_idx >= 0 && bo_qs_idx >= 0) {
+            fpga_bo_write(bo_d_idx, temp_d.data(), size_d);
+            fpga_bo_write(bo_qs_idx, temp_qs.data(), size_qs);
+            fpga_register_tensor_bo(s_name, bo_d_idx, bo_qs_idx);
+            bos_B = {bo_d_idx, bo_qs_idx};
+            
+            printf("[FPGA] Offloaded Weight: %s\n", s_name.c_str());
+            fflush(stdout); // Ép in ra màn hình ngay lập tức
         } else {
-            return 0;
+            return 0; // Hết RAM FPGA
         }
     }
 
-    if (bo_B_idx >= 0) {
-        int bo_A_idx = fpga_get_global_bo_A_idx(); // Hết kẹt Deadlock
-        int bo_C_idx = fpga_get_global_bo_C_idx(); // Hết kẹt Deadlock
+    if (bos_B.d >= 0 && bos_B.qs >= 0) {
+        int bo_A_idx = fpga_get_global_bo_A_idx();
+        int bo_C_idx = fpga_get_global_bo_C_idx();
 
         if (bo_A_idx >= 0 && bo_C_idx >= 0) {
             size_t bytes_A = ggml_nbytes(activ);
             if (fpga_bo_write(bo_A_idx, activ->data, bytes_A)) {
                 
-                // Bỏ comment dòng in này để xem Kernel chạy thật
                 printf("[FPGA] Running Kernel %s (M=%d, K=%d, N=%d)...\n", s_name.c_str(), M, K, N);
+                fflush(stdout); // Ép in ra màn hình ngay lập tức
                 
-                if (fpga_run_matmul(bo_A_idx, bo_B_idx, bo_C_idx, M, K, N)) {
-                    
+                if (fpga_run_matmul(bo_A_idx, bos_B.d, bos_B.qs, bo_C_idx, M, K, N)) {
                     size_t bytes_C = ggml_nbytes(dst);
                     if (fpga_bo_read(bo_C_idx, dst->data, bytes_C)) {
                         return 1; // THÀNH CÔNG RỰC RỠ!
