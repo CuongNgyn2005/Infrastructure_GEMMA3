@@ -64,10 +64,9 @@ int fpga_alloc_bo(size_t bytes, int bank = 0);
 bool fpga_bo_write(int idx, const void * src, size_t nbytes);
 bool fpga_bo_read(int idx, void * dst, size_t nbytes);
 
-// [TRẢ VỀ 4 CON TRỎ CHO KHỚP VỚI KERNEL HLS CŨ]
+// Phải có 4 con trỏ (A, B_d, B_qs, C) cho khớp Bitstream HLS
 bool fpga_run_matmul(int bo_A, int bo_B_d, int bo_B_qs, int bo_C, int M, int K, int N);
 
-// Trả về BO_Pair
 struct BO_Pair { int d; int qs; };
 void fpga_register_tensor_bo(const std::string &name, int bo_d_idx, int bo_qs_idx);
 BO_Pair fpga_get_bo_idx_for_name(const std::string &name);
@@ -76,12 +75,13 @@ bool fpga_create_global_buffers(size_t n_ctx, size_t n_ff, std::string &err);
 int fpga_get_global_bo_A_idx();
 int fpga_get_global_bo_C_idx();
 void* fpga_get_virt_addr(int idx);
-#endif // __cplusplus
+#endif 
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 struct ggml_tensor;
+// Phải có biến int ith ở cuối cùng!
 int fpga_try_matmul(const struct ggml_tensor * weight, const struct ggml_tensor * activ, struct ggml_tensor * dst, int ith);
 #ifdef __cplusplus
 }
