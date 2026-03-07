@@ -1,3 +1,4 @@
+// FPGA host implementation.
 #include "fpga_host.h"
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -7,21 +8,22 @@
 #include <iostream>
 #include <cstring>
 #include <unordered_map>
-#include "ggml.h"
 
-// ================= CẤU HÌNH ĐỊA CHỈ TỐI THƯỢNG =================
+// ================= CẤU HÌNH ĐỊA CHỈ (DỰA THEO VIVADO CỦA BẠN) =================
 constexpr uint64_t KERNEL_CTRL_BASE = 0xA0000000;
 constexpr size_t   KERNEL_CTRL_SIZE = 65536;
 
-// [QUAN TRỌNG NHẤT]: Chuyển vùng nhớ lên Mốc 32GB (DDR HIGH)
-// Cách ly hoàn toàn 100% khỏi Linux, sửa triệt để lỗi sập nguồn!
-constexpr uint64_t PHY_MEM_BASE = 0x800000000ULL; 
+// [QUAN TRỌNG NHẤT 1] - Đưa lên vùng DDR_HIGH (Mốc 32GB)
+// Tránh xa hoàn toàn vùng RAM 2GB của Linux. Tuyệt đối không còn sập nguồn!
+constexpr uint64_t PHY_MEM_BASE     = 0x800000000ULL; 
 
-// Hàm chuyển đổi tọa độ CPU (0x8...) sang tọa độ FPGA (0x5...) theo Vivado
-inline uint64_t get_fpga_axi_addr(uint64_t cpu_phy_addr) {
-    return cpu_phy_addr - 0x800000000ULL + 0x500000000ULL;
+// [QUAN TRỌNG NHẤT 2] - Hàm dịch địa chỉ từ CPU sang FPGA
+// CPU ghi ở mốc 32GB (0x8_0000_0000)
+// FPGA đọc ở mốc 20GB (0x5_0000_0000) theo đúng ảnh Vivado của bạn!
+inline uint64_t cpu_to_fpga_axi(uint64_t cpu_phy) {
+    return cpu_phy - 0x800000000ULL + 0x500000000ULL;
 }
-// ================================================================
+// ==============================================================================
 
 struct MemBuffer {
     uint64_t phy_addr; 
@@ -36,13 +38,31 @@ static std::vector<MemBuffer> g_buffers;
 static uint64_t g_current_phy_offset = 0;
 static std::mutex g_mutex;
 static bool g_ready = false;
-static std::unordered_map<std::string, BO_Pair> g_tensor_map; 
+
+static std::unordered_map<std::string, BO_Pair> g_tensor_map;
 
 static int g_bo_A_idx = -1;
 static int g_bo_C_idx = -1;
 static std::mutex s_global_bo_mtx;
 
-// --- HÀM COPY AN TOÀN BAREMETAL ARM (Bypass NEON SIMD) ---
+// --- Hàm ghi thanh ghi ---
+static void reg_write(int offset, uint32_t value) {
+    if (g_ctrl_base_virt) {
+        volatile uint32_t* ptr = (volatile uint32_t*)((char*)g_ctrl_base_virt + offset);
+        *ptr = value;
+    }
+}
+
+// --- Hàm đọc thanh ghi ---
+static uint32_t reg_read(int offset) {
+    if (g_ctrl_base_virt) {
+        volatile uint32_t* ptr = (volatile uint32_t*)((char*)g_ctrl_base_virt + offset);
+        return *ptr;
+    }
+    return 0;
+}
+
+// --- Hàm Copy An toàn (Bypass ARM NEON để tránh Bus Error) ---
 static void safe_io_memcpy(void* dst, const void* src, size_t n) {
     volatile uint32_t* d32 = (volatile uint32_t*)dst;
     const uint32_t* s32 = (const uint32_t*)src;
@@ -54,30 +74,21 @@ static void safe_io_memcpy(void* dst, const void* src, size_t n) {
     for (size_t i = 0; i < n8; i++) { d8[i] = s8[i]; }
 }
 
-static void reg_write(int offset, uint32_t value) {
-    if (g_ctrl_base_virt) {
-        volatile uint32_t* ptr = (volatile uint32_t*)((char*)g_ctrl_base_virt + offset);
-        *ptr = value;
-    }
-}
-
-static uint32_t reg_read(int offset) {
-    if (g_ctrl_base_virt) {
-        volatile uint32_t* ptr = (volatile uint32_t*)((char*)g_ctrl_base_virt + offset);
-        return *ptr;
-    }
-    return 0;
-}
-
 bool fpga_host_init(const std::string &xclbin_path, const std::string &kernel_name, std::string &err) {
     std::lock_guard<std::mutex> lk(g_mutex);
 #ifdef USE_FPGA
     (void)xclbin_path; (void)kernel_name;
+    
     if ((g_mem_fd = open("/dev/mem", O_RDWR | O_SYNC)) == -1) {
-        err = "Cannot open /dev/mem"; return false;
+        err = "Cannot open /dev/mem. Are you root (sudo)?";
+        return false;
     }
     void* map_base = mmap(0, KERNEL_CTRL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, g_mem_fd, KERNEL_CTRL_BASE);
-    if (map_base == MAP_FAILED) { close(g_mem_fd); return false; }
+    if (map_base == MAP_FAILED) {
+        err = "mmap control register failed";
+        close(g_mem_fd);
+        return false;
+    }
     g_ctrl_base_virt = map_base;
     g_buffers.clear(); g_tensor_map.clear(); g_current_phy_offset = 0;
     
@@ -106,6 +117,7 @@ int fpga_alloc_bo(size_t bytes, int bank) {
 #ifdef USE_FPGA
     (void)bank;
     if (!g_ready) return -1;
+
     uint64_t phy_addr = PHY_MEM_BASE + g_current_phy_offset;
     void* virt_addr = mmap(0, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, g_mem_fd, phy_addr);
     if (virt_addr == MAP_FAILED) return -1;
@@ -144,34 +156,34 @@ bool fpga_bo_read(int idx, void * dst, size_t nbytes) {
 #endif
 }
 
-// Chạy Kernel với tọa độ đã dịch theo Vivado
+// Chạy Kernel (Đã dịch địa chỉ qua cpu_to_fpga_axi)
 bool fpga_run_matmul(int bo_A, int bo_B_d, int bo_B_qs, int bo_C, int M, int K, int N) {
     std::lock_guard<std::mutex> lk(g_mutex);
 #ifdef USE_FPGA
     if (!g_ready) return false;
     
-    uint64_t addr_A    = get_fpga_axi_addr(g_buffers[bo_A].phy_addr);
-    uint64_t addr_B_d  = get_fpga_axi_addr(g_buffers[bo_B_d].phy_addr);
-    uint64_t addr_B_qs = get_fpga_axi_addr(g_buffers[bo_B_qs].phy_addr);
-    uint64_t addr_C    = get_fpga_axi_addr(g_buffers[bo_C].phy_addr);
+    // Ép kiểu dịch tọa độ trước khi truyền vào thanh ghi
+    uint64_t addr_A    = cpu_to_fpga_axi(g_buffers[bo_A].phy_addr);
+    uint64_t addr_B_d  = cpu_to_fpga_axi(g_buffers[bo_B_d].phy_addr);
+    uint64_t addr_B_qs = cpu_to_fpga_axi(g_buffers[bo_B_qs].phy_addr);
+    uint64_t addr_C    = cpu_to_fpga_axi(g_buffers[bo_C].phy_addr);
 
-    reg_write(0x10, (uint32_t)(addr_A & 0xFFFFFFFF)); 
+    reg_write(0x10, (uint32_t)(addr_A & 0xFFFFFFFF));
     reg_write(0x14, (uint32_t)(addr_A >> 32));
-    
-    reg_write(0x1c, (uint32_t)(addr_B_d & 0xFFFFFFFF)); 
+
+    reg_write(0x1c, (uint32_t)(addr_B_d & 0xFFFFFFFF));
     reg_write(0x20, (uint32_t)(addr_B_d >> 32));
-    
-    reg_write(0x28, (uint32_t)(addr_B_qs & 0xFFFFFFFF)); 
+
+    reg_write(0x28, (uint32_t)(addr_B_qs & 0xFFFFFFFF));
     reg_write(0x2c, (uint32_t)(addr_B_qs >> 32));
 
-    reg_write(0x34, (uint32_t)(addr_C & 0xFFFFFFFF)); 
+    reg_write(0x34, (uint32_t)(addr_C & 0xFFFFFFFF));
     reg_write(0x38, (uint32_t)(addr_C >> 32));
-    
-    reg_write(0x40, (uint32_t)M); 
-    reg_write(0x48, (uint32_t)K); 
+
+    reg_write(0x40, (uint32_t)M);
+    reg_write(0x48, (uint32_t)K);
     reg_write(0x50, (uint32_t)N);
 
-    // Kích hoạt kernel
     reg_write(0x00, 1);
 
     int timeout = 10000000;
@@ -203,14 +215,18 @@ bool fpga_create_global_buffers(size_t n_ctx, size_t n_ff, std::string &err) {
 }
 
 int fpga_get_global_bo_A_idx() {
-    std::lock_guard<std::mutex> lk(s_global_bo_mtx); 
-    if (g_bo_A_idx < 0) g_bo_A_idx = fpga_alloc_bo(16 * 1024 * 1024); 
+    std::lock_guard<std::mutex> lk(s_global_bo_mtx);
+    if (g_bo_A_idx < 0) {
+        g_bo_A_idx = fpga_alloc_bo(16 * 1024 * 1024); 
+    }
     return g_bo_A_idx;
 }
 
 int fpga_get_global_bo_C_idx() {
     std::lock_guard<std::mutex> lk(s_global_bo_mtx);
-    if (g_bo_C_idx < 0) g_bo_C_idx = fpga_alloc_bo(16 * 1024 * 1024);
+    if (g_bo_C_idx < 0) {
+        g_bo_C_idx = fpga_alloc_bo(16 * 1024 * 1024);
+    }
     return g_bo_C_idx;
 }
 
@@ -220,29 +236,31 @@ void* fpga_get_virt_addr(int idx) {
     return g_buffers[idx].virt_addr;
 }
 
+// =========================================================================
+// HÀM XỬ LÝ CHÍNH
+// =========================================================================
+#include "ggml.h"
+
 #ifndef QK8_0
 #define QK8_0 32
 typedef struct {
-    ggml_fp16_t d;
-    int8_t  qs[QK8_0];
+    ggml_fp16_t d;     
+    int8_t  qs[QK8_0]; 
 } block_q8_0;
 #endif
 
-// =========================================================================
-// HÀM XỬ LÝ CHÍNH 
-// =========================================================================
 extern "C" int fpga_try_matmul(const struct ggml_tensor * weight, const struct ggml_tensor * activ, struct ggml_tensor * dst, int ith) {
     if (!fpga_ready()) return 0;
 
     if (weight->type != GGML_TYPE_Q8_0 || activ->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return 0;
-    
+
     const int K = weight->ne[0];
     const int N = weight->ne[1];
     const int M = activ->ne[1]; 
     if (activ->ne[0] != K || dst->ne[0] != N || dst->ne[1] != M) return 0;
 
-    // Chặn luồng 1, 2, 3 tránh tràn RAM
-    if (ith != 0) { return 1; }
+    // CHẶN ĐA LUỒNG
+    if (ith != 0) return 1;
 
     const std::string s_name = weight->name;
     BO_Pair bos_B = fpga_get_bo_idx_for_name(s_name);
@@ -250,11 +268,13 @@ extern "C" int fpga_try_matmul(const struct ggml_tensor * weight, const struct g
     if ((bos_B.d < 0 || bos_B.qs < 0) && weight->data != nullptr) {
         size_t nelements = ggml_nelements(weight);
         size_t n_blocks = nelements / 32;
+        
         size_t size_d = n_blocks * 2; 
         size_t size_qs = nelements;
 
         std::vector<uint16_t> temp_d(n_blocks); 
         std::vector<int8_t> temp_qs(nelements);
+
         const block_q8_0* src_data = (const block_q8_0*)weight->data;
 
         for (size_t i = 0; i < n_blocks; ++i) {
@@ -270,13 +290,15 @@ extern "C" int fpga_try_matmul(const struct ggml_tensor * weight, const struct g
         if (bo_d_idx >= 0 && bo_qs_idx >= 0) {
             fpga_bo_write(bo_d_idx, temp_d.data(), size_d);
             fpga_bo_write(bo_qs_idx, temp_qs.data(), size_qs);
+            
             fpga_register_tensor_bo(s_name, bo_d_idx, bo_qs_idx);
             bos_B = {bo_d_idx, bo_qs_idx};
             
-            printf("[FPGA] Offloaded: %s\n", s_name.c_str());
-            fflush(stdout); // Ép in ra màn hình
+            printf("[FPGA] Offloaded Weight: %s\n", s_name.c_str());
+            fflush(stdout); // Ép in ra ngay lập tức
         } else {
-            return 0; // Hết RAM FPGA
+            printf("[FPGA-WARN] Het RAM cho %s\n", s_name.c_str());
+            return 0; 
         }
     }
 
@@ -288,17 +310,16 @@ extern "C" int fpga_try_matmul(const struct ggml_tensor * weight, const struct g
             size_t bytes_A = ggml_nbytes(activ);
             if (fpga_bo_write(bo_A_idx, activ->data, bytes_A)) {
                 
-                printf("[FPGA] Run Kernel %s (M=%d, K=%d, N=%d)...\n", s_name.c_str(), M, K, N);
-                fflush(stdout); 
-                
+                // printf("[FPGA] Run Kernel %s (M=%d, K=%d, N=%d)...\n", s_name.c_str(), M, K, N);
                 if (fpga_run_matmul(bo_A_idx, bos_B.d, bos_B.qs, bo_C_idx, M, K, N)) {
+                    
                     size_t bytes_C = ggml_nbytes(dst);
                     if (fpga_bo_read(bo_C_idx, dst->data, bytes_C)) {
-                        return 1; // THÀNH CÔNG RỰC RỠ!
+                        return 1; // THÀNH CÔNG!
                     }
                 }
             }
         }
     }
-    return 0; 
+    return 0;
 }
