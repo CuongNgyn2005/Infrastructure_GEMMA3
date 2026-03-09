@@ -8,7 +8,7 @@
 #include <stdio.h>
 #include <time.h>
 #include "ggml.h"
-
+#include <stdlib.h>
 // ── Q8_0 block layout (khớp với ggml internal) ────────
 #define QK8_0 32
 typedef struct {
@@ -185,51 +185,54 @@ int fpga_run_matmul(
 
 // ─────────────────────────────────────────────────────────
 int fpga_try_matmul(
-    struct ggml_tensor * src0,   // weight B  (Q8_0)
-    struct ggml_tensor * src1,   // activation A (F32)
-    struct ggml_tensor * dst,    // output C (F32)
+    struct ggml_tensor * src0,
+    struct ggml_tensor * src1,
+    struct ggml_tensor * dst,
     int ith)
 {
-    // ── Bước 1: Kiểm tra kiểu dữ liệu ───────────────────
+    // Bước 1: Kiểm tra kiểu dữ liệu
     if (src0->type != GGML_TYPE_Q8_0) return 0;
     if (src1->type != GGML_TYPE_F32)  return 0;
     if (dst->type  != GGML_TYPE_F32)  return 0;
 
-    // ── Bước 2: Kích thước ───────────────────────────────
+    // Bước 2: Chỉ xử lý 2D matmul (batch=1)
+    if (src0->ne[2] != 1 || src1->ne[2] != 1) return 0;
+
+    // Bước 3: Kích thước
     const int64_t K = src0->ne[0];
     const int64_t N = src0->ne[1];
     const int64_t M = src1->ne[1];
 
-    // Fallback CPU nếu vượt giới hạn FPGA kernel
-    if (K > FPGA_MAX_K || N > FPGA_MAX_N || M > FPGA_MAX_M) {
-        // In lần đầu để biết layer nào bị skip
-        static int skip_logged = 0;
-        if (!skip_logged) {
-            fprintf(stderr, "[FPGA] skip (K=%lld N=%lld M=%lld > limit) → CPU\n",
-                    (long long)K, (long long)N, (long long)M);
-            skip_logged = 1;
+    // Bước 4: Giới hạn tuyệt đối
+    if (K > FPGA_MAX_K || N > FPGA_MAX_N || M > FPGA_MAX_M) return 0;
+
+    // Bước 5: *** QUAN TRỌNG *** Phải là bội của tile size
+    // M=1 (decode phase) sẽ fallback CPU — đây là hành vi đúng
+    if (M % 16 != 0 || K % 64 != 0 || N % 64 != 0) {
+        static int align_logged = 0;
+        if (!align_logged) {
+            fprintf(stderr,
+                "[FPGA] tile-align skip M=%lld K=%lld N=%lld → CPU\n",
+                (long long)M, (long long)K, (long long)N);
+            align_logged = 1;
         }
         return 0;
     }
 
-    // ── Bước 3: Thread phụ trả về sớm ───────────────────
-    // FIX: phải check ith TRƯỚC khi repack để tránh 4 threads
-    // ghi đồng thời vào g_B_d_buf / g_B_qs_buf (race condition)
-    if (ith != 0) return 1;  // thread 0 sẽ lo phần này
+    // Bước 6: Thread phụ return sớm
+    if (ith != 0) return 1;
 
-    // ── Bước 4: Repack Q8_0 → B_d + B_qs (chỉ thread 0) ─
+    // Bước 7: Repack
     const int num_blocks = (int)((K * N) / QK8_0);
     const block_q8_0_t* blocks = (const block_q8_0_t*)src0->data;
-
     for (int i = 0; i < num_blocks; i++) {
         g_B_d_buf[i] = blocks[i].d;
         memcpy(&g_B_qs_buf[i * QK8_0], blocks[i].qs, QK8_0);
     }
 
-    // ── Bước 5: Gọi FPGA kernel ──────────────────────────
+    // Bước 8: Chạy FPGA
     const float* A = (const float*)src1->data;
     float*       C = (float*)dst->data;
-
     return fpga_run_matmul(A, g_B_d_buf, g_B_qs_buf, C,
                            (int)M, (int)K, (int)N, ith);
 }
