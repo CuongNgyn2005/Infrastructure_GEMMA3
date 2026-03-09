@@ -607,12 +607,12 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         # The compiler automatically enables "-ffast-math" which can cause NaNs in tests due to "-fassociative-math"
         target_compile_options(${GGML_CPU_NAME} PRIVATE "-fno-associative-math")
     endif() 
-     if (USE_FPGA)
-        target_sources(${GGML_CPU_NAME} PRIVATE
-            ${GGML_CPU_DIR}/fpga_host.cpp
-        )
-        target_compile_definitions(${GGML_CPU_NAME} PRIVATE USE_FPGA)
-        target_link_libraries(${GGML_CPU_NAME} PRIVATE pthread)
-    endif()
+    if (USE_FPGA)
+    target_sources(${GGML_CPU_NAME} PRIVATE
+        "${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu/fpga_host.cpp"
+    )
+    target_compile_definitions(${GGML_CPU_NAME} PRIVATE USE_FPGA)
+    target_link_libraries(${GGML_CPU_NAME} PRIVATE pthread)
+endif()
 endfunction()
 
