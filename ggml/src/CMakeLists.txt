@@ -1,6 +1,6 @@
 include(CheckCXXCompilerFlag)
 include("../cmake/common.cmake")
-
+option(USE_FPGA "Enable FPGA acceleration via /dev/mem" OFF)
 add_compile_definitions(GGML_SCHED_MAX_COPIES=${GGML_SCHED_MAX_COPIES})
 
 # enable libstdc++ assertions for debug builds

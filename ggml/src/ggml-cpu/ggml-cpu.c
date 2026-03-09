@@ -1213,7 +1213,18 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
-
+#ifdef USE_FPGA
+static int              g_fpga_initialized = 0;
+static pthread_once_t   g_fpga_once        = PTHREAD_ONCE_INIT;
+static void do_fpga_init(void) {
+    if (fpga_init() == 0) {
+        g_fpga_initialized = 1;
+        fprintf(stderr, "[FPGA] Kernel ready!\n");
+    } else {
+        fprintf(stderr, "[FPGA] init FAILED, fallback to CPU\n");
+    }
+}
+#endif
     
     // ---  (FPGA HOOK) ---
 void ggml_compute_forward_mul_mat(
@@ -1222,24 +1233,20 @@ void ggml_compute_forward_mul_mat(
 
     //  ---
 #ifdef USE_FPGA
-    static int fpga_initialized = 0;
-    static pthread_once_t fpga_once = PTHREAD_ONCE_INIT;
-    // Hàm init chỉ chạy đúng 1 lần, thread-safe
-    static void do_fpga_init(void) {
-        if (fpga_init() == 0) fpga_initialized = 1;
-        else fprintf(stderr, "[FPGA] init FAILED, fallback to CPU\n");
-    }
-    pthread_once(&fpga_once, do_fpga_init);
-// Thêm dòng in này để biết file .c có nhận cờ USE_FPGA không
+    pthread_once(&g_fpga_once, do_fpga_init);  // thread-safe, chạy 1 lần
+
     static int hook_count = 0;
-    if (hook_count < 5) { // Chỉ in 5 lần cho đỡ trôi màn hình
-        printf("\n[DEBUG-HOOK] Da vao hook FPGA trong ggml-cpu.c!\n");
+    if (hook_count < 5) {
+        printf("[DEBUG-HOOK] FPGA hook active (initialized=%d)\n", g_fpga_initialized);
         hook_count++;
     }
-if (fpga_initialized && fpga_try_matmul(dst->src[0], dst->src[1], dst, params->ith)) {
-    return;
-}
+
+    if (g_fpga_initialized &&
+        fpga_try_matmul(dst->src[0], dst->src[1], dst, params->ith)) {
+        return;
+    }
 #endif
+
     // --- END TASK 5 (FPGA HOOK) ---
     const struct ggml_tensor * src0 = dst->src[0]; // ma tran nguon thu nhat 
     const struct ggml_tensor * src1 = dst->src[1]; // ma tran nguon thu hai 
