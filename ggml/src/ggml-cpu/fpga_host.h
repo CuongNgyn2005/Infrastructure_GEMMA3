@@ -1,90 +1,23 @@
-/*
-#ifndef FPGA_HOST_H
-#define FPGA_HOST_H
-
-#include <string>
-#include <cstddef>
-
-// Initialize FPGA host. If successful, return true. Otherwise set
-// `err` to a human-readable message and return false.
-bool fpga_host_init(const std::string &xclbin_path, const std::string &kernel_name, std::string &err);
-
-// Shutdown / cleanup
-void fpga_host_shutdown();
-
-// Returns true if FPGA layer is initialized and ready.
-bool fpga_ready();
-
-// Allocate a BO on the device. Returns index >= 0 on success, -1 on failure.
-int fpga_alloc_bo(size_t bytes, int bank = 0);
-
-// Write to BO at index
-bool fpga_bo_write(int idx, const void * src, size_t nbytes);
-
-// Read from BO at index
-bool fpga_bo_read(int idx, void * dst, size_t nbytes);
-
-// [THAY ĐỔI] Hàm chạy kernel nhận 2 chỉ số cho B: bo_B_d (Scale) và bo_B_qs (Data)
-bool fpga_run_matmul(int bo_A, int bo_B_d, int bo_B_qs, int bo_C, int M, int K, int N);
-
-// [THAY ĐỔI] Đăng ký 2 chỉ số BO cho một tensor
-void fpga_register_tensor_bo(const std::string &name, int bo_d_idx, int bo_qs_idx);
-
-// [THAY ĐỔI] Lấy struct chứa cặp chỉ số (dùng để trả về từ map)
-struct BO_Pair { int d; int qs; };
-BO_Pair fpga_get_bo_idx_for_name(const std::string &name);
-
-
-// =============== TASK 4============== 
-// CAP PHAT BOS TOAN CUC CHO ACTIVATIONS (A) VA RESULTS (C) 
-// DUA TREN KICH THUOC TOI DA CUA MODEL ( LAY TU HPARAMS )
-bool fpga_create_global_buffers(size_t n_ctx, size_t n_ff, std::string &err);
-
-// LAY INDEX CUA BO (A) TOAN CUC 
-int fpga_get_global_bo_A_idx();
-
-// LAY INDEX CUA BO (C) TOAN CU 
-int fpga_get_global_bo_C_idx();
-// --- KET THUC TASK 4 -------- 
-void* fpga_get_virt_addr(int idx); 
-void* fpga_get_virt_addr(int idx); 
-#endif // FPGA_HOST_H
-*/
-#ifndef FPGA_HOST_H
-#define FPGA_HOST_H
-
-#ifdef __cplusplus
-#include <string>
-#include <cstddef>
-
-bool fpga_host_init(const std::string &xclbin_path, const std::string &kernel_name, std::string &err);
-void fpga_host_shutdown();
-bool fpga_ready();
-int fpga_alloc_bo(size_t bytes, int bank = 0);
-bool fpga_bo_write(int idx, const void * src, size_t nbytes);
-bool fpga_bo_read(int idx, void * dst, size_t nbytes);
-
-// Phải có 4 con trỏ (A, B_d, B_qs, C) cho khớp Bitstream HLS
-bool fpga_run_matmul(int bo_A, int bo_B_d, int bo_B_qs, int bo_C, int M, int K, int N);
-
-struct BO_Pair { int d; int qs; };
-void fpga_register_tensor_bo(const std::string &name, int bo_d_idx, int bo_qs_idx);
-BO_Pair fpga_get_bo_idx_for_name(const std::string &name);
-
-bool fpga_create_global_buffers(size_t n_ctx, size_t n_ff, std::string &err);
-int fpga_get_global_bo_A_idx();
-int fpga_get_global_bo_C_idx();
-void* fpga_get_virt_addr(int idx);
-#endif 
-
+#pragma once
 #ifdef __cplusplus
 extern "C" {
 #endif
-struct ggml_tensor;
-// Phải có biến int ith ở cuối cùng!
-int fpga_try_matmul(const struct ggml_tensor * weight, const struct ggml_tensor * activ, struct ggml_tensor * dst, int ith);
+
+// Khởi tạo một lần khi app start
+int  fpga_init(void);
+void fpga_cleanup(void);
+
+// Gọi từ ggml_compute_forward_mul_mat
+// Trả về 1 nếu thành công, 0 nếu fallback CPU
+int fpga_run_matmul(
+    const float*    A,      // activation matrix (float32)
+    const uint16_t* B_d,    // weight scales (Q8_0 block scale)
+    const int8_t*   B_qs,   // weight quants (Q8_0 block data)
+    float*          C,      // output matrix
+    int M, int K, int N,
+    int ith                 // thread id — chỉ chạy nếu ith==0
+);
+
 #ifdef __cplusplus
 }
 #endif
-
-#endif // FPGA_HOST_H
