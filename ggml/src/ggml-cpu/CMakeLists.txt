@@ -607,7 +607,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_compile_options(${GGML_CPU_NAME} PRIVATE "-fno-associative-math")
     endif() 
 
-     if (USE_FPGA)
+    if (USE_FPGA)
         target_sources(${GGML_CPU_NAME} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/fpga_host.cpp
         )
