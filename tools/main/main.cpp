@@ -143,62 +143,7 @@ int main(int argc, char ** argv) {
     // load the model and apply lora adapter, if any
     LOG_INF("%s: load the model and apply lora adapter, if any\n", __func__);
 
-    // Initialize FPGA host (non-fatal). Reads configuration from environment
-    // variables so we don't need to rebuild when moving between PC and ZCU102.
-    // Environment variables (optional): FPGA_XCLBIN, FPGA_KERNEL
-    // =============================== UP DATE DUONG DAN THEO SET ENVIROMENT VARIABLE =============
-    /*
-            # Build without FPGA (stubs only - to verify syntax)
-        cmake -S . -B build_ver2 -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        cmake --build build_ver2 --target llama-cli -j
 
-        # Build with FPGA support (on ZCU102 or cross-compile env)  
-        cmake -S . -B build_ver2 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_FPGA=ON
-        cmake --build build_ver2 --target llama-cli -j
-
-        # Run (example - adjust paths)
-        $env:FPGA_XCLBIN="/path/to/kernal_forward.xclbin" 
-        $env:FPGA_KERNEL="KERNAL_FORWARD_0"
-        ./build_ver2/bin/llama-cli -m model.gguf -p "test"
-    */
-
-
-    /*
-    #ifdef USE_FPGA
-    {
-        const char *env_xclbin = std::getenv("FPGA_XCLBIN");
-        const char *env_kernel = std::getenv("FPGA_KERNEL");
-        std::string xclbin_path = env_xclbin ? env_xclbin : "/lib/firmware/kernal_forward.xclbin";
-        std::string kernel_name = env_kernel ? env_kernel : "KERNAL_FORWARD";
-
-        std::string fpga_err;
-        if (fpga_host_init(xclbin_path, kernel_name, fpga_err)) {
-            LOG_INF("%s: FPGA host initialized: xclbin=%s kernel=%s\n", __func__, xclbin_path.c_str(), kernel_name.c_str());
-        } else {
-            LOG_WRN("%s: FPGA host init failed or not enabled: %s\n", __func__, fpga_err.c_str());
-        }
-    }
-        #endif
-  */ 
-   // Initialize FPGA host (non-fatal)
-   //============================= UPDATE TEN KERNAL TRUC TIEP ===================
-   /*
-   #ifdef USE_FPGA
-    {
-        // Fixed paths for FPGA bitstream and kernel
-        std::string xclbin_path = "lib/firmware/kernal_forward.xclbin";  // <-- Thay đường dẫn này
-        std::string kernel_name = "KERNAL_FORWARD_0";  // 
-
-        std::string fpga_err;
-        if (fpga_host_init(xclbin_path, kernel_name, fpga_err)) {
-            LOG_INF("%s: FPGA host initialized: xclbin=%s kernel=%s\n", __func__, xclbin_path.c_str(), kernel_name.c_str());
-        } else {
-            LOG_WRN("%s: FPGA host init failed or not enabled: %s\n", __func__, fpga_err.c_str());
-        }
-    }
-
-#endif
-*/ 
 #ifdef USE_FPGA
     {
         // Đường dẫn này giờ vô nghĩa với code mới, nhưng cần để hàm ko lỗi
@@ -207,7 +152,7 @@ int main(int argc, char ** argv) {
 
         std::string fpga_err;
         // Hàm này giờ chỉ làm nhiệm vụ mmap /dev/mem
-        if (fpga_host_init(xclbin_path, kernel_name, fpga_err)) {
+        if (fpga_init(xclbin_path, kernel_name, fpga_err)) {
             LOG_INF("%s: FPGA host initialized (Bare-metal mode)\n", __func__);
         } else {
             LOG_WRN("%s: FPGA host init failed: %s\n", __func__, fpga_err.c_str());
@@ -1098,7 +1043,7 @@ int main(int argc, char ** argv) {
 
      // Shutdown FPGA host
     #ifdef USE_FPGA
-    fpga_host_shutdown();
+    fpga_cleanup();
     #endif
     return 0;
 }
