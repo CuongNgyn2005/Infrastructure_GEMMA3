@@ -7,7 +7,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include "ggml.h"
-
+#include "time.h"
 #define QK8_0 32
 typedef struct {
     uint16_t d;          // scale (fp16 dưới dạng raw bits)
@@ -95,7 +95,7 @@ int fpga_run_matmul(
     float* C, int M, int K, int N, int ith)
 {
     if (ith != 0) return 1;  // chỉ thread 0
-
+     if (!g_ctrl || g_ctrl == MAP_FAILED) return 0;
     pthread_mutex_lock(&g_mutex);
 
     size_t sz_A   = (size_t)M * K * sizeof(float);
@@ -125,7 +125,18 @@ int fpga_run_matmul(
     wr32(REG_CTRL, 0x1);  // AP_START
 
     // Chờ AP_DONE (bit1=1)
-    while (!(rd32(REG_CTRL) & 0x2));
+    struct timespec t0, t1;
+clock_gettime(CLOCK_MONOTONIC, &t0);
+while (!(rd32(REG_CTRL) & 0x2)) {
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000
+                    + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    if (elapsed_ms > 5000) {
+        fprintf(stderr, "[FPGA] TIMEOUT waiting AP_DONE! Fallback CPU.\n");
+        pthread_mutex_unlock(&g_mutex);
+        return 0;
+    }
+}
 
     // Đọc kết quả về
     memcpy(C, g_buf_C, sz_C);

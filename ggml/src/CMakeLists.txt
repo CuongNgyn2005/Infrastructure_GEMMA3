@@ -419,10 +419,10 @@ if (BUILD_SHARED_LIBS)
 endif()
 # [THÊM ĐOẠN NÀY VÀO CUỐI FILE]
 if (USE_FPGA)
-    # Thêm fpga_host.cpp vào thư viện ggml chính
-    # Lưu ý đường dẫn: file nằm trong thư mục con ggml-cpu/
-    target_sources(ggml PRIVATE ggml-cpu/fpga_host.cpp)
-    
-    # Định nghĩa USE_FPGA ở mức PUBLIC để ggml-cpu và llama đều thấy
-    target_compile_definitions(ggml PUBLIC USE_FPGA)
+    target_compile_definitions(ggml-cpu PRIVATE USE_FPGA)
+    target_sources(ggml-cpu PRIVATE
+        ggml/src/ggml-cpu/fpga_host.cpp
+    )
+    # Link pthread (cần cho mutex)
+    target_link_libraries(ggml-cpu PRIVATE pthread)
 endif()

@@ -1223,22 +1223,22 @@ void ggml_compute_forward_mul_mat(
     //  ---
 #ifdef USE_FPGA
     static int fpga_initialized = 0;
-    if (!fpga_initialized) {
-        if (fpga_init() == 0) {
-            fpga_initialized = 1;
-        }
-        // Nếu init thất bại → tự động fallback CPU
+    static pthread_once_t fpga_once = PTHREAD_ONCE_INIT;
+    // Hàm init chỉ chạy đúng 1 lần, thread-safe
+    static void do_fpga_init(void) {
+        if (fpga_init() == 0) fpga_initialized = 1;
+        else fprintf(stderr, "[FPGA] init FAILED, fallback to CPU\n");
     }
+    pthread_once(&fpga_once, do_fpga_init);
 // Thêm dòng in này để biết file .c có nhận cờ USE_FPGA không
     static int hook_count = 0;
     if (hook_count < 5) { // Chỉ in 5 lần cho đỡ trôi màn hình
         printf("\n[DEBUG-HOOK] Da vao hook FPGA trong ggml-cpu.c!\n");
         hook_count++;
     }
-if (fpga_try_matmul(dst->src[0], dst->src[1], dst,params->ith)) {
-        return; 
-    }
- 
+if (fpga_initialized && fpga_try_matmul(dst->src[0], dst->src[1], dst, params->ith)) {
+    return;
+}
 #endif
     // --- END TASK 5 (FPGA HOOK) ---
     const struct ggml_tensor * src0 = dst->src[0]; // ma tran nguon thu nhat 
