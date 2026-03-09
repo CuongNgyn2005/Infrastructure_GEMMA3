@@ -12,6 +12,7 @@ function(ggml_add_cpu_backend_features cpu_name arch)
     target_link_libraries(${cpu_name} PRIVATE ${GGML_CPU_FEATS_NAME})
 endfunction()
 
+set(GGML_CPU_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 function(ggml_add_cpu_backend_variant_impl tag_name)
     if (tag_name)
         set(GGML_CPU_NAME ggml-cpu-${tag_name})
