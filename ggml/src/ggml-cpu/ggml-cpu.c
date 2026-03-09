@@ -3616,8 +3616,3 @@ void ggml_cpu_init(void) {
 
     ggml_critical_section_end();
 }
-if (USE_FPGA)
-    # Thêm biến ${CMAKE_CURRENT_LIST_DIR} để ép CMake tìm đúng trong thư mục ggml-cpu
-    target_sources(ggml-cpu PRIVATE ${CMAKE_CURRENT_LIST_DIR}/fpga_host.cpp)
-    target_compile_definitions(ggml-cpu PUBLIC USE_FPGA)
-endif()
