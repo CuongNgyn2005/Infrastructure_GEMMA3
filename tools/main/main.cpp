@@ -152,7 +152,7 @@ int main(int argc, char ** argv) {
 
         std::string fpga_err;
         // Hàm này giờ chỉ làm nhiệm vụ mmap /dev/mem
-        if (fpga_init(xclbin_path, kernel_name, fpga_err)) {
+        if (fpga_init()) {
             LOG_INF("%s: FPGA host initialized (Bare-metal mode)\n", __func__);
         } else {
             LOG_WRN("%s: FPGA host init failed: %s\n", __func__, fpga_err.c_str());
