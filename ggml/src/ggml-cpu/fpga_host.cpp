@@ -6,6 +6,14 @@
 #include <string.h>
 #include <pthread.h>
 #include <stdio.h>
+#include "ggml.h"
+
+#define QK8_0 32
+typedef struct {
+    uint16_t d;          // scale (fp16 dưới dạng raw bits)
+    int8_t   qs[QK8_0]; // quantized values
+} block_q8_0_t;
+
 
 // ── Địa chỉ từ Vivado Address Editor ──────────────────
 #define CTRL_PHYS    0x80000000ULL   // s_axi_control base
@@ -124,4 +132,46 @@ int fpga_run_matmul(
 
     pthread_mutex_unlock(&g_mutex);
     return 1;
+}
+int fpga_try_matmul(
+    struct ggml_tensor * src0,  // weight (Q8_0) — ma trận B
+    struct ggml_tensor * src1,  // activation (F32) — ma trận A
+    struct ggml_tensor * dst,   // output (F32) — ma trận C
+    int ith)
+{
+    // ── Bước 1: Chỉ xử lý Q8_0 × F32 → F32 ──────────────────
+    if (src0->type != GGML_TYPE_Q8_0) return 0;  // fallback CPU
+    if (src1->type != GGML_TYPE_F32)  return 0;
+    if (dst->type  != GGML_TYPE_F32)  return 0;
+
+    // ── Bước 2: Lấy kích thước ───────────────────────────────
+    // src0 shape: [K, N] (weight, Q8_0)
+    // src1 shape: [K, M] (activation, F32, transposed khi mul_mat)
+    // dst  shape: [N, M]
+    const int64_t K = src0->ne[0];  // inner dim
+    const int64_t N = src0->ne[1];  // số hàng weight
+    const int64_t M = src1->ne[1];  // batch / seq_len
+
+    // Giới hạn kích thước FPGA hỗ trợ (TILE_M=16, TILE_K=64, TILE_N=64)
+    if (K > 4096 || N > 4096 || M > 512) return 0;  // fallback CPU
+
+    // ── Bước 3: Bóc tách B_d và B_qs từ block_q8_0 ──────────
+    const int num_blocks = (K * N) / QK8_0;
+    const block_q8_0_t* blocks = (const block_q8_0_t*)src0->data;
+
+    // Alloc tạm trên stack/heap để repack
+    static uint16_t B_d_buf [4096 * 4096 / QK8_0];  // scales
+    static int8_t   B_qs_buf[4096 * 4096];            // quants
+
+    for (int i = 0; i < num_blocks; i++) {
+        B_d_buf[i] = blocks[i].d;
+        memcpy(&B_qs_buf[i * QK8_0], blocks[i].qs, QK8_0);
+    }
+
+    // ── Bước 4: Gọi fpga_run_matmul ──────────────────────────
+    const float* A = (const float*)src1->data;
+    float*       C = (float*)dst->data;
+
+    return fpga_run_matmul(A, B_d_buf, B_qs_buf, C,
+                           (int)M, (int)K, (int)N, ith);
 }

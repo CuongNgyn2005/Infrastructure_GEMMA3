@@ -3,19 +3,28 @@
 extern "C" {
 #endif
 
-// Khởi tạo một lần khi app start
 int  fpga_init(void);
 void fpga_cleanup(void);
 
-// Gọi từ ggml_compute_forward_mul_mat
-// Trả về 1 nếu thành công, 0 nếu fallback CPU
+// Hàm LOW-LEVEL (dùng nội bộ)
 int fpga_run_matmul(
-    const float*    A,      // activation matrix (float32)
-    const uint16_t* B_d,    // weight scales (Q8_0 block scale)
-    const int8_t*   B_qs,   // weight quants (Q8_0 block data)
-    float*          C,      // output matrix
+    const float*    A,
+    const uint16_t* B_d,
+    const int8_t*   B_qs,
+    float*          C,
     int M, int K, int N,
-    int ith                 // thread id — chỉ chạy nếu ith==0
+    int ith
+);
+
+// Hàm HIGH-LEVEL — được gọi từ ggml-cpu.c
+// Nhận ggml_tensor*, tự bóc tách data, gọi fpga_run_matmul
+// src0 = weight (Q8_0), src1 = activation (F32), dst = output
+struct ggml_tensor;
+int fpga_try_matmul(
+    struct ggml_tensor * src0,   // weight B (Q8_0)
+    struct ggml_tensor * src1,   // activation A (F32)
+    struct ggml_tensor * dst,    // output C (F32)
+    int ith                      // thread id
 );
 
 #ifdef __cplusplus

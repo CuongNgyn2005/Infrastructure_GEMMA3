@@ -1,6 +1,6 @@
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
-#define USE_FPGA 1 
+//#define USE_FPGA 1 
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "traits.h"
@@ -1222,6 +1222,13 @@ void ggml_compute_forward_mul_mat(
 
     //  ---
 #ifdef USE_FPGA
+    static int fpga_initialized = 0;
+    if (!fpga_initialized) {
+        if (fpga_init() == 0) {
+            fpga_initialized = 1;
+        }
+        // Nếu init thất bại → tự động fallback CPU
+    }
 // Thêm dòng in này để biết file .c có nhận cờ USE_FPGA không
     static int hook_count = 0;
     if (hook_count < 5) { // Chỉ in 5 lần cho đỡ trôi màn hình
