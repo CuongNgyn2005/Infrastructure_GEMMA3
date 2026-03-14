@@ -90,8 +90,8 @@ typedef struct {
 #define BUF_C_PHYS   0x7C000000ULL
 #define BUF_SIZE     0x4000000       // 64MB
 
-#define FPGA_MAX_K   4096
-#define FPGA_MAX_N   4096
+#define FPGA_MAX_K   8192
+#define FPGA_MAX_N   8192
 #define FPGA_MAX_M   512
 
 // ══════════════════════════════════════════════════════════
