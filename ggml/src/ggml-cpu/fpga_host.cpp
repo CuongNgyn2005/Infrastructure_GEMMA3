@@ -9,14 +9,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <omp.h>       // OpenMP parallel repack
 
 // ══════════════════════════════════════════════════════════
 //  FPGA DEBUG LOG
-//  Bật/tắt từng tầng: 1=bật, 0=tắt
 // ══════════════════════════════════════════════════════════
 #define FPGA_LOG_LEVEL_INFO    1
 #define FPGA_LOG_LEVEL_MATMUL  1
-#define FPGA_LOG_LEVEL_REG     1
+#define FPGA_LOG_LEVEL_REG     0   // tắt bớt để giảm noise
 #define FPGA_LOG_LEVEL_TIMING  1
 
 #define FPGA_LOG_FILE "/tmp/fpga_debug.log"
@@ -65,7 +65,7 @@ typedef struct {
 } block_q8_0_t;
 
 // ══════════════════════════════════════════════════════════
-//  Địa chỉ phần cứng
+//  Địa chỉ phần cứng — KHÔNG ĐỔI so với bitstream cũ
 // ══════════════════════════════════════════════════════════
 #define CTRL_PHYS    0x80000000ULL
 #define CTRL_SIZE    0x10000
@@ -87,15 +87,11 @@ typedef struct {
 #define BUF_BD_PHYS  0x74000000ULL
 #define BUF_BQS_PHYS 0x78000000ULL
 #define BUF_C_PHYS   0x7C000000ULL
-#define BUF_SIZE     0x4000000       // 64MB mỗi buffer
+#define BUF_SIZE     0x4000000       // 64MB
 
-// Giới hạn kích thước — sau khi pad
 #define FPGA_MAX_K   8192
 #define FPGA_MAX_N   8192
 #define FPGA_MAX_M   512
-
-// Ngưỡng M tối thiểu — M < MIN thì overhead memcpy > lợi ích
-// M=1 (decode từng token) luôn dùng CPU
 #define FPGA_MIN_M   8
 
 // ══════════════════════════════════════════════════════════
@@ -112,6 +108,13 @@ static uint16_t*          g_B_d_buf  = NULL;
 static int8_t*            g_B_qs_buf = NULL;
 static long long          g_fpga_count = 0;
 static long long          g_cpu_count  = 0;
+
+// ── B-cache: tránh copy B_d/B_qs lên DDR khi weight không đổi ──
+// Weight của mỗi layer không thay đổi giữa các lần inference
+// → chỉ copy lần đầu, các lần sau skip → tiết kiệm ~4ms/call
+static const void* g_cached_B_ptr  = NULL;  // src0->data lần trước
+static int64_t     g_cached_B_K    = 0;
+static int64_t     g_cached_B_N    = 0;
 
 static void wr32(uint32_t off, uint32_t val) { g_ctrl[off/4] = val; }
 static uint32_t rd32(uint32_t off)           { return g_ctrl[off/4]; }
@@ -162,6 +165,7 @@ int fpga_init(void) {
         return -1;
     }
     LOGI("repack buffers alloc OK");
+    LOGI("OpenMP threads available: %d", omp_get_max_threads());
 
     uint32_t ctrl_val = rd32(REG_CTRL);
     LOGI("REG_CTRL sanity = 0x%08X (mong đợi AP_IDLE=0x4 hoặc 0x6)", ctrl_val);
@@ -193,36 +197,33 @@ void fpga_cleanup(void) {
     free(g_B_d_buf);
     free(g_B_qs_buf);
     g_ctrl = NULL; g_B_d_buf = NULL; g_B_qs_buf = NULL;
+    g_cached_B_ptr = NULL;
     LOGI("cleanup done");
 }
 
 // ══════════════════════════════════════════════════════════
-//  fpga_run_matmul
+//  fpga_run_matmul_internal
 //
-//  M_pad : kích thước M thực sự gửi cho FPGA (bội của 16)
-//  M_real: số hàng thực sự cần trong kết quả C (M_real <= M_pad)
-//
-//  Lý do tách M_pad và M_real:
-//    - FPGA kernel cần M là bội của TILE_M=16
-//    - dst->data chỉ có M_real*N bytes, không phải M_pad*N bytes
-//    - Nên copy kết quả chỉ M_real hàng từ DDR về dst
+//  M_pad : M gửi FPGA (bội 16)
+//  M_real: số hàng thực cần trong C (M_real <= M_pad)
+//  b_changed: 1=B đã thay đổi cần copy DDR, 0=skip copy B
 // ══════════════════════════════════════════════════════════
 static int fpga_run_matmul_internal(
-    const float*    A,      // Ma trận activation (M_pad x K, đã zero-pad)
-    const uint16_t* B_d,    // Scale Q8_0 (K/32 x N)
-    const int8_t*   B_qs,   // Quant Q8_0 (K x N)
-    float*          C,      // Output (M_real x N) — chỉ copy M_real hàng về đây
-    int M_pad,              // M gửi FPGA (bội 16)
-    int M_real,             // M thực (số hàng cần đọc từ C DDR)
-    int K, int N)
+    const float*    A,
+    const uint16_t* B_d,
+    const int8_t*   B_qs,
+    float*          C,
+    int M_pad, int M_real,
+    int K, int N,
+    int b_changed)      // ← tham số mới
 {
     pthread_mutex_lock(&g_mutex);
 
-    size_t sz_A   = (size_t)M_pad * K * sizeof(float);
-    size_t sz_Bd  = (size_t)(K / QK8_0) * N * sizeof(uint16_t);
-    size_t sz_Bqs = (size_t)K * N * sizeof(int8_t);
-    size_t sz_C_pad  = (size_t)M_pad * N * sizeof(float);   // full DDR C
-    size_t sz_C_real = (size_t)M_real * N * sizeof(float);  // phần cần copy về
+    size_t sz_A      = (size_t)M_pad * K * sizeof(float);
+    size_t sz_Bd     = (size_t)(K / QK8_0) * N * sizeof(uint16_t);
+    size_t sz_Bqs    = (size_t)K * N * sizeof(int8_t);
+    size_t sz_C_pad  = (size_t)M_pad * N * sizeof(float);
+    size_t sz_C_real = (size_t)M_real * N * sizeof(float);
 
     if (sz_A > BUF_SIZE || sz_Bd > BUF_SIZE || sz_Bqs > BUF_SIZE || sz_C_pad > BUF_SIZE) {
         LOGE("buffer overflow! A=%zuKB Bd=%zuKB Bqs=%zuKB C=%zuKB (max=%uKB)",
@@ -232,7 +233,6 @@ static int fpga_run_matmul_internal(
     }
 
     // ── Chờ AP_IDLE ──
-    LOGR("waiting AP_IDLE...");
     double t_idle = fpga_now_ms();
     while (!(rd32(REG_CTRL) & 0x4)) {
         if (fpga_now_ms() - t_idle > 1000.0) {
@@ -241,18 +241,25 @@ static int fpga_run_matmul_internal(
             return 0;
         }
     }
-    LOGR("AP_IDLE OK (%.1f ms wait)", fpga_now_ms() - t_idle);
 
     // ── Copy dữ liệu vào DDR ──
     double t_copy = fpga_now_ms();
-    memcpy(g_buf_A,   A,    sz_A);
-    memcpy(g_buf_Bd,  B_d,  sz_Bd);
-    memcpy(g_buf_Bqs, B_qs, sz_Bqs);
-    LOGT("memcpy→DDR: A=%zuKB Bd=%zuKB Bqs=%zuKB in %.2f ms",
-         sz_A/1024, sz_Bd/1024, sz_Bqs/1024, fpga_now_ms() - t_copy);
+    memcpy(g_buf_A, A, sz_A);
+    LOGT("memcpy→DDR: A=%zuKB in %.2f ms", sz_A/1024, fpga_now_ms() - t_copy);
+
+    if (b_changed) {
+        // B weight thay đổi → copy lên DDR
+        double t_b = fpga_now_ms();
+        memcpy(g_buf_Bd,  B_d,  sz_Bd);
+        memcpy(g_buf_Bqs, B_qs, sz_Bqs);
+        LOGT("memcpy→DDR: Bd=%zuKB Bqs=%zuKB (MISS) in %.2f ms",
+             sz_Bd/1024, sz_Bqs/1024, fpga_now_ms() - t_b);
+    } else {
+        LOGT("B-cache HIT — skip copy Bd=%zuKB Bqs=%zuKB",
+             sz_Bd/1024, sz_Bqs/1024);
+    }
 
     // ── Ghi register ──
-    LOGR("writing regs: M_pad=%d M_real=%d K=%d N=%d", M_pad, M_real, K, N);
     wr32(REG_A_LO,   (uint32_t)(BUF_A_PHYS   & 0xFFFFFFFF));
     wr32(REG_A_HI,   (uint32_t)(BUF_A_PHYS   >> 32));
     wr32(REG_BD_LO,  (uint32_t)(BUF_BD_PHYS  & 0xFFFFFFFF));
@@ -261,17 +268,13 @@ static int fpga_run_matmul_internal(
     wr32(REG_BQS_HI, (uint32_t)(BUF_BQS_PHYS >> 32));
     wr32(REG_C_LO,   (uint32_t)(BUF_C_PHYS   & 0xFFFFFFFF));
     wr32(REG_C_HI,   (uint32_t)(BUF_C_PHYS   >> 32));
-    wr32(REG_M, (uint32_t)M_pad);   // FPGA nhận M_pad (bội 16)
+    wr32(REG_M, (uint32_t)M_pad);
     wr32(REG_K, (uint32_t)K);
     wr32(REG_N, (uint32_t)N);
-
-    LOGR("verify: A_LO=0x%08X M=%u K=%u N=%u",
-         rd32(REG_A_LO), rd32(REG_M), rd32(REG_K), rd32(REG_N));
 
     // ── AP_START ──
     double t_start = fpga_now_ms();
     wr32(REG_CTRL, 0x1);
-    LOGR("AP_START sent, polling AP_DONE...");
 
     // ── Chờ AP_DONE — timeout 5s ──
     while (!(rd32(REG_CTRL) & 0x2)) {
@@ -282,32 +285,28 @@ static int fpga_run_matmul_internal(
             return 0;
         }
     }
-    double t_kernel = fpga_now_ms() - t_start;
-    LOGR("AP_DONE OK ctrl=0x%08X", rd32(REG_CTRL));
     LOGT("kernel exec: %.2f ms (M_pad=%d M_real=%d K=%d N=%d)",
-         t_kernel, M_pad, M_real, K, N);
+         fpga_now_ms() - t_start, M_pad, M_real, K, N);
 
-    // ── Copy kết quả về — CHỈ M_real hàng ──
-    // FPGA tính M_pad hàng trong DDR, nhưng dst chỉ cần M_real hàng
+    // ── Copy kết quả về — chỉ M_real hàng ──
     double t_read = fpga_now_ms();
     memcpy(C, g_buf_C, sz_C_real);
-    LOGT("memcpy←DDR: C_real=%zuKB (M_real=%d, bỏ %d hàng pad) in %.2f ms",
-         sz_C_real/1024, M_real, M_pad - M_real, fpga_now_ms() - t_read);
+    LOGT("memcpy←DDR: C_real=%zuKB (M_real=%d) in %.2f ms",
+         sz_C_real/1024, M_real, fpga_now_ms() - t_read);
     LOGT("TOTAL fpga_run_matmul: %.2f ms", fpga_now_ms() - t_copy);
 
     pthread_mutex_unlock(&g_mutex);
     return 1;
 }
 
-// ── Wrapper public (giữ chữ ký cũ để fpga_host.h không đổi) ──
+// ── Wrapper public ──
 int fpga_run_matmul(
     const float* A, const uint16_t* B_d, const int8_t* B_qs,
     float* C, int M, int K, int N, int ith)
 {
     if (ith != 0) return 1;
     if (!g_ctrl || g_ctrl == MAP_FAILED) return 0;
-    // Wrapper này dùng M trực tiếp (M_pad = M_real = M)
-    return fpga_run_matmul_internal(A, B_d, B_qs, C, M, M, K, N);
+    return fpga_run_matmul_internal(A, B_d, B_qs, C, M, M, K, N, 1);
 }
 
 // ══════════════════════════════════════════════════════════
@@ -352,7 +351,7 @@ int fpga_try_matmul(
         g_cpu_count++; return 0;
     }
 
-    // ── Check K, N align (bội 64) ──
+    // ── Check K, N align ──
     if (K % 64 != 0 || N % 64 != 0) {
         if (ith == 0) LOGM("SKIP K%%64=%lld N%%64=%lld → CPU",
              (long long)(K%64), (long long)(N%64));
@@ -368,79 +367,102 @@ int fpga_try_matmul(
     }
 
     // ── Check M tối thiểu ──
-    // M < FPGA_MIN_M (decode phase, M=1) → overhead memcpy > lợi ích
     if (M < FPGA_MIN_M) {
         if (ith == 0) LOGM("SKIP M=%lld < %d (decode) → CPU",
              (long long)M, FPGA_MIN_M);
         g_cpu_count++; return 0;
     }
 
-    // ── Tính M_pad: làm tròn lên bội 16 ──
-    // Ví dụ: M=25 → M_pad=32, M=10 → M_pad=16, M=16 → M_pad=16
+    // ── Tính M_pad ──
     const int64_t M_pad = ((M + 15) / 16) * 16;
-    if (ith == 0) {
-        if (M_pad != M)
-            LOGM("M=%lld → pad→%lld (thêm %lld hàng zero)", (long long)M, (long long)M_pad, (long long)(M_pad-M));
-        else
-            LOGM("M=%lld đã align, không cần pad", (long long)M);
-    }
-
-    // Kiểm tra M_pad không vượt giới hạn
     if (M_pad > FPGA_MAX_M) {
         if (ith == 0) LOGM("SKIP M_pad=%lld > FPGA_MAX_M=%d", (long long)M_pad, FPGA_MAX_M);
         g_cpu_count++; return 0;
     }
 
-    // ── Thread phụ return sớm sau khi đã qua hết check ──
+    if (ith == 0) {
+        if (M_pad != M)
+            LOGM("M=%lld → pad→%lld", (long long)M, (long long)M_pad);
+    }
+
+    // Thread phụ return sớm
     if (ith != 0) return 1;
 
-    // ══ Từ đây chỉ thread 0 thực thi ══
+    // ══ Thread 0 ══
 
-    // ── Repack Q8_0: tách B_d và B_qs ──
     LOGM(">>> FPGA #%lld: M=%lld(pad→%lld) K=%lld N=%lld",
-         g_fpga_count + 1, (long long)M, (long long)M_pad, (long long)K, (long long)N);
+         g_fpga_count + 1, (long long)M, (long long)M_pad,
+         (long long)K, (long long)N);
 
-    double t_repack = fpga_now_ms();
-    const int num_blocks = (int)((K * N) / QK8_0);
-    const block_q8_0_t* blocks = (const block_q8_0_t*)src0->data;
-    for (int i = 0; i < num_blocks; i++) {
-        g_B_d_buf[i] = blocks[i].d;
-        memcpy(&g_B_qs_buf[i * QK8_0], blocks[i].qs, QK8_0);
+    // ── B-cache check ──
+    // So sánh con trỏ src0->data, K, N để biết weight có đổi không
+    const void* cur_B_ptr = src0->data;
+    int b_changed = (cur_B_ptr != g_cached_B_ptr ||
+                     K != g_cached_B_K ||
+                     N != g_cached_B_N) ? 1 : 0;
+
+    if (b_changed) {
+        LOGT("B-cache MISS (ptr=%p K=%lld N=%lld) → repack + copy DDR",
+             cur_B_ptr, (long long)K, (long long)N);
+    } else {
+        LOGT("B-cache HIT (same weight) → skip repack + DDR copy");
     }
-    LOGT("repack %d blocks in %.2f ms", num_blocks, fpga_now_ms() - t_repack);
+
+    // ── Repack Q8_0 với OpenMP (chỉ khi B thay đổi) ──
+    if (b_changed) {
+        double t_repack = fpga_now_ms();
+        const int num_blocks = (int)((K * N) / QK8_0);
+        const block_q8_0_t* blocks = (const block_q8_0_t*)src0->data;
+
+        // OpenMP parallel: chia đều num_blocks cho 4 threads
+        // Mỗi thread xử lý range riêng → không có race condition
+        #pragma omp parallel for schedule(static) num_threads(4)
+        for (int i = 0; i < num_blocks; i++) {
+            g_B_d_buf[i] = blocks[i].d;
+            // Dùng direct assignment thay memcpy cho QK8_0=32 bytes
+            // Compiler sẽ vector hóa với ARM NEON
+            const int8_t* src_qs = blocks[i].qs;
+            int8_t*       dst_qs = &g_B_qs_buf[i * QK8_0];
+            for (int j = 0; j < QK8_0; j++)
+                dst_qs[j] = src_qs[j];
+        }
+
+        LOGT("repack %d blocks (OpenMP 4T) in %.2f ms",
+             num_blocks, fpga_now_ms() - t_repack);
+
+        // Cập nhật cache key
+        g_cached_B_ptr = cur_B_ptr;
+        g_cached_B_K   = K;
+        g_cached_B_N   = N;
+    }
 
     // ── Tạo A_pad nếu M không align ──
-    // A_pad = zero matrix (M_pad x K), copy M hàng đầu từ src1
-    // Các hàng M..M_pad-1 = 0 → FPGA tính ra C hàng đó = 0, bỏ đi
-    const float* A_src = (const float*)src1->data;
-    float*       A_use = (float*)A_src;  // mặc định dùng trực tiếp
+    const float* A_src    = (const float*)src1->data;
+    float*       A_use    = (float*)A_src;
     float*       A_pad_buf = NULL;
 
     if (M_pad != M) {
         double t_pad = fpga_now_ms();
         A_pad_buf = (float*)calloc(M_pad * K, sizeof(float));
         if (!A_pad_buf) {
-            LOGE("calloc A_pad M_pad=%lld K=%lld failed → CPU fallback",
-                 (long long)M_pad, (long long)K);
+            LOGE("calloc A_pad failed → CPU fallback");
             g_cpu_count++; return 0;
         }
-        // Copy M hàng thực, phần còn lại đã = 0 (calloc)
         memcpy(A_pad_buf, A_src, (size_t)M * K * sizeof(float));
         A_use = A_pad_buf;
-        LOGT("A_pad alloc+memcpy (M=%lld→%lld, %zuKB) in %.2f ms",
-             (long long)M, (long long)M_pad,
+        LOGT("A_pad alloc+memcpy (%zuKB) in %.2f ms",
              (size_t)M_pad * K * sizeof(float) / 1024,
              fpga_now_ms() - t_pad);
     }
 
-    // ── Gọi FPGA kernel ──
+    // ── Gọi FPGA ──
     float* C = (float*)dst->data;
     int ret = fpga_run_matmul_internal(
         A_use, g_B_d_buf, g_B_qs_buf, C,
-        (int)M_pad, (int)M,   // M_pad cho FPGA, M_real cho memcpy kết quả
-        (int)K, (int)N);
+        (int)M_pad, (int)M,
+        (int)K, (int)N,
+        b_changed);
 
-    // Giải phóng A_pad nếu đã alloc
     free(A_pad_buf);
 
     if (ret) {
