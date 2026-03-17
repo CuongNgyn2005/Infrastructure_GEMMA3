@@ -83,10 +83,10 @@ typedef struct {
 #define REG_K        0x48
 #define REG_N        0x50
 
-#define BUF_A_PHYS   0x70000000ULL
-#define BUF_BD_PHYS  0x74000000ULL
-#define BUF_BQS_PHYS 0x78000000ULL
-#define BUF_C_PHYS   0x7C000000ULL
+#define BUF_A_PHYS   0x6DC00000ULL  // 64MB
+#define BUF_BD_PHYS  0x6EC00000ULL  // 64MB
+#define BUF_BQS_PHYS 0x6FC00000ULL  // 64MB
+#define BUF_C_PHYS   0x70C00000ULL  // 64MB
 #define BUF_SIZE     0x4000000       // 64MB
 
 #define FPGA_MAX_K   8192
