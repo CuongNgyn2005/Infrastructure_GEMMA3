@@ -67,7 +67,7 @@ typedef struct {
 // ══════════════════════════════════════════════════════════
 //  Địa chỉ phần cứng — KHÔNG ĐỔI so với bitstream cũ
 // ══════════════════════════════════════════════════════════
-#define CTRL_PHYS    0x80000000ULL
+#define CTRL_PHYS    0x400000000ULL
 #define CTRL_SIZE    0x10000
 
 #define REG_CTRL     0x00
