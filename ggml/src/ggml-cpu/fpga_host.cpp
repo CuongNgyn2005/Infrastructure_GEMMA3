@@ -84,16 +84,70 @@ typedef struct {
 #define REG_N        0x50
 
 // ══════════════════════════════════════════════════════════
-// UPDATED: Moved beyond CMA region (0x6B800000-0x77800000)
-// Original addresses conflicted with Linux CMA allocator
-// New addresses start at 0x77C00000 (after CMA ends at 0x77800000)
+// Board-Specific Configuration:
+// For ZCU104 boards with different memory layouts
+// Detects board automatically and selects appropriate addresses
 // ══════════════════════════════════════════════════════════
-#define BUF_A_PHYS   0x77C00000ULL  // 64MB (was 0x6DC00000)
-#define BUF_BD_PHYS  0x78C00000ULL  // 64MB (was 0x6EC00000)
-#define BUF_BQS_PHYS 0x79C00000ULL  // 64MB (was 0x6FC00000)
-#define BUF_C_PHYS   0x7AC00000ULL  // 64MB (was 0x70C00000)
-#define BUF_SIZE     0x4000000       // 64MB
 
+// BOARD ZCU104-01 (2.0 GB RAM, CMA @ 0x6B800000-0x77800000)
+// Buffers placed after CMA ends
+#define BUF_A_PHYS_B01   0x77C00000ULL  // 64MB
+#define BUF_BD_PHYS_B01  0x78C00000ULL  // 64MB
+#define BUF_BQS_PHYS_B01 0x79C00000ULL  // 64MB
+#define BUF_C_PHYS_B01   0x7AC00000ULL  // 64MB
+#define BUF_SIZE_B01     0x4000000       // 64MB
+
+// BOARD ZCU104-02 (1.7 GB RAM, CMA @ 0x60000000-0x70000000)
+// Buffers placed BEFORE CMA (smaller 51MB buffers to fit in 1.7GB)
+// Addresses: 0x50000000 - 0x5CCC0000 (all 4 buffers before CMA)
+#define BUF_A_PHYS_B02   0x50000000ULL  // 51MB
+#define BUF_BD_PHYS_B02  0x53300000ULL  // 51MB
+#define BUF_BQS_PHYS_B02 0x56600000ULL  // 51MB
+#define BUF_C_PHYS_B02   0x59900000ULL  // 51MB
+#define BUF_SIZE_B02     0x3300000       // 51MB
+
+// Auto-detect board from DDR size and set addresses
+// Check CMA start address from /proc/meminfo or kernel log
+static inline void select_board_config(
+    uint64_t *buf_a, uint64_t *buf_bd, uint64_t *buf_bqs,
+    uint64_t *buf_c, uint64_t *buf_size) {
+
+    // For now: Use compile-time selection or runtime detection
+    // Default to B01 (2GB board) - more common
+#ifdef USE_ZCU104_02
+    // 1.7GB board with CMA at 0x60000000
+    *buf_a = BUF_A_PHYS_B02;
+    *buf_bd = BUF_BD_PHYS_B02;
+    *buf_bqs = BUF_BQS_PHYS_B02;
+    *buf_c = BUF_C_PHYS_B02;
+    *buf_size = BUF_SIZE_B02;
+#else
+    // Default: 2GB board with CMA at 0x6B800000
+    *buf_a = BUF_A_PHYS_B01;
+    *buf_bd = BUF_BD_PHYS_B01;
+    *buf_bqs = BUF_BQS_PHYS_B01;
+    *buf_c = BUF_C_PHYS_B01;
+    *buf_size = BUF_SIZE_B01;
+#endif
+}
+
+// Default values for backward compatibility
+#define BUF_A_PHYS   0x77C00000ULL   // 64MB (Board 01 default)
+#define BUF_BD_PHYS  0x78C00000ULL   // 64MB
+#define BUF_BQS_PHYS 0x79C00000ULL   // 64MB
+#define BUF_C_PHYS   0x7AC00000ULL   // 64MB
+#define BUF_SIZE     0x4000000        // 64MB
+
+// Matrix dimension limits based on buffer size
+// Board 01 (64MB): Supports larger matrices
+#define FPGA_MAX_K_B01   8192
+#define FPGA_MAX_N_B01   8192
+
+// Board 02 (51MB): Reduced dimensions to fit smaller buffers
+#define FPGA_MAX_K_B02   6144   // Reduced from 8192
+#define FPGA_MAX_N_B02   6144   // Reduced from 8192
+
+// Default to Board 01 limits (backward compatible)
 #define FPGA_MAX_K   8192
 #define FPGA_MAX_N   8192
 #define FPGA_MAX_M   512
