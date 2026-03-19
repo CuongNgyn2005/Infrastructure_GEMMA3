@@ -418,12 +418,10 @@ if (BUILD_SHARED_LIBS)
     endforeach()
 endif()
 
-# [THÊM ĐOẠN NÀY VÀO CUỐI FILE]
-#if (USE_FPGA)
- #   target_compile_definitions(ggml-cpu PRIVATE USE_FPGA)
-  #  target_sources(ggml-cpu PRIVATE
-   #     ggml/src/ggml-cpu/fpga_host.cpp
-    #)
-    # Link pthread (cần cho mutex)
-    #target_link_libraries(ggml-cpu PRIVATE pthread)
-#endif()
+if (USE_FPGA)
+    target_compile_definitions(ggml-cpu PRIVATE USE_FPGA)
+    target_sources(ggml-cpu PRIVATE
+        ggml/src/ggml-cpu/fpga_host.cpp
+    )
+    target_link_libraries(ggml-cpu PRIVATE pthread)
+endif()
