@@ -83,10 +83,15 @@ typedef struct {
 #define REG_K        0x48
 #define REG_N        0x50
 
-#define BUF_A_PHYS   0x6DC00000ULL  // 64MB
-#define BUF_BD_PHYS  0x6EC00000ULL  // 64MB
-#define BUF_BQS_PHYS 0x6FC00000ULL  // 64MB
-#define BUF_C_PHYS   0x70C00000ULL  // 64MB
+// ══════════════════════════════════════════════════════════
+// UPDATED: Moved beyond CMA region (0x6B800000-0x77800000)
+// Original addresses conflicted with Linux CMA allocator
+// New addresses start at 0x77C00000 (after CMA ends at 0x77800000)
+// ══════════════════════════════════════════════════════════
+#define BUF_A_PHYS   0x77C00000ULL  // 64MB (was 0x6DC00000)
+#define BUF_BD_PHYS  0x78C00000ULL  // 64MB (was 0x6EC00000)
+#define BUF_BQS_PHYS 0x79C00000ULL  // 64MB (was 0x6FC00000)
+#define BUF_C_PHYS   0x7AC00000ULL  // 64MB (was 0x70C00000)
 #define BUF_SIZE     0x4000000       // 64MB
 
 #define FPGA_MAX_K   8192
