@@ -1,0 +1,101 @@
+╔════════════════════════════════════════════════════════════════╗
+║         FPGA INTEGRATION - QUICK REFERENCE CARD                ║
+╚════════════════════════════════════════════════════════════════╝
+
+PROBLEM FOUND:
+  Original buffer addresses (0x6DC00000-0x74BFFFFF) conflicted
+  with Linux CMA region (0x6B800000-0x77800000)
+
+SOLUTION APPLIED:
+  ✅ Moved buffers to: 0x77C00000-0x7EC00000 (after CMA)
+  ✅ Updated: ggml/src/ggml-cpu/fpga_host.cpp
+  ✅ No bitstream regeneration needed!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+QUICK COMMANDS (on ZCU104):
+
+1. Test addresses:
+   $ sudo ./verify_fpga_addresses.sh
+
+2. Uncomment CMakeLists:
+   $ nano ggml/src/CMakeLists.txt  # Edit lines 422-429
+   Remove '#' before: if, target_compile_definitions,
+                      target_sources, target_link_libraries
+
+3. Build:
+   $ cd llama.cpp && rm -rf build && mkdir build && cd build
+   $ cmake .. -DUSE_FPGA=ON -DCMAKE_BUILD_TYPE=Release
+   $ make -j$(nproc)
+
+4. Load bitstream:
+   $ sudo fpgautil -b DATN1_wrapper.bit
+
+5. Run test:
+   $ sudo ./bin/llama-run -m model.gguf -n 128 -c 512
+
+6. Monitor logs:
+   $ tail -f /tmp/fpga_debug.log
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SUCCESS INDICATORS:
+
+✓ Compilation successful (no errors)
+  [100%] Built target llama-run
+
+✓ FPGA initialization message:
+  [FPGA] init OK — ctrl@0x400000000
+
+✓ FPGA matmul being called:
+  [FPGA][MATMUL] called M=8 K=2048 N=4096
+  [FPGA][MATMUL] >>> FPGA #1
+  [FPGA][MATMUL] <<< FPGA OK
+
+✓ Performance improvement visible
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TROUBLESHOOTING:
+
+Problem: verify_fpga_addresses.sh FAILS
+  → Check /proc/iomem: cat /proc/iomem | grep "System RAM"
+  → Addresses may need adjustment
+
+Problem: CMake configure error
+  → Check CMakeLists line 422: "if (USE_FPGA)" NOT "#if"
+  → Uncomment ALL lines under it (remove leading #)
+
+Problem: mmap failed at runtime
+  → Run as root: sudo ./llama-run ...
+  → Or use verify script to find safe addresses
+
+Problem: FPGA not being called
+  → Check matrix sizes: K%64==0, N%64==0, M>=8
+  → Check /tmp/fpga_debug.log for skip reasons
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ADDRESS MAP (FINAL):
+
+0x00000000 ▁▁▁ Linux Kernel + Heap
+0x6B800000 ███ CMA Region (kernel-managed, 256MB)
+0x77800000 ▔▔▔ CMA ENDS
+0x77C00000 ▁▁▁ BUF_A   (64MB)
+0x78C00000 ▁▁▁ BUF_BD  (64MB)
+0x79C00000 ▁▁▁ BUF_BQS (64MB)
+0x7AC00000 ▁▁▁ BUF_C   (64MB)
+0x7EC00000 ▔▔▔ End of FPGA buffers
+0x7FFFFFFF     End of 2GB DDR
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DOCUMENTATION:
+
+Full guide:    FPGA_ACTION_PLAN.md
+Memory report: zcu104_memory_analysis.md
+Code updated:  ggml/src/ggml-cpu/fpga_host.cpp (lines 86-90)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Ready to proceed? Run verify_fpga_addresses.sh first! 🚀
