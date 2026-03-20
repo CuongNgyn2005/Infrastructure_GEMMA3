@@ -114,20 +114,20 @@ static inline void select_board_config(
 
     // For now: Use compile-time selection or runtime detection
     // Default to B01 (2GB board) - more common
-#ifdef USE_ZCU104_02
-    // 1.7GB board with CMA at 0x60000000
-    *buf_a = BUF_A_PHYS_B02;
-    *buf_bd = BUF_BD_PHYS_B02;
-    *buf_bqs = BUF_BQS_PHYS_B02;
-    *buf_c = BUF_C_PHYS_B02;
-    *buf_size = BUF_SIZE_B02;
-#else
+#ifdef USE_ZCU104_01
     // Default: 2GB board with CMA at 0x6B800000
     *buf_a = BUF_A_PHYS_B01;
     *buf_bd = BUF_BD_PHYS_B01;
     *buf_bqs = BUF_BQS_PHYS_B01;
     *buf_c = BUF_C_PHYS_B01;
     *buf_size = BUF_SIZE_B01;
+#else
+        // 1.7GB board with CMA at 0x60000000
+    *buf_a = BUF_A_PHYS_B02;
+    *buf_bd = BUF_BD_PHYS_B02;
+    *buf_bqs = BUF_BQS_PHYS_B02;
+    *buf_c = BUF_C_PHYS_B02;
+    *buf_size = BUF_SIZE_B02;
 #endif
 }
 
