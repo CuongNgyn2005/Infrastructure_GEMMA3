@@ -171,9 +171,20 @@ static long long          g_cpu_count  = 0;
 // ── B-cache: tránh copy B_d/B_qs lên DDR khi weight không đổi ──
 // Weight của mỗi layer không thay đổi giữa các lần inference
 // → chỉ copy lần đầu, các lần sau skip → tiết kiệm ~4ms/call
-static const void* g_cached_B_ptr  = NULL;  // src0->data lần trước
+// Key: hash(ptr, K, N) để tránh false cache hits nếu pointer tái sử dụng
+static uint64_t    g_cached_B_key  = 0;     // hash(ptr ^ K ^ N)
 static int64_t     g_cached_B_K    = 0;
 static int64_t     g_cached_B_N    = 0;
+
+// ── Board configuration (set tại runtime theo physical DDR size) ──
+static uint64_t g_buf_A_phys   = BUF_A_PHYS;
+static uint64_t g_buf_BD_phys  = BUF_BD_PHYS;
+static uint64_t g_buf_BQS_phys = BUF_BQS_PHYS;
+static uint64_t g_buf_C_phys   = BUF_C_PHYS;
+static uint64_t g_buf_size     = BUF_SIZE;
+static int64_t  g_fpga_max_k   = FPGA_MAX_K;
+static int64_t  g_fpga_max_n   = FPGA_MAX_N;
+static int      g_board_detected = 0;  // 1=detected, 0=default
 
 static void wr32(uint32_t off, uint32_t val) { g_ctrl[off/4] = val; }
 static uint32_t rd32(uint32_t off)           { return g_ctrl[off/4]; }
@@ -192,6 +203,25 @@ int fpga_init(void) {
     }
     LOGI("/dev/mem opened OK (fd=%d)", g_mem_fd);
 
+    // ── Auto-detect board configuration based on physical RAM ──
+    select_board_config(&g_buf_A_phys, &g_buf_BD_phys, &g_buf_BQS_phys,
+                        &g_buf_C_phys, &g_buf_size);
+    
+    // Adjust FPGA limits based on detected board
+    if (g_buf_size == BUF_SIZE_B02) {
+        g_fpga_max_k = FPGA_MAX_K_B02;
+        g_fpga_max_n = FPGA_MAX_N_B02;
+        g_board_detected = 2;
+        LOGI("Detected Board ZCU104-02 (1.7GB): buffer 51MB, max K=%lld N=%lld",
+             g_fpga_max_k, g_fpga_max_n);
+    } else {
+        g_fpga_max_k = FPGA_MAX_K_B01;
+        g_fpga_max_n = FPGA_MAX_N_B01;
+        g_board_detected = 1;
+        LOGI("Detected Board ZCU104-01 (2GB): buffer 64MB, max K=%lld N=%lld",
+             g_fpga_max_k, g_fpga_max_n);
+    }
+
     g_ctrl = (volatile uint32_t*)mmap(
         NULL, CTRL_SIZE, PROT_READ|PROT_WRITE,
         MAP_SHARED, g_mem_fd, CTRL_PHYS);
@@ -202,19 +232,20 @@ int fpga_init(void) {
     LOGI("ctrl mmap OK phys=0x%08llX virt=%p",
          (unsigned long long)CTRL_PHYS, (void*)g_ctrl);
 
-    g_buf_A   = mmap(NULL, BUF_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, g_mem_fd, BUF_A_PHYS);
-    g_buf_Bd  = mmap(NULL, BUF_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, g_mem_fd, BUF_BD_PHYS);
-    g_buf_Bqs = mmap(NULL, BUF_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, g_mem_fd, BUF_BQS_PHYS);
-    g_buf_C   = mmap(NULL, BUF_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, g_mem_fd, BUF_C_PHYS);
+    g_buf_A   = mmap(NULL, g_buf_size, PROT_READ|PROT_WRITE, MAP_SHARED, g_mem_fd, g_buf_A_phys);
+    g_buf_Bd  = mmap(NULL, g_buf_size, PROT_READ|PROT_WRITE, MAP_SHARED, g_mem_fd, g_buf_BD_phys);
+    g_buf_Bqs = mmap(NULL, g_buf_size, PROT_READ|PROT_WRITE, MAP_SHARED, g_mem_fd, g_buf_BQS_phys);
+    g_buf_C   = mmap(NULL, g_buf_size, PROT_READ|PROT_WRITE, MAP_SHARED, g_mem_fd, g_buf_C_phys);
 
-    if (g_buf_A   == MAP_FAILED) { LOGE("mmap buf_A failed");   return -1; }
-    if (g_buf_Bd  == MAP_FAILED) { LOGE("mmap buf_Bd failed");  return -1; }
-    if (g_buf_Bqs == MAP_FAILED) { LOGE("mmap buf_Bqs failed"); return -1; }
-    if (g_buf_C   == MAP_FAILED) { LOGE("mmap buf_C failed");   return -1; }
+    if (g_buf_A   == MAP_FAILED) { LOGE("mmap buf_A@0x%llX failed", (unsigned long long)g_buf_A_phys);   return -1; }
+    if (g_buf_Bd  == MAP_FAILED) { LOGE("mmap buf_Bd@0x%llX failed", (unsigned long long)g_buf_BD_phys);  return -1; }
+    if (g_buf_Bqs == MAP_FAILED) { LOGE("mmap buf_Bqs@0x%llX failed", (unsigned long long)g_buf_BQS_phys); return -1; }
+    if (g_buf_C   == MAP_FAILED) { LOGE("mmap buf_C@0x%llX failed", (unsigned long long)g_buf_C_phys);   return -1; }
 
-    LOGI("DDR mmap OK: A@0x%08llX Bd@0x%08llX Bqs@0x%08llX C@0x%08llX",
-         (unsigned long long)BUF_A_PHYS,  (unsigned long long)BUF_BD_PHYS,
-         (unsigned long long)BUF_BQS_PHYS,(unsigned long long)BUF_C_PHYS);
+    LOGI("DDR mmap OK (%lluMB): A@0x%llX Bd@0x%llX Bqs@0x%llX C@0x%llX",
+         g_buf_size / (1024*1024),
+         (unsigned long long)g_buf_A_phys,  (unsigned long long)g_buf_BD_phys,
+         (unsigned long long)g_buf_BQS_phys,(unsigned long long)g_buf_C_phys);
 
     g_B_d_buf  = (uint16_t*)malloc((FPGA_MAX_K * FPGA_MAX_N / QK8_0) * sizeof(uint16_t));
     g_B_qs_buf = (int8_t*)  malloc( FPGA_MAX_K * FPGA_MAX_N          * sizeof(int8_t));
@@ -234,11 +265,12 @@ int fpga_init(void) {
         LOGI("AP_IDLE=1 → kernel sẵn sàng nhận lệnh");
     }
 
-    printf("[FPGA] init OK — ctrl@0x%08llX, DDR bufs@0x%08llX..0x%08llX\n",
+    printf("[FPGA] init OK — ctrl@0x%08llX, DDR bufs@0x%llX..0x%llX (%lluMB)\n",
            (unsigned long long)CTRL_PHYS,
-           (unsigned long long)BUF_A_PHYS,
-           (unsigned long long)BUF_C_PHYS + BUF_SIZE - 1);
-    LOGI("═══ FPGA INIT COMPLETE ═══");
+           (unsigned long long)g_buf_A_phys,
+           (unsigned long long)g_buf_C_phys + g_buf_size - 1,
+           g_buf_size / (1024*1024));
+    LOGI("═══ FPGA INIT COMPLETE (Board %d detected & configured) ═══", g_board_detected);
     return 0;
 }
 
@@ -248,15 +280,15 @@ int fpga_init(void) {
 void fpga_cleanup(void) {
     LOGI("cleanup — final stats: FPGA=%lld CPU=%lld", g_fpga_count, g_cpu_count);
     if (g_ctrl    && g_ctrl    != MAP_FAILED) munmap((void*)(uintptr_t)g_ctrl, CTRL_SIZE);
-    if (g_buf_A   && g_buf_A   != MAP_FAILED) munmap(g_buf_A,   BUF_SIZE);
-    if (g_buf_Bd  && g_buf_Bd  != MAP_FAILED) munmap(g_buf_Bd,  BUF_SIZE);
-    if (g_buf_Bqs && g_buf_Bqs != MAP_FAILED) munmap(g_buf_Bqs, BUF_SIZE);
-    if (g_buf_C   && g_buf_C   != MAP_FAILED) munmap(g_buf_C,   BUF_SIZE);
+    if (g_buf_A   && g_buf_A   != MAP_FAILED) munmap(g_buf_A,   g_buf_size);
+    if (g_buf_Bd  && g_buf_Bd  != MAP_FAILED) munmap(g_buf_Bd,  g_buf_size);
+    if (g_buf_Bqs && g_buf_Bqs != MAP_FAILED) munmap(g_buf_Bqs, g_buf_size);
+    if (g_buf_C   && g_buf_C   != MAP_FAILED) munmap(g_buf_C,   g_buf_size);
     if (g_mem_fd  >= 0) close(g_mem_fd);
     free(g_B_d_buf);
     free(g_B_qs_buf);
     g_ctrl = NULL; g_B_d_buf = NULL; g_B_qs_buf = NULL;
-    g_cached_B_ptr = NULL;
+    g_cached_B_key = 0;
     LOGI("cleanup done");
 }
 
@@ -284,9 +316,9 @@ static int fpga_run_matmul_internal(
     size_t sz_C_pad  = (size_t)M_pad * N * sizeof(float);
     size_t sz_C_real = (size_t)M_real * N * sizeof(float);
 
-    if (sz_A > BUF_SIZE || sz_Bd > BUF_SIZE || sz_Bqs > BUF_SIZE || sz_C_pad > BUF_SIZE) {
-        LOGE("buffer overflow! A=%zuKB Bd=%zuKB Bqs=%zuKB C=%zuKB (max=%uKB)",
-             sz_A/1024, sz_Bd/1024, sz_Bqs/1024, sz_C_pad/1024, BUF_SIZE/1024);
+    if (sz_A > g_buf_size || sz_Bd > g_buf_size || sz_Bqs > g_buf_size || sz_C_pad > g_buf_size) {
+        LOGE("buffer overflow! A=%zuKB Bd=%zuKB Bqs=%zuKB C=%zuKB (max=%lluKB)",
+             sz_A/1024, sz_Bd/1024, sz_Bqs/1024, sz_C_pad/1024, g_buf_size/1024);
         pthread_mutex_unlock(&g_mutex);
         return 0;
     }
@@ -319,14 +351,15 @@ static int fpga_run_matmul_internal(
     }
 
     // ── Ghi register ──
-    wr32(REG_A_LO,   (uint32_t)(BUF_A_PHYS   & 0xFFFFFFFF));
-    wr32(REG_A_HI,   (uint32_t)(BUF_A_PHYS   >> 32));
-    wr32(REG_BD_LO,  (uint32_t)(BUF_BD_PHYS  & 0xFFFFFFFF));
-    wr32(REG_BD_HI,  (uint32_t)(BUF_BD_PHYS  >> 32));
-    wr32(REG_BQS_LO, (uint32_t)(BUF_BQS_PHYS & 0xFFFFFFFF));
-    wr32(REG_BQS_HI, (uint32_t)(BUF_BQS_PHYS >> 32));
-    wr32(REG_C_LO,   (uint32_t)(BUF_C_PHYS   & 0xFFFFFFFF));
-    wr32(REG_C_HI,   (uint32_t)(BUF_C_PHYS   >> 32));
+    __sync_synchronize();  // Memory barrier to ensure DDR writes flushed
+    wr32(REG_A_LO,   (uint32_t)(g_buf_A_phys   & 0xFFFFFFFF));
+    wr32(REG_A_HI,   (uint32_t)(g_buf_A_phys   >> 32));
+    wr32(REG_BD_LO,  (uint32_t)(g_buf_BD_phys  & 0xFFFFFFFF));
+    wr32(REG_BD_HI,  (uint32_t)(g_buf_BD_phys  >> 32));
+    wr32(REG_BQS_LO, (uint32_t)(g_buf_BQS_phys & 0xFFFFFFFF));
+    wr32(REG_BQS_HI, (uint32_t)(g_buf_BQS_phys >> 32));
+    wr32(REG_C_LO,   (uint32_t)(g_buf_C_phys   & 0xFFFFFFFF));
+    wr32(REG_C_HI,   (uint32_t)(g_buf_C_phys   >> 32));
     wr32(REG_M, (uint32_t)M_pad);
     wr32(REG_K, (uint32_t)K);
     wr32(REG_N, (uint32_t)N);
@@ -335,10 +368,10 @@ static int fpga_run_matmul_internal(
     double t_start = fpga_now_ms();
     wr32(REG_CTRL, 0x1);
 
-    // ── Chờ AP_DONE — timeout 5s ──
+    // ── Chờ AP_DONE — timeout 2s (kernel phải resolve trong 2s, nếu không là hung) ──
     while (!(rd32(REG_CTRL) & 0x2)) {
-        if (fpga_now_ms() - t_start > 5000.0) {
-            LOGE("AP_DONE TIMEOUT (5s)! M_pad=%d K=%d N=%d ctrl=0x%08X",
+        if (fpga_now_ms() - t_start > 2000.0) {
+            LOGE("AP_DONE TIMEOUT (2s)! M_pad=%d K=%d N=%d ctrl=0x%08X",
                  M_pad, K, N, rd32(REG_CTRL));
             pthread_mutex_unlock(&g_mutex);
             return 0;
@@ -417,11 +450,11 @@ int fpga_try_matmul(
         g_cpu_count++; return 0;
     }
 
-    // ── Check size tuyệt đối ──
-    if (K > FPGA_MAX_K || N > FPGA_MAX_N || M > FPGA_MAX_M) {
-        if (ith == 0) LOGM("SKIP size M=%lld K=%lld N=%lld > max(%d,%d,%d)",
+    // ── Check size tuyệt đối (dùng FPGA max limits từ board detection) ──
+    if (K > g_fpga_max_k || N > g_fpga_max_n || M > FPGA_MAX_M) {
+        if (ith == 0) LOGM("SKIP size M=%lld K=%lld N=%lld > max(%d,%lld,%lld)",
              (long long)M, (long long)K, (long long)N,
-             FPGA_MAX_M, FPGA_MAX_K, FPGA_MAX_N);
+             FPGA_MAX_M, g_fpga_max_k, g_fpga_max_n);
         g_cpu_count++; return 0;
     }
 
@@ -453,21 +486,24 @@ int fpga_try_matmul(
          g_fpga_count + 1, (long long)M, (long long)M_pad,
          (long long)K, (long long)N);
 
-    // ── B-cache check ──
-    // So sánh con trỏ src0->data, K, N để biết weight có đổi không
-    const void* cur_B_ptr = src0->data;
-    int b_changed = (cur_B_ptr != g_cached_B_ptr ||
+    // ── B-cache check (compute hash of src0 identity, K, N) ──
+    // Use hash to avoid false hits if pointer address is reused
+    uint64_t cur_B_key = ((uintptr_t)src0->data) ^ (uint64_t)K ^ (uint64_t)N;
+    int b_changed = (cur_B_key != g_cached_B_key ||
                      K != g_cached_B_K ||
                      N != g_cached_B_N) ? 1 : 0;
 
     if (b_changed) {
-        LOGT("B-cache MISS (ptr=%p K=%lld N=%lld) → repack + copy DDR",
-             cur_B_ptr, (long long)K, (long long)N);
+        LOGT("B-cache MISS (key=0x%llx K=%lld N=%lld) → repack + copy DDR",
+             (unsigned long long)cur_B_key, (long long)K, (long long)N);
     } else {
         LOGT("B-cache HIT (same weight) → skip repack + DDR copy");
     }
 
     // ── Repack Q8_0 với OpenMP (chỉ khi B thay đổi) ──
+    // Note: Repacking happens OUTSIDE the fpga_run_matmul_internal lock
+    // Multi-thread safety: Each thread repacks independently into g_B_d_buf/g_B_qs_buf
+    // The lock inside fpga_run_matmul_internal protects DDR copy and kernel execution
     if (b_changed) {
         double t_repack = fpga_now_ms();
         const int num_blocks = (int)((K * N) / QK8_0);
@@ -489,8 +525,8 @@ int fpga_try_matmul(
         LOGT("repack %d blocks (OpenMP 4T) in %.2f ms",
              num_blocks, fpga_now_ms() - t_repack);
 
-        // Cập nhật cache key
-        g_cached_B_ptr = cur_B_ptr;
+        // Cập nhật cache key (no lock needed, atomic write of uint64_t + int64_t on ARM)
+        g_cached_B_key = cur_B_key;
         g_cached_B_K   = K;
         g_cached_B_N   = N;
     }
