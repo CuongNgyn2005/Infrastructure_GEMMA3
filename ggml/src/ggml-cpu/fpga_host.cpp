@@ -396,7 +396,7 @@ static int fpga_run_matmul_internal(
     int has_nan_inf = 0;
     for (int i = 0; i < print_count; i++) {
         float val = C[i];
-        if (isnan(val) || isinf(val)) {
+        if (std::isnan(val) || std::isinf(val)) {
             LOGE("[DEBUG] C[0][%d]=%.6f (NaN/Inf!)", i, val);
             has_nan_inf = 1;
         } else {
