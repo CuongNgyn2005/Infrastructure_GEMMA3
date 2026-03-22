@@ -325,6 +325,7 @@ static int fpga_run_matmul_internal(
 
     // ── Chờ AP_IDLE ──
     double t_idle = fpga_now_ms();
+    LOGT("[DEBUG] WAIT AP_IDLE... REG_CTRL=0x%08X", rd32(REG_CTRL));
     while (!(rd32(REG_CTRL) & 0x4)) {
         if (fpga_now_ms() - t_idle > 1000.0) {
             LOGE("AP_IDLE timeout (1s) ctrl=0x%08X", rd32(REG_CTRL));
@@ -332,6 +333,7 @@ static int fpga_run_matmul_internal(
             return 0;
         }
     }
+    LOGT("[DEBUG] AP_IDLE OK! ctrl=0x%08X (elapsed=%.2f ms)", rd32(REG_CTRL), fpga_now_ms() - t_idle);
 
     // ── Copy dữ liệu vào DDR ──
     double t_copy = fpga_now_ms();
@@ -382,9 +384,28 @@ static int fpga_run_matmul_internal(
 
     // ── Copy kết quả về — chỉ M_real hàng ──
     double t_read = fpga_now_ms();
+    LOGT("[DEBUG] Before memcpy C: g_buf_C=%p, sz_C_real=%zu", g_buf_C, sz_C_real);
     memcpy(C, g_buf_C, sz_C_real);
     LOGT("memcpy←DDR: C_real=%zuKB (M_real=%d) in %.2f ms",
          sz_C_real/1024, M_real, fpga_now_ms() - t_read);
+    
+    // ── DEBUG: Check output validity ──
+    LOGT("[DEBUG] Checking output data (M_real=%d, N=%d)...", M_real, N);
+    int print_count = (N < 10) ? N : 10;
+    int has_nan_inf = 0;
+    for (int i = 0; i < print_count; i++) {
+        float val = C[i];
+        if (isnan(val) || isinf(val)) {
+            LOGE("[DEBUG] C[0][%d]=%.6f (NaN/Inf!)", i, val);
+            has_nan_inf = 1;
+        } else {
+            LOGT("[DEBUG] C[0][%d]=%.6f", i, val);
+        }
+    }
+    if (has_nan_inf) {
+        LOGE("[DEBUG] WARNING: Output has NaN/Inf!");
+    }
+    
     LOGT("TOTAL fpga_run_matmul: %.2f ms", fpga_now_ms() - t_copy);
 
     pthread_mutex_unlock(&g_mutex);
