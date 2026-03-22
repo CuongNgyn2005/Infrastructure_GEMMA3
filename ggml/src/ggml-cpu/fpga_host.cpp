@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <omp.h>       // OpenMP parallel repack
+#include <cmath>       // for isnan(), isinf()
 
 // ══════════════════════════════════════════════════════════
 //  FPGA DEBUG LOG
