@@ -213,13 +213,13 @@ int fpga_init(void) {
         g_fpga_max_k = FPGA_MAX_K_B02;
         g_fpga_max_n = FPGA_MAX_N_B02;
         g_board_detected = 2;
-        LOGI("Detected Board ZCU104-02 (1.7GB): buffer 51MB, max K=%lld N=%lld",
+        LOGI("Detected Board ZCU104-02 (1.7GB): buffer 51MB, max K=%ld N=%ld",
              g_fpga_max_k, g_fpga_max_n);
     } else {
         g_fpga_max_k = FPGA_MAX_K_B01;
         g_fpga_max_n = FPGA_MAX_N_B01;
         g_board_detected = 1;
-        LOGI("Detected Board ZCU104-01 (2GB): buffer 64MB, max K=%lld N=%lld",
+        LOGI("Detected Board ZCU104-01 (2GB): buffer 64MB, max K=%ld N=%ld",
              g_fpga_max_k, g_fpga_max_n);
     }
 
@@ -231,7 +231,7 @@ int fpga_init(void) {
         return -1;
     }
     LOGI("ctrl mmap OK phys=0x%08llX virt=%p",
-         (unsigned long long)CTRL_PHYS, (void*)g_ctrl);
+         (unsigned long long)CTRL_PHYS, (const void*)g_ctrl);
 
     g_buf_A   = mmap(NULL, g_buf_size, PROT_READ|PROT_WRITE, MAP_SHARED, g_mem_fd, g_buf_A_phys);
     g_buf_Bd  = mmap(NULL, g_buf_size, PROT_READ|PROT_WRITE, MAP_SHARED, g_mem_fd, g_buf_BD_phys);
@@ -243,7 +243,7 @@ int fpga_init(void) {
     if (g_buf_Bqs == MAP_FAILED) { LOGE("mmap buf_Bqs@0x%llX failed", (unsigned long long)g_buf_BQS_phys); return -1; }
     if (g_buf_C   == MAP_FAILED) { LOGE("mmap buf_C@0x%llX failed", (unsigned long long)g_buf_C_phys);   return -1; }
 
-    LOGI("DDR mmap OK (%lluMB): A@0x%llX Bd@0x%llX Bqs@0x%llX C@0x%llX",
+    LOGI("DDR mmap OK (%luMB): A@0x%llX Bd@0x%llX Bqs@0x%llX C@0x%llX",
          g_buf_size / (1024*1024),
          (unsigned long long)g_buf_A_phys,  (unsigned long long)g_buf_BD_phys,
          (unsigned long long)g_buf_BQS_phys,(unsigned long long)g_buf_C_phys);
@@ -266,7 +266,7 @@ int fpga_init(void) {
         LOGI("AP_IDLE=1 → kernel sẵn sàng nhận lệnh");
     }
 
-    printf("[FPGA] init OK — ctrl@0x%08llX, DDR bufs@0x%llX..0x%llX (%lluMB)\n",
+    printf("[FPGA] init OK — ctrl@0x%08llX, DDR bufs@0x%llX..0x%llX (%luMB)\n",
            (unsigned long long)CTRL_PHYS,
            (unsigned long long)g_buf_A_phys,
            (unsigned long long)g_buf_C_phys + g_buf_size - 1,
@@ -318,7 +318,7 @@ static int fpga_run_matmul_internal(
     size_t sz_C_real = (size_t)M_real * N * sizeof(float);
 
     if (sz_A > g_buf_size || sz_Bd > g_buf_size || sz_Bqs > g_buf_size || sz_C_pad > g_buf_size) {
-        LOGE("buffer overflow! A=%zuKB Bd=%zuKB Bqs=%zuKB C=%zuKB (max=%lluKB)",
+        LOGE("buffer overflow! A=%zuKB Bd=%zuKB Bqs=%zuKB C=%zuKB (max=%luKB)",
              sz_A/1024, sz_Bd/1024, sz_Bqs/1024, sz_C_pad/1024, g_buf_size/1024);
         pthread_mutex_unlock(&g_mutex);
         return 0;
@@ -474,8 +474,8 @@ int fpga_try_matmul(
 
     // ── Check size tuyệt đối (dùng FPGA max limits từ board detection) ──
     if (K > g_fpga_max_k || N > g_fpga_max_n || M > FPGA_MAX_M) {
-        if (ith == 0) LOGM("SKIP size M=%lld K=%lld N=%lld > max(%d,%lld,%lld)",
-             (long long)M, (long long)K, (long long)N,
+        if (ith == 0) LOGM("SKIP size M=%ld K=%ld N=%ld > max(%d,%ld,%ld)",
+             (long)M, (long)K, (long)N,
              FPGA_MAX_M, g_fpga_max_k, g_fpga_max_n);
         g_cpu_count++; return 0;
     }
@@ -555,7 +555,7 @@ int fpga_try_matmul(
 
     // ── Tạo A_pad nếu M không align ──
     const float* A_src    = (const float*)src1->data;
-    float*       A_use    = (float*)A_src;
+    const float* A_use    = A_src;
     float*       A_pad_buf = NULL;
 
     if (M_pad != M) {
@@ -566,7 +566,7 @@ int fpga_try_matmul(
             g_cpu_count++; return 0;
         }
         memcpy(A_pad_buf, A_src, (size_t)M * K * sizeof(float));
-        A_use = A_pad_buf;
+        A_use = (const float*)A_pad_buf;
         LOGT("A_pad alloc+memcpy (%zuKB) in %.2f ms",
              (size_t)M_pad * K * sizeof(float) / 1024,
              fpga_now_ms() - t_pad);
