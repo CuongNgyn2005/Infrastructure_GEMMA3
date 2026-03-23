@@ -230,8 +230,8 @@ int fpga_init(void) {
         LOGE("mmap ctrl@0x%08llX failed", (unsigned long long)CTRL_PHYS);
         return -1;
     }
-    LOGI("ctrl mmap OK phys=0x%08llX virt=%p",
-         (unsigned long long)CTRL_PHYS, (const void*)g_ctrl);
+    LOGI("ctrl mmap OK phys=0x%08llX virt=0x%llX",
+         (unsigned long long)CTRL_PHYS, (unsigned long long)(uintptr_t)g_ctrl);
 
     g_buf_A   = mmap(NULL, g_buf_size, PROT_READ|PROT_WRITE, MAP_SHARED, g_mem_fd, g_buf_A_phys);
     g_buf_Bd  = mmap(NULL, g_buf_size, PROT_READ|PROT_WRITE, MAP_SHARED, g_mem_fd, g_buf_BD_phys);
