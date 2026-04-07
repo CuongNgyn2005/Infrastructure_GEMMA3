@@ -41,10 +41,10 @@ inline uint16_t f32_to_f16(float v) {
 // ── Prototype (tên khớp set_top trong TCL) ─────────────
 extern "C" {
 void kernel_forward(
-    const float*    A,      // [M x K]        float32
+    const float* A,      // [M x K]        float32
     const uint16_t* B_d,    // [N x K/QK8_0]  fp16 scale
-    const int8_t*   B_qs,   // [N x K]         int8 quant
-    float*          C,      // [M x N]         float32 output
+    const int8_t* B_qs,   // [N x K]         int8 quant
+    float* C,      // [M x N]         float32 output
     int M, int K, int N
 );
 }
