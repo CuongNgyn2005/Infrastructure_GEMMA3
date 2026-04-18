@@ -1225,7 +1225,24 @@ static void do_fpga_init(void) {
     }
 }
 #endif
-    
+#ifdef USE_FPGA
+   // Extract layer ID from tensor name
+// Example: "layers.5.mlp.w1" -> returns 5
+static int extract_layer_id_from_name(const char * name) {
+    if (!name) return 0;
+    int layer = 0;
+    if (sscanf(name, "layers.%d", &layer) == 1) {
+        return layer;
+    }
+    return 0;
+}
+
+// Get current sequence position (will implement later)
+static int get_current_seq_pos(void) {
+    extern int g_current_seq_pos;  // From fpga_host.cpp
+    return g_current_seq_pos;
+} 
+#endif
     // ---  (FPGA HOOK) ---
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
@@ -1241,9 +1258,17 @@ void ggml_compute_forward_mul_mat(
         hook_count++;
     }
 
-    if (g_fpga_initialized &&
-        fpga_try_matmul(dst->src[0], dst->src[1], dst, params->ith)) {
-        return;
+   if (g_fpga_initialized) {
+        // NEW: Use extended interface with layer tracking
+        int layer_id = extract_layer_id_from_name(src0->name);
+        if (fpga_try_matmul_extended(
+                src0, src1, dst, ith,
+                layer_id,  // Which layer
+                0,         // seq_pos (not used for MLP)
+                0))        // is_attention = 0
+        {
+            return;
+        }
     }
 #endif
 
@@ -1998,7 +2023,34 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                ggml_compute_forward_flash_attn_ext(params, tensor);
+               // ggml_compute_forward_flash_attn_ext(params, tensor);
+                   #ifdef USE_FPGA
+                    // Extract Q tensor to get layer ID
+                    struct ggml_tensor * Q = node->src[0];
+                    int layer_id = extract_layer_id_from_name(Q->name);
+                    int seq_pos = get_current_seq_pos();
+                    
+                    if (g_fpga_initialized) {
+                        // Try FPGA attention path
+                        if (fpga_try_matmul_extended(
+                                node->src[1],  // K
+                                Q,             // Q
+                                node,          // output
+                                ith,
+                                layer_id,
+                                seq_pos,
+                                1))            // is_attention = 1
+                        {
+                            *compute_status = GGML_COMPUTE_STATUS_COMPLETE;
+                            return;
+                        }
+                    }
+                    #endif
+                    
+                    // Fall back to CPU Flash Attention
+                    ggml_compute_forward_flash_attn_ext(params, node);
+                    *compute_status = GGML_COMPUTE_STATUS_COMPLETE;
+                    return;
             } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {

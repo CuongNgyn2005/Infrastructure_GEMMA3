@@ -1,22 +1,9 @@
 #pragma once
-
 #include <stdint.h>
 #include <string.h>
 
 #define QK8_0 32
 
-// ══════════════════════════════════════════════════════════
-//  Layout memory (khớp với ggml Q8_0, src0 shape (K,N)):
-//
-//  A   : [M x K]        float32  row-major  A[m*K + k]
-//  B_d : [N x K/QK8_0] uint16   row-major  B_d [n*(K/32) + k/32]
-//  B_qs: [N x K]        int8     row-major  B_qs[n*K + k]
-//  C   : [M x N]        float32  row-major  C[m*N + n]
-//
-//  C[m][n] = sum_k  A[m][k] * B_qs[n][k] * f16_to_f32(B_d[n][k/32])
-// ══════════════════════════════════════════════════════════
-
-// ── float16 (raw uint16 bits) <-> float32 ──────────────
 inline float f16_to_f32(uint16_t h) {
     uint32_t s = (uint32_t)((h >> 15) & 1U);
     uint32_t e = (uint32_t)((h >> 10) & 0x1FU);
@@ -38,13 +25,12 @@ inline uint16_t f32_to_f16(float v) {
     return (uint16_t)((s << 15) | ((uint32_t)e << 10) | m);
 }
 
-// ── Prototype (tên khớp set_top trong TCL) ─────────────
 extern "C" {
 void kernel_forward(
-    const float* A,      // [M x K]        float32
-    const uint16_t* B_d,    // [N x K/QK8_0]  fp16 scale
-    const int8_t* B_qs,   // [N x K]         int8 quant
-    float* C,      // [M x N]         float32 output
+    const float*    A,
+    const uint16_t* B_d,
+    const int8_t*   B_qs,
+    float*          C,
     int M, int K, int N
 );
 }

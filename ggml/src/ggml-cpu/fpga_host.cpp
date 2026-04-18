@@ -56,18 +56,12 @@ static double fpga_now_ms(void) {
 #define LOGT(fmt, ...) FPGA_LOG(FPGA_LOG_LEVEL_TIMING, "TIMING", fmt, ##__VA_ARGS__)
 #define LOGE(fmt, ...) FPGA_LOG(1,                      "ERROR",  fmt, ##__VA_ARGS__)
 
-// ══════════════════════════════════════════════════════════
-//  Q8_0 block layout
-// ══════════════════════════════════════════════════════════
 #define QK8_0 32
 typedef struct {
     uint16_t d;
     int8_t   qs[QK8_0];
 } block_q8_0_t;
 
-// ══════════════════════════════════════════════════════════
-//  Địa chỉ phần cứng — KHÔNG ĐỔI so với bitstream cũ
-// ══════════════════════════════════════════════════════════
 #define CTRL_PHYS    0x400000000ULL
 #define CTRL_SIZE    0x10000
 
@@ -83,53 +77,19 @@ typedef struct {
 #define REG_M        0x40
 #define REG_K        0x48
 #define REG_N        0x50
+#define REG_LAYER_ID 0x58   // Layer identifier
+#define REG_SEQ_POS  0x60   // Sequence position
+#define REG_IS_ATTN  0x68   // Attention flag
 
 // ══════════════════════════════════════════════════════════
-// Board-Specific Configuration
+// Board-Specific Configuration: ZCU104 (mem=1792M)
+// Vùng Nhớ: An toàn 0x70000000 - 0x7FFFFFFF (tránh kernel Linux)
 // ══════════════════════════════════════════════════════════
-
-// BOARD ZCU104-01 (2.0 GB RAM)
-#define BUF_A_PHYS_B01   0x77C00000ULL  // 64MB
-#define BUF_BD_PHYS_B01  0x78C00000ULL  // 64MB
-#define BUF_BQS_PHYS_B01 0x79C00000ULL  // 64MB
-#define BUF_C_PHYS_B01   0x7AC00000ULL  // 64MB
-#define BUF_SIZE_B01     0x4000000       // 64MB
-
-// BOARD ZCU104-02 (1.7 GB RAM)
-#define BUF_A_PHYS_B02   0x70000000ULL  // 51MB
-#define BUF_BD_PHYS_B02  0x74000000ULL  // 51MB
-#define BUF_BQS_PHYS_B02 0x78000000ULL  // 51MB
-#define BUF_C_PHYS_B02   0x7C000000ULL  // 51MB
-#define BUF_SIZE_B02     0x4000000       // 51MB
-
-static inline void select_board_config(
-    uint64_t *buf_a, uint64_t *buf_bd, uint64_t *buf_bqs,
-    uint64_t *buf_c, uint64_t *buf_size) {
-#ifdef USE_ZCU104_01
-    *buf_a = BUF_A_PHYS_B01;
-    *buf_bd = BUF_BD_PHYS_B01;
-    *buf_bqs = BUF_BQS_PHYS_B01;
-    *buf_c = BUF_C_PHYS_B01;
-    *buf_size = BUF_SIZE_B01;
-#else
-    *buf_a = BUF_A_PHYS_B02;
-    *buf_bd = BUF_BD_PHYS_B02;
-    *buf_bqs = BUF_BQS_PHYS_B02;
-    *buf_c = BUF_C_PHYS_B02;
-    *buf_size = BUF_SIZE_B02;
-#endif
-}
-
-#define BUF_A_PHYS   0x77C00000ULL
-#define BUF_BD_PHYS  0x78C00000ULL
-#define BUF_BQS_PHYS 0x79C00000ULL
-#define BUF_C_PHYS   0x7AC00000ULL
-#define BUF_SIZE     0x4000000
-
-#define FPGA_MAX_K_B01   8192
-#define FPGA_MAX_N_B01   8192
-#define FPGA_MAX_K_B02   6144
-#define FPGA_MAX_N_B02   6144
+#define BUF_A_PHYS       0x70000000ULL  // Buf A:   70000000 -> 74000000
+#define BUF_BD_PHYS      0x74000000ULL  // Buf Bd:  74000000 -> 78000000
+#define BUF_BQS_PHYS     0x78000000ULL  // Buf Bqs: 78000000 -> 7C000000
+#define BUF_C_PHYS       0x7C000000ULL  // Buf C:   7C000000 -> 80000000
+#define BUF_SIZE         0x4000000      // 64MB mỗi mảng
 
 #define FPGA_MAX_K   8192
 #define FPGA_MAX_N   8192
@@ -159,7 +119,6 @@ static uint64_t g_buf_C_phys   = BUF_C_PHYS;
 static uint64_t g_buf_size     = BUF_SIZE;
 static int64_t  g_fpga_max_k   = FPGA_MAX_K;
 static int64_t  g_fpga_max_n   = FPGA_MAX_N;
-static int      g_board_detected = 0;
 
 static void wr32(uint32_t off, uint32_t val) { g_ctrl[off/4] = val; }
 static uint32_t rd32(uint32_t off)           { return g_ctrl[off/4]; }
@@ -173,20 +132,7 @@ int fpga_init(void) {
     }
     LOGI("/dev/mem opened OK (fd=%d)", g_mem_fd);
 
-    select_board_config(&g_buf_A_phys, &g_buf_BD_phys, &g_buf_BQS_phys,
-                        &g_buf_C_phys, &g_buf_size);
-    
-    if (g_buf_size == BUF_SIZE_B02) {
-        g_fpga_max_k = FPGA_MAX_K_B02;
-        g_fpga_max_n = FPGA_MAX_N_B02;
-        g_board_detected = 2;
-        LOGI("Detected Board ZCU104-02 (1.7GB): buffer 51MB, max K=%ld N=%ld", g_fpga_max_k, g_fpga_max_n);
-    } else {
-        g_fpga_max_k = FPGA_MAX_K_B01;
-        g_fpga_max_n = FPGA_MAX_N_B01;
-        g_board_detected = 1;
-        LOGI("Detected Board ZCU104-01 (2GB): buffer 64MB, max K=%ld N=%ld", g_fpga_max_k, g_fpga_max_n);
-    }
+    LOGI("Configured for Board (mem=1792M): Safe hidden RAM [0x70000000 - 0x7FFFFFFF]");
 
     g_ctrl = (volatile uint32_t*)mmap(NULL, CTRL_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, g_mem_fd, CTRL_PHYS);
     if (g_ctrl == MAP_FAILED) return -1;
@@ -217,7 +163,16 @@ void fpga_cleanup(void) {
     if (g_mem_fd >= 0) close(g_mem_fd);
     free(g_B_d_buf); free(g_B_qs_buf);
 }
+// Context tracking for current operation
+static int g_current_layer_id = 0;
+static int g_current_seq_pos = 0;
+static int g_is_attention_op = 0;
 
+void fpga_set_context(int layer_id, int seq_pos, int is_attn) {
+    g_current_layer_id = layer_id;
+    g_current_seq_pos = seq_pos;
+    g_is_attention_op = is_attn;
+}
 static int fpga_run_matmul_internal(
     const float* A,
     const uint16_t* B_d,
@@ -234,22 +189,16 @@ static int fpga_run_matmul_internal(
     size_t sz_Bqs    = (size_t)K * N * sizeof(int8_t);
     size_t sz_C_real = (size_t)M_real * N * sizeof(float);
 
-    // ── MÁY QUÉT KIỂM TRA DỮ LIỆU ĐẦU VÀO TRƯỚC KHI CHẠY ──
     LOGT("=============================================");
     LOGT("[DEBUG DATA] Soi data HOST gui di (M_pad=%d, K=%d, N=%d)", M_pad, K, N);
     
     const float* dbg_A = (const float*)A;
     int a_has_nan = 0;
     for(size_t i = 0; i < (size_t)M_pad * K; i++) {
-        if (std::isnan(dbg_A[i]) || std::isinf(dbg_A[i])) {
-            a_has_nan = 1; break;
-        }
+        if (std::isnan(dbg_A[i]) || std::isinf(dbg_A[i])) { a_has_nan = 1; break; }
     }
-    if (a_has_nan) {
-        LOGE("[FATAL ERROR] Ma tran A da chua san NaN tu CPU truyen xuong! (Hieu ung Poisoned Cache)");
-    } else {
-        LOGT("  [OK] Ma tran A sach se, khong co NaN.");
-    }
+    if (a_has_nan) { LOGE("[FATAL ERROR] Ma tran A da chua san NaN tu CPU truyen xuong!"); } 
+    else { LOGT("  [OK] Ma tran A sach se, khong co NaN."); }
     
     LOGT("  A[0..7]: %f, %f, %f, %f, %f, %f, %f, %f",
          dbg_A[0], dbg_A[1], dbg_A[2], dbg_A[3], dbg_A[4], dbg_A[5], dbg_A[6], dbg_A[7]);
@@ -265,7 +214,7 @@ static int fpga_run_matmul_internal(
     }
     LOGT("=============================================");
 
-    while (!(rd32(REG_CTRL) & 0x4)) { /* wait idle */ }
+    while (!(rd32(REG_CTRL) & 0x4)) { }
 
     memcpy(g_buf_A, A, sz_A);
 
@@ -288,13 +237,17 @@ static int fpga_run_matmul_internal(
     wr32(REG_N, (uint32_t)N);
 
     wr32(REG_CTRL, 0x1);
-    while (!(rd32(REG_CTRL) & 0x2)) { /* wait done */ }
+    while (!(rd32(REG_CTRL) & 0x2)) { }
 
     memcpy(C, g_buf_C, sz_C_real);
     
+    
+    LOGE("--- KET QUA TU FPGA ---");
     int has_nan_inf = 0;
-    for (int i = 0; i < ((N < 10) ? N : 10); i++) {
-        if (std::isnan(C[i]) || std::isinf(C[i])) has_nan_inf = 1;
+    for (int i = 0; i < 8; i++) {
+        float val = C[i];
+        if (std::isnan(val) || std::isinf(val)) has_nan_inf = 1;
+        LOGE("C[%d] = %f", i, val);
     }
     if (has_nan_inf) LOGE("[DEBUG] Output tra ve co NaN/Inf!");
 
@@ -360,4 +313,50 @@ int fpga_try_matmul(
     free(A_pad_buf);
     if (ret) g_fpga_count++; else g_cpu_count++;
     return ret;
+}
+int fpga_try_matmul_extended(
+    struct ggml_tensor * src0,
+    struct ggml_tensor * src1,
+    struct ggml_tensor * dst,
+    int ith,
+    int layer_id,
+    int seq_pos,
+    int is_attention)
+{
+    // Basic validation
+    if (!g_fpga_initialized) return 0;
+    if (!src0 || !src1 || !dst) return 0;
+    
+    pthread_mutex_lock(&g_mutex);
+    
+    // Store context
+    fpga_set_context(layer_id, seq_pos, is_attention);
+    
+    // Write control registers with layer info
+    wr32(REG_LAYER_ID, (uint32_t)layer_id);
+    wr32(REG_SEQ_POS, (uint32_t)seq_pos);
+    wr32(REG_IS_ATTN, (uint32_t)is_attention);
+    
+    __sync_synchronize();
+    
+    // For now, delegate to existing fpga_try_matmul
+    // Later you can optimize based on is_attention flag
+    const float* A = (const float*)src1->data;
+    const uint16_t* B_d = (const uint16_t*)src0->data;
+    const int8_t* B_qs = (const int8_t*)src0->data;
+    float* C = (float*)dst->data;
+    
+    // Use reasonable default dimensions
+    // In real use, extract from tensors
+    int M = 16;
+    int K = 1024;
+    int N = 1024;
+    
+    int ret = fpga_run_matmul_internal(
+        A, B_d, B_qs, C,
+        M, M, K, N, 1);
+    
+    pthread_mutex_unlock(&g_mutex);
+    
+    return ret ? 1 : 0;
 }
