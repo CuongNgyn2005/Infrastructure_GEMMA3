@@ -1243,12 +1243,21 @@ static int get_current_seq_pos(void) {
     return g_current_seq_pos;
 } 
 #endif
-    // ---  (FPGA HOOK) ---
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
 
-    //  ---
+    // 1. DỜI PHẦN KHAI BÁO BIẾN LÊN TRÊN CÙNG
+    const struct ggml_tensor * src0 = dst->src[0]; // ma tran nguon thu nhat 
+    const struct ggml_tensor * src1 = dst->src[1]; // ma tran nguon thu hai 
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int ith = params->ith; // chi so cua thread hien tai 
+    const int nth = params->nth; // tong so thread 
+
+    // 2. BÂY GIỜ MỚI GỌI FPGA HOOK
 #ifdef USE_FPGA
     pthread_once(&g_fpga_once, do_fpga_init);  // thread-safe, chạy 1 lần
 
@@ -1259,7 +1268,6 @@ void ggml_compute_forward_mul_mat(
     }
 
    if (g_fpga_initialized) {
-        // NEW: Use extended interface with layer tracking
         int layer_id = extract_layer_id_from_name(src0->name);
         if (fpga_try_matmul_extended(
                 src0, src1, dst, ith,
@@ -1272,14 +1280,6 @@ void ggml_compute_forward_mul_mat(
     }
 #endif
 
-    // --- END TASK 5 (FPGA HOOK) ---
-    const struct ggml_tensor * src0 = dst->src[0]; // ma tran nguon thu nhat 
-    const struct ggml_tensor * src1 = dst->src[1]; // ma tran nguon thu hai 
-
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    const int ith = params->ith;// chi so cua thread hien tai 
-    const int nth = params->nth; // tong so thread 
 /// ================ cau hinh du lieu =============================
 // xac dinh kieu du lieu cho phep nhan vector (dot product)
 // lay ham chuyen doi tu float sang kieu du lieu cu the 
@@ -2023,34 +2023,31 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
-               // ggml_compute_forward_flash_attn_ext(params, tensor);
-                   #ifdef USE_FPGA
-                    // Extract Q tensor to get layer ID
-                    struct ggml_tensor * Q = node->src[0];
-                    int layer_id = extract_layer_id_from_name(Q->name);
-                    int seq_pos = get_current_seq_pos();
-                    
-                    if (g_fpga_initialized) {
-                        // Try FPGA attention path
-                        if (fpga_try_matmul_extended(
-                                node->src[1],  // K
-                                Q,             // Q
-                                node,          // output
-                                ith,
-                                layer_id,
-                                seq_pos,
-                                1))            // is_attention = 1
-                        {
-                            *compute_status = GGML_COMPUTE_STATUS_COMPLETE;
-                            return;
-                        }
+               #ifdef USE_FPGA
+                // Thay 'node' thành 'tensor'
+                struct ggml_tensor * Q = tensor->src[0];
+                int layer_id = extract_layer_id_from_name(Q->name);
+                int seq_pos = get_current_seq_pos();
+                
+                if (g_fpga_initialized) {
+                    // Try FPGA attention path
+                    if (fpga_try_matmul_extended(
+                            tensor->src[1],  // K
+                            Q,               // Q
+                            tensor,          // output
+                            params->ith,     // Sửa thành params->ith
+                            layer_id,
+                            seq_pos,
+                            1))              // is_attention = 1
+                    {
+                        return; // FPGA đã xử lý xong, thoát luôn không cần compute_status
                     }
-                    #endif
-                    
-                    // Fall back to CPU Flash Attention
-                    ggml_compute_forward_flash_attn_ext(params, node);
-                    *compute_status = GGML_COMPUTE_STATUS_COMPLETE;
-                    return;
+                }
+                #endif
+                
+                // Fall back to CPU Flash Attention
+                ggml_compute_forward_flash_attn_ext(params, tensor); // Sửa node thành tensor
+                return;
             } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {

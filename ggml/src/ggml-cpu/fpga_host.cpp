@@ -314,6 +314,65 @@ int fpga_try_matmul(
     if (ret) g_fpga_count++; else g_cpu_count++;
     return ret;
 }
+// ===================================================================
+// HÀM CHẠY ATTENTION (IS_ATTN = 1)
+// ===================================================================
+static int fpga_run_attention(
+    const float* Q,
+    const uint16_t* K_scales,
+    const int8_t* K_V_data,
+    float* output,
+    int M, int K, int N, // Thêm các chiều để truyền xuống FPGA
+    int layer_id,
+    int seq_pos,
+    int is_attn)
+{
+    // Đảm bảo không có ai khác tranh giành FPGA lúc này
+    // Lưu ý: Đã gọi lock mutex ở fpga_try_matmul_extended rồi, nên ở đây không gọi nữa
+    
+    // 1. Ghi tham số ngữ cảnh
+    wr32(REG_LAYER_ID, (uint32_t)layer_id);
+    wr32(REG_SEQ_POS,  (uint32_t)seq_pos);
+    wr32(REG_IS_ATTN,  (uint32_t)is_attn);
+    
+    // 2. Chuẩn bị dữ liệu Q, K, V
+    // Kernel HLS hiện tại mong đợi A chứa Q, B_qs chứa K và V, B_d chứa Scale
+    // M, K, N truyền xuống để mạch biết Head Dim
+    const int HEAD_DIM = 64; // Theo chuẩn kernel của bạn
+
+    memcpy(g_buf_A, Q, HEAD_DIM * sizeof(float));
+    memcpy(g_buf_Bqs, K_V_data, 2 * HEAD_DIM * sizeof(int8_t));
+    memcpy(g_buf_Bd, K_scales, 2 * sizeof(uint16_t));
+    
+    __sync_synchronize();
+
+    // 3. Truyền địa chỉ
+    wr32(REG_A_LO,   (uint32_t)(g_buf_A_phys   & 0xFFFFFFFF));
+    wr32(REG_A_HI,   (uint32_t)(g_buf_A_phys   >> 32));
+    wr32(REG_BD_LO,  (uint32_t)(g_buf_BD_phys  & 0xFFFFFFFF));
+    wr32(REG_BD_HI,  (uint32_t)(g_buf_BD_phys  >> 32));
+    wr32(REG_BQS_LO, (uint32_t)(g_buf_BQS_phys & 0xFFFFFFFF));
+    wr32(REG_BQS_HI, (uint32_t)(g_buf_BQS_phys >> 32));
+    wr32(REG_C_LO,   (uint32_t)(g_buf_C_phys   & 0xFFFFFFFF));
+    wr32(REG_C_HI,   (uint32_t)(g_buf_C_phys   >> 32));
+    
+    wr32(REG_M, (uint32_t)M);
+    wr32(REG_K, (uint32_t)K);
+    wr32(REG_N, (uint32_t)N);
+
+    // 4. Kích hoạt FPGA
+    wr32(REG_CTRL, 0x1);
+    while (!(rd32(REG_CTRL) & 0x2)) { }
+
+    // 5. Đọc kết quả
+    memcpy(output, g_buf_C, HEAD_DIM * sizeof(float));
+    
+    return 1;
+}
+
+// ===================================================================
+// HÀM MỞ RỘNG ĐỂ GIAO TIẾP VỚI GGML-CPU.C
+// ===================================================================
 int fpga_try_matmul_extended(
     struct ggml_tensor * src0,
     struct ggml_tensor * src1,
@@ -323,40 +382,80 @@ int fpga_try_matmul_extended(
     int seq_pos,
     int is_attention)
 {
-    // Basic validation
     if (!g_fpga_initialized) return 0;
     if (!src0 || !src1 || !dst) return 0;
+    if (ith != 0) return 1; // Chỉ cho thread 0 giao tiếp FPGA
+
+    // Tính toán kích thước thật từ tensor
+    const int64_t K = src0->ne[0];
+    const int64_t N = src0->ne[1];
+    const int64_t M = src1->ne[1];
+
+    // Padding cho M (Giữ nguyên logic cũ)
+    const int64_t M_pad = ((M + 15) / 16) * 16;
+    if (M_pad > FPGA_MAX_M) { g_cpu_count++; return 0; }
     
     pthread_mutex_lock(&g_mutex);
-    
-    // Store context
     fpga_set_context(layer_id, seq_pos, is_attention);
-    
-    // Write control registers with layer info
-    wr32(REG_LAYER_ID, (uint32_t)layer_id);
-    wr32(REG_SEQ_POS, (uint32_t)seq_pos);
-    wr32(REG_IS_ATTN, (uint32_t)is_attention);
-    
-    __sync_synchronize();
-    
-    // For now, delegate to existing fpga_try_matmul
-    // Later you can optimize based on is_attention flag
-    const float* A = (const float*)src1->data;
-    const uint16_t* B_d = (const uint16_t*)src0->data;
-    const int8_t* B_qs = (const int8_t*)src0->data;
-    float* C = (float*)dst->data;
-    
-    // Use reasonable default dimensions
-    // In real use, extract from tensors
-    int M = 16;
-    int K = 1024;
-    int N = 1024;
-    
-    int ret = fpga_run_matmul_internal(
-        A, B_d, B_qs, C,
-        M, M, K, N, 1);
-    
+
+    int ret = 0;
+
+    if (is_attention == 1) {
+        // --- NHÁNH ATTENTION ---
+        // Theo chuẩn đồ thị: src1 là Q, src0 chứa K và V
+        const float* Q = (const float*)src1->data;
+        const uint16_t* K_scales = (const uint16_t*)src0->data; 
+        const int8_t* K_V_data = (const int8_t*)src0->data + 2; // Offset cho đúng vị trí K_V (Tùy thuộc cách bạn thiết kế tensor K_V)
+        float* output = (float*)dst->data;
+
+        ret = fpga_run_attention(Q, K_scales, K_V_data, output, (int)M_pad, (int)K, (int)N, layer_id, seq_pos, 1);
+    } 
+    else {
+        // --- NHÁNH MATMUL (MLP) ---
+        // Tương tự logic fpga_try_matmul cũ
+        uint64_t cur_B_key = ((uintptr_t)src0->data) ^ (uint64_t)K ^ (uint64_t)N;
+        int b_changed = (cur_B_key != g_cached_B_key || K != g_cached_B_K || N != g_cached_B_N) ? 1 : 0;
+
+        if (b_changed) {
+            const int num_blocks = (int)((K * N) / QK8_0);
+            const block_q8_0_t* blocks = (const block_q8_0_t*)src0->data;
+
+            #pragma omp parallel for schedule(static) num_threads(4)
+            for (int i = 0; i < num_blocks; i++) {
+                g_B_d_buf[i] = blocks[i].d;
+                const int8_t* src_qs = blocks[i].qs;
+                int8_t* dst_qs = &g_B_qs_buf[i * QK8_0];
+                for (int j = 0; j < QK8_0; j++)
+                    dst_qs[j] = src_qs[j];
+            }
+            g_cached_B_key = cur_B_key;
+            g_cached_B_K   = K;
+            g_cached_B_N   = N;
+        }
+
+        const float* A_src = (const float*)src1->data;
+        float* A_pad_buf = NULL;
+        const float* A_use = A_src;
+
+        if (M_pad != M) {
+            A_pad_buf = (float*)calloc(M_pad * K, sizeof(float));
+            memcpy(A_pad_buf, A_src, (size_t)M * K * sizeof(float));
+            A_use = (const float*)A_pad_buf;
+        }
+
+        float* C = (float*)dst->data;
+        
+        // Ghi metadata trước khi chạy mạch Matmul thường
+        wr32(REG_LAYER_ID, (uint32_t)layer_id);
+        wr32(REG_SEQ_POS,  (uint32_t)seq_pos);
+        wr32(REG_IS_ATTN,  (uint32_t)0);
+
+        ret = fpga_run_matmul_internal(A_use, g_B_d_buf, g_B_qs_buf, C, (int)M_pad, (int)M, (int)K, (int)N, b_changed);
+
+        if (A_pad_buf) free(A_pad_buf);
+    }
+
+    if (ret) g_fpga_count++; else g_cpu_count++;
     pthread_mutex_unlock(&g_mutex);
-    
-    return ret ? 1 : 0;
+    return ret;
 }
