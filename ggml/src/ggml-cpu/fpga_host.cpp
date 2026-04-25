@@ -11,7 +11,29 @@
 #include <time.h>
 #include <omp.h>       // OpenMP parallel repack
 #include <cmath>       // for isnan(), isinf()
+// Fallback converter FP16 -> FP32
+static inline float safe_fp16_to_fp32(uint16_t h) {
+    uint32_t s = (uint32_t)((h >> 15) & 1U);
+    uint32_t e = (uint32_t)((h >> 10) & 0x1FU);
+    uint32_t m = (uint32_t)(h & 0x3FFU);
+    uint32_t b;
+    if      (e == 0U)  b = s << 31;
+    else if (e == 31U) b = (s << 31) | 0x7F800000U | (m << 13);
+    else               b = (s << 31) | ((e + 112U) << 23) | (m << 13);
+    union { uint32_t i; float f; } u; u.i = b; return u.f;
+}
 
+// Fallback converter FP32 -> FP16
+static inline uint16_t safe_fp32_to_fp16(float f) {
+    union { float f; uint32_t i; } u; u.f = f;
+    uint32_t i = u.i;
+    uint32_t s = (i >> 16) & 0x8000;
+    int e = ((i >> 23) & 0xff) - 127 + 15;
+    uint32_t m = (i >> 13) & 0x3ff;
+    if (e <= 0) return s;
+    if (e >= 31) return s | 0x7c00;
+    return s | (e << 10) | m;
+}
 // ══════════════════════════════════════════════════════════
 //  FPGA DEBUG LOG
 // ══════════════════════════════════════════════════════════
@@ -165,7 +187,7 @@ void fpga_cleanup(void) {
 }
 // Context tracking for current operation
 static int g_current_layer_id = 0;
-static int g_current_seq_pos = 0;
+ int g_current_seq_pos = 0;
 static int g_is_attention_op = 0;
 
 void fpga_set_context(int layer_id, int seq_pos, int is_attn) {
@@ -182,7 +204,7 @@ static int fpga_run_matmul_internal(
     int K, int N,
     int b_changed)
 {
-    pthread_mutex_lock(&g_mutex);
+    //pthread_mutex_lock(&g_mutex);
 
     size_t sz_A      = (size_t)M_pad * K * sizeof(float);
     size_t sz_Bd     = (size_t)(K / QK8_0) * N * sizeof(uint16_t);
@@ -237,7 +259,14 @@ static int fpga_run_matmul_internal(
     wr32(REG_N, (uint32_t)N);
 
     wr32(REG_CTRL, 0x1);
-    while (!(rd32(REG_CTRL) & 0x2)) { }
+    int timeout = 5000000; 
+    while (!(rd32(REG_CTRL) & 0x2)) {
+        timeout--;
+        if (timeout <= 0) {
+            fprintf(stderr, "[FPGA ERROR] HARDWARE TIMEOUT! REG_CTRL = 0x%08X\n", rd32(REG_CTRL));
+            break; // Ép thoát vòng lặp để không treo máy
+        }
+    }
 
     memcpy(C, g_buf_C, sz_C_real);
     
@@ -251,14 +280,14 @@ static int fpga_run_matmul_internal(
     }
     if (has_nan_inf) LOGE("[DEBUG] Output tra ve co NaN/Inf!");
 
-    pthread_mutex_unlock(&g_mutex);
+    //pthread_mutex_unlock(&g_mutex);
     return 1;
 }
 
-int fpga_try_matmul(
-    struct ggml_tensor * src0,
-    struct ggml_tensor * src1,
-    struct ggml_tensor * dst,
+extern "C" int fpga_try_matmul(
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    const struct ggml_tensor * dst,
     int ith)
 {
     const int64_t K = src0->ne[0];
@@ -322,26 +351,19 @@ static int fpga_run_attention(
     const uint16_t* K_scales,
     const int8_t* K_V_data,
     float* output,
-    int M, int K, int N, // Thêm các chiều để truyền xuống FPGA
+    int head_dim,  // <--- Đã sửa: Truyền head_dim thay vì M, K, N
     int layer_id,
     int seq_pos,
     int is_attn)
 {
-    // Đảm bảo không có ai khác tranh giành FPGA lúc này
-    // Lưu ý: Đã gọi lock mutex ở fpga_try_matmul_extended rồi, nên ở đây không gọi nữa
-    
     // 1. Ghi tham số ngữ cảnh
     wr32(REG_LAYER_ID, (uint32_t)layer_id);
     wr32(REG_SEQ_POS,  (uint32_t)seq_pos);
     wr32(REG_IS_ATTN,  (uint32_t)is_attn);
     
-    // 2. Chuẩn bị dữ liệu Q, K, V
-    // Kernel HLS hiện tại mong đợi A chứa Q, B_qs chứa K và V, B_d chứa Scale
-    // M, K, N truyền xuống để mạch biết Head Dim
-    const int HEAD_DIM = 64; // Theo chuẩn kernel của bạn
-
-    memcpy(g_buf_A, Q, HEAD_DIM * sizeof(float));
-    memcpy(g_buf_Bqs, K_V_data, 2 * HEAD_DIM * sizeof(int8_t));
+    // 2. Chuẩn bị dữ liệu Q, K, V (Động theo head_dim)
+    memcpy(g_buf_A, Q, head_dim * sizeof(float));
+    memcpy(g_buf_Bqs, K_V_data, 2 * head_dim * sizeof(int8_t));
     memcpy(g_buf_Bd, K_scales, 2 * sizeof(uint16_t));
     
     __sync_synchronize();
@@ -356,60 +378,152 @@ static int fpga_run_attention(
     wr32(REG_C_LO,   (uint32_t)(g_buf_C_phys   & 0xFFFFFFFF));
     wr32(REG_C_HI,   (uint32_t)(g_buf_C_phys   >> 32));
     
-    wr32(REG_M, (uint32_t)M);
-    wr32(REG_K, (uint32_t)K);
-    wr32(REG_N, (uint32_t)N);
+    // MƯỢN THANH GHI K ĐỂ TRUYỀN HEAD_DIM XUỐNG MẠCH CỨNG
+    wr32(REG_M, 1);
+    wr32(REG_K, (uint32_t)head_dim);
+    wr32(REG_N, 1);
 
     // 4. Kích hoạt FPGA
     wr32(REG_CTRL, 0x1);
-    while (!(rd32(REG_CTRL) & 0x2)) { }
+    int timeout = 5000000; 
+    while (!(rd32(REG_CTRL) & 0x2)) {
+        timeout--;
+        if (timeout <= 0) {
+            fprintf(stderr, "[FPGA ERROR] HARDWARE TIMEOUT! REG_CTRL = 0x%08X\n", rd32(REG_CTRL));
+            break;
+        }
+    }
 
     // 5. Đọc kết quả
-    memcpy(output, g_buf_C, HEAD_DIM * sizeof(float));
+    memcpy(output, g_buf_C, head_dim * sizeof(float));
     
     return 1;
 }
-
 // ===================================================================
 // HÀM MỞ RỘNG ĐỂ GIAO TIẾP VỚI GGML-CPU.C
 // ===================================================================
-int fpga_try_matmul_extended(
-    struct ggml_tensor * src0,
-    struct ggml_tensor * src1,
-    struct ggml_tensor * dst,
+extern "C" int fpga_try_matmul_extended(
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    const struct ggml_tensor * dst,
     int ith,
     int layer_id,
     int seq_pos,
     int is_attention)
 {
-    if (!g_fpga_initialized) return 0;
-    if (!src0 || !src1 || !dst) return 0;
-    if (ith != 0) return 1; // Chỉ cho thread 0 giao tiếp FPGA
+   if (!src0 || !src1 || !dst) return 0;
 
     // Tính toán kích thước thật từ tensor
     const int64_t K = src0->ne[0];
     const int64_t N = src0->ne[1];
     const int64_t M = src1->ne[1];
-
-    // Padding cho M (Giữ nguyên logic cũ)
     const int64_t M_pad = ((M + 15) / 16) * 16;
-    if (M_pad > FPGA_MAX_M) { g_cpu_count++; return 0; }
+
+    // =========================================================
+    // 1. KIỂM TRA ĐIỀU KIỆN TỪ CHỐI (DÀNH CHO TẤT CẢ CÁC THREAD)
+    // Nếu rớt bài kiểm tra này, toàn bộ các Thread phải return 0
+    // =========================================================
+    if (is_attention == 0) {
+        // Chỉ kiểm tra gắt gao với MatMul (Nhánh 1)
+        if (src0->type != GGML_TYPE_Q8_0) return 0;
+        if (src1->type != GGML_TYPE_F32)  return 0;
+        if (dst->type  != GGML_TYPE_F32)  return 0;
+        if (K % 64 != 0 || N % 64 != 0)   return 0;
+        if (K > g_fpga_max_k || N > g_fpga_max_n || M > FPGA_MAX_M) return 0;
+        if (M < FPGA_MIN_M) return 0;
+    }
     
+    if (M_pad > FPGA_MAX_M) return 0; // Áp dụng cho cả MatMul và Attention
+
+    // =========================================================
+    // 2. CHỐT CHẠY FPGA. Cho phép các Thread phụ đi ngủ.
+    // =========================================================
+    if (ith != 0) return 1; 
+
+    // Chỉ còn lại duy nhất Thread 0 ở đây
     pthread_mutex_lock(&g_mutex);
     fpga_set_context(layer_id, seq_pos, is_attention);
-
-    int ret = 0;
+    
+    fprintf(stderr, "\n[FPGA HOST] >>> Thread 0 Locked Mutex. is_attn=%d, layer_id=%d, M=%d, K=%d, N=%d\n", 
+            is_attention, layer_id, (int)M_pad, (int)K, (int)N);
 
     if (is_attention == 1) {
-        // --- NHÁNH ATTENTION ---
-        // Theo chuẩn đồ thị: src1 là Q, src0 chứa K và V
-        const float* Q = (const float*)src1->data;
-        const uint16_t* K_scales = (const uint16_t*)src0->data; 
-        const int8_t* K_V_data = (const int8_t*)src0->data + 2; // Offset cho đúng vị trí K_V (Tùy thuộc cách bạn thiết kế tensor K_V)
+        // --- NHÁNH ATTENTION - CÁCH 2: LƯỢNG TỬ HÓA ON-THE-FLY ---
+        
+        // Trong Llama.cpp, dst chính là Node FLASH_ATTN_EXT
+        // Nó chứa: src[0] = Q, src[1] = K, src[2] = V
+        const struct ggml_tensor * Q_tensor = dst->src[0];
+        const struct ggml_tensor * K_tensor = dst->src[1];
+        const struct ggml_tensor * V_tensor = dst->src[2];
+
+        // Lấy con trỏ thô
+        const float* Q = (const float*)Q_tensor->data;
+        const uint16_t* K_data = (const uint16_t*)K_tensor->data;
+        const uint16_t* V_data = (const uint16_t*)V_tensor->data;
+
+        int head_dim = Q_tensor->ne[0]; 
+        if (head_dim > 512) return 0;
+        // Trích xuất Token mới nhất (Luôn nằm ở cuối mảng K, V)
+        int current_idx = K_tensor->ne[1] - 1;
+        if (current_idx < 0) current_idx = 0;
+
+        // Nhảy đến đúng địa chỉ của Token hiện tại nhờ Stride (nb[1])
+        const uint16_t* k_current = (const uint16_t*)((const char*)K_data + current_idx * K_tensor->nb[1]);
+        const uint16_t* v_current = (const uint16_t*)((const char*)V_data + current_idx * V_tensor->nb[1]);
+
+        int8_t kv_quantized[1024]; // Chứa tối đa 512 cho K, 512 cho V
+        uint16_t kv_scales[2];    
+        
+        float k_f32[512]; 
+        float v_f32[512]; 
+        
+        // ---------------------------------------------------
+        // Lượng tử hóa K (Symmetric INT8 Quantization)
+        // ---------------------------------------------------
+        float max_k = 0.0f;
+        // (Đã xóa dòng khai báo lặp float k_f32[64] ở đây)
+        
+        for (int i = 0; i < head_dim; i++) {
+            k_f32[i] = safe_fp16_to_fp32(k_current[i]);
+            if (fabs(k_f32[i]) > max_k) max_k = fabs(k_f32[i]);
+        }
+        float scale_k = max_k / 127.0f;
+        kv_scales[0] = safe_fp32_to_fp16(scale_k);
+        float inv_scale_k = scale_k > 0 ? 1.0f / scale_k : 0.0f;
+        
+        for (int i = 0; i < head_dim; i++) {
+            kv_quantized[i] = (int8_t)roundf(k_f32[i] * inv_scale_k);
+        }
+
+        // ---------------------------------------------------
+        // Lượng tử hóa V (Symmetric INT8 Quantization)
+        // ---------------------------------------------------
+        float max_v = 0.0f;
+        // (Đã xóa dòng khai báo lặp float v_f32[64] ở đây)
+        
+        for (int i = 0; i < head_dim; i++) {
+            v_f32[i] = safe_fp16_to_fp32(v_current[i]);
+            if (fabs(v_f32[i]) > max_v) max_v = fabs(v_f32[i]);
+        }
+        float scale_v = max_v / 127.0f;
+        kv_scales[1] = safe_fp32_to_fp16(scale_v);
+        float inv_scale_v = scale_v > 0 ? 1.0f / scale_v : 0.0f;
+        
+        for (int i = 0; i < head_dim; i++) {
+            kv_quantized[head_dim + i] = (int8_t)roundf(v_f32[i] * inv_scale_v);
+        }
+
+        // Trỏ mảng đầu ra C
         float* output = (float*)dst->data;
 
-        ret = fpga_run_attention(Q, K_scales, K_V_data, output, (int)M_pad, (int)K, (int)N, layer_id, seq_pos, 1);
-    } 
+        fprintf(stderr, "[FPGA HOST] Calling fpga_run_attention (Layer %d, Pos %d, HeadDim %d)...\n", 
+                layer_id, seq_pos, head_dim);
+        
+        // Đẩy thẳng xuống FPGA (SỬA: Chỉ truyền head_dim)
+        fpga_run_attention(Q, kv_scales, kv_quantized, output, head_dim, layer_id, seq_pos, 1);
+        
+        fprintf(stderr, "[FPGA HOST] fpga_run_attention DONE!\n");
+    }
     else {
         // --- NHÁNH MATMUL (MLP) ---
         // Tương tự logic fpga_try_matmul cũ
@@ -450,12 +564,20 @@ int fpga_try_matmul_extended(
         wr32(REG_SEQ_POS,  (uint32_t)seq_pos);
         wr32(REG_IS_ATTN,  (uint32_t)0);
 
-        ret = fpga_run_matmul_internal(A_use, g_B_d_buf, g_B_qs_buf, C, (int)M_pad, (int)M, (int)K, (int)N, b_changed);
-
+        fprintf(stderr, "[FPGA HOST] Calling fpga_run_matmul_internal...\n");
+        
+        fpga_run_matmul_internal(A_use, g_B_d_buf, g_B_qs_buf, C, (int)M_pad, (int)M, (int)K, (int)N, b_changed);
         if (A_pad_buf) free(A_pad_buf);
+        
+        fprintf(stderr, "[FPGA HOST] fpga_run_matmul_internal DONE!\n");
     }
 
-    if (ret) g_fpga_count++; else g_cpu_count++;
+    g_fpga_count++;
     pthread_mutex_unlock(&g_mutex);
-    return ret;
+    fprintf(stderr, "[FPGA HOST] <<< Mutex Unlocked. Returning 1.\n\n");
+    
+    return 1;
+}
+extern "C" void fpga_reset_kv_cache(void) {
+    g_current_seq_pos = 0;
 }
