@@ -13,7 +13,8 @@
 #include <stdexcept>
 // FPGA sequence position tracking
 extern void fpga_set_context(int layer_id, int seq_pos, int is_attn);
-static int g_kv_seq_pos = 0;
+extern "C" void fpga_reset_kv_cache(void);  // Đã thêm chuẩn C
+extern int g_current_seq_pos;
 //
 // llama_context
 //
@@ -823,16 +824,14 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // micro-batching is not possible for non-causal encoding, so we process the batch in a single shot
     GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens");
 
-    if (t_compute_start_us == 0) {
+   if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
-        extern void fpga_reset_kv_cache(void);
-            if (t_compute_start_us == 0) {
-                g_kv_seq_pos = 0;  // Reset for new sequence
-                fpga_reset_kv_cache();
-                LLAMA_LOG_DEBUG("New sequence detected, FPGA cache reset\n");
-            }
+        
+        // Reset FPGA K-V cache cho chuỗi suy luận mới
+        g_current_seq_pos = 0;  
+        fpga_reset_kv_cache();
+        LLAMA_LOG_DEBUG("New sequence detected, FPGA cache reset\n");
     }
-
     // TODO: this clear of the buffer can easily be forgotten - need something better
     embd_seq.clear();
 
@@ -1094,20 +1093,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
         const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
-        if (success) {
-            // For single-token decode phase, increment position
-            if (n_tokens == 1) {
-                g_kv_seq_pos++;
-                if (g_kv_seq_pos >= 512) {
-                    // Cache overflow - would need to reset or shift
-                    LLAMA_LOG_WARN("KV cache full at position %d\n", g_kv_seq_pos);
-                    // fpga_reset_kv_cache();
-                }
-            } else {
-                // Batch processing (prefill)
-                // Position is handled per token in the batch
-            }
-        }
+
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
@@ -1140,17 +1126,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
         if (res) {  // Only if generation was successful
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                g_kv_seq_pos++;
+                g_current_seq_pos++;
                 
-                if (g_kv_seq_pos >= 512) {
-                    LLAMA_LOG_WARN("KV cache full at position %d\n", g_kv_seq_pos);
-                    // TODO: Implement cache shift or reset
-                    // fpga_reset_kv_cache();
-                    // g_kv_seq_pos = 0;
+                if (g_current_seq_pos >= 512) {
+                    LLAMA_LOG_WARN("KV cache full at position %d\n", g_current_seq_pos);
                 }
             }
             LLAMA_LOG_DEBUG("seq_pos updated to %d (n_tokens=%d)\n", 
-                            g_kv_seq_pos, ubatch.n_tokens);
+                            g_current_seq_pos, ubatch.n_tokens);
         }
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {
@@ -2059,8 +2042,7 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
-    extern void fpga_reset_kv_cache(void);
-    g_kv_seq_pos = 0;  // Reset FPGA K-V cache position
+    g_current_seq_pos = 0;  // Reset FPGA K-V cache position
     fpga_reset_kv_cache();
 }
 
