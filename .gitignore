@@ -1,0 +1,12 @@
+# Bỏ qua tất cả các thư mục có tên bắt đầu bằng "build"
+build*/
+
+# NGOẠI TRỪ thư mục build_mem (giữ lại thư mục này và mọi thứ bên trong)
+!build_mem/
+!build_mem/**
+
+# Bỏ qua thư mục bitstream
+bitstream/
+
+# Bỏ qua tất cả các file có đuôi .bit
+*.bit

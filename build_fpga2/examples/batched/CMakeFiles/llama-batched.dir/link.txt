@@ -1,1 +1,0 @@
-/usr/bin/c++ -O2 -g -DNDEBUG "CMakeFiles/llama-batched.dir/batched.cpp.o" -o ../../bin/llama-batched  -Wl,-rpath,/home/newubuntu/llama.cpp/build_fpga2/bin: ../../common/libcommon.a ../../bin/libllama.so ../../bin/libggml.so ../../bin/libggml-cpu.so ../../bin/libggml-base.so /usr/lib/x86_64-linux-gnu/libcurl.so

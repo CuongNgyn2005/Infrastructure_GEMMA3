@@ -1,1 +1,0 @@
-/usr/bin/c++ -O2 -g -DNDEBUG "CMakeFiles/llama-quantize.dir/quantize.cpp.o" -o ../../bin/llama-quantize  -Wl,-rpath,/home/newubuntu/llama.cpp/build_fpga2/bin: ../../common/libcommon.a ../../bin/libllama.so ../../bin/libggml.so ../../bin/libggml-cpu.so ../../bin/libggml-base.so /usr/lib/x86_64-linux-gnu/libcurl.so

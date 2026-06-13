@@ -1,1 +1,0 @@
-/usr/bin/c++ -fPIC -O3 -DNDEBUG -shared -Wl,-soname,libmtmd.so -o ../../bin/libmtmd.so CMakeFiles/mtmd.dir/mtmd.cpp.o CMakeFiles/mtmd.dir/mtmd-audio.cpp.o CMakeFiles/mtmd.dir/clip.cpp.o CMakeFiles/mtmd.dir/mtmd-helper.cpp.o  -Wl,-rpath,/home/newubuntu/llama.cpp/build7/bin: ../../bin/libllama.so ../../bin/libggml.so ../../bin/libggml-cpu.so ../../bin/libggml-base.so 

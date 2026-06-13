@@ -1,1 +1,0 @@
-/usr/bin/c++ -O2 -g -DNDEBUG "CMakeFiles/test-thread-safety.dir/test-thread-safety.cpp.o" "CMakeFiles/test-thread-safety.dir/get-model.cpp.o" -o ../bin/test-thread-safety  -Wl,-rpath,/home/newubuntu/llama.cpp/build_ver2/bin: ../common/libcommon.a /usr/lib/x86_64-linux-gnu/libcurl.so ../bin/libllama.so ../bin/libggml.so ../bin/libggml-cpu.so ../bin/libggml-base.so

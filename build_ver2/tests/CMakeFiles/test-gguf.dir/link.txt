@@ -1,1 +1,0 @@
-/usr/bin/c++ -O2 -g -DNDEBUG "CMakeFiles/test-gguf.dir/test-gguf.cpp.o" "CMakeFiles/test-gguf.dir/get-model.cpp.o" -o ../bin/test-gguf  -Wl,-rpath,/home/newubuntu/llama.cpp/build_ver2/bin: ../common/libcommon.a /usr/lib/x86_64-linux-gnu/libcurl.so ../bin/libllama.so ../bin/libggml.so ../bin/libggml-cpu.so ../bin/libggml-base.so
