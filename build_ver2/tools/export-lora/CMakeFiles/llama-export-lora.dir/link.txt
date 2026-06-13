@@ -1,0 +1,1 @@
+/usr/bin/c++ -O2 -g -DNDEBUG "CMakeFiles/llama-export-lora.dir/export-lora.cpp.o" -o ../../bin/llama-export-lora  -Wl,-rpath,/home/newubuntu/llama.cpp/build_ver2/bin: ../../common/libcommon.a ../../bin/libllama.so ../../bin/libggml.so ../../bin/libggml-cpu.so ../../bin/libggml-base.so /usr/lib/x86_64-linux-gnu/libcurl.so

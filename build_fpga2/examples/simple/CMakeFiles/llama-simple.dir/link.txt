@@ -1,0 +1,1 @@
+/usr/bin/c++ -O2 -g -DNDEBUG "CMakeFiles/llama-simple.dir/simple.cpp.o" -o ../../bin/llama-simple  -Wl,-rpath,/home/newubuntu/llama.cpp/build_fpga2/bin: ../../bin/libllama.so ../../bin/libggml.so ../../bin/libggml-cpu.so ../../bin/libggml-base.so

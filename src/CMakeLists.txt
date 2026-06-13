@@ -1,7 +1,7 @@
 llama_add_compile_flags()
 
-# Option to enable FPGA/XRT support from CMake command line (cmake -DUSE_FPGA=ON ...)
-option(USE_FPGA "Enable FPGA / XRT support (requires XRT installed)" OFF)
+# Option to enable the Linux /dev/mem FPGA host path from CMake command line.
+option(USE_FPGA "Enable FPGA host hooks via ggml-cpu /dev/mem" OFF)
 
 #
 # libraries
@@ -38,8 +38,6 @@ add_library(llama
             unicode-data.cpp
             unicode.cpp
             unicode.h
-            fpga_host.cpp
-            fpga_host.h
             )
 
 target_include_directories(llama PRIVATE .)
@@ -56,12 +54,5 @@ endif()
 
 
 if (USE_FPGA)
-    # Thêm source mới
-    #target_sources(llama PRIVATE fpga_host.cpp fpga_host.h)
-    
-    # QUAN TRỌNG: KHÔNG link thư viện XRT nữa
-    # Chỉ cần define macro
     target_compile_definitions(llama PUBLIC USE_FPGA)
-    
-    # Nếu trước đây có: target_link_libraries(llama PRIVATE xrt_coreutil ...) -> XÓA NÓ ĐI
 endif()

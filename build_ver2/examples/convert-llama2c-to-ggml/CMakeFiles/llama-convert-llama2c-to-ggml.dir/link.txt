@@ -1,0 +1,1 @@
+/usr/bin/c++ -O2 -g -DNDEBUG "CMakeFiles/llama-convert-llama2c-to-ggml.dir/convert-llama2c-to-ggml.cpp.o" -o ../../bin/llama-convert-llama2c-to-ggml  -Wl,-rpath,/home/newubuntu/llama.cpp/build_ver2/bin: ../../common/libcommon.a ../../bin/libllama.so ../../bin/libggml.so ../../bin/libggml-cpu.so ../../bin/libggml-base.so /usr/lib/x86_64-linux-gnu/libcurl.so

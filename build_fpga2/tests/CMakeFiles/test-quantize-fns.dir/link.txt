@@ -1,0 +1,1 @@
+/usr/bin/c++ -O2 -g -DNDEBUG "CMakeFiles/test-quantize-fns.dir/test-quantize-fns.cpp.o" "CMakeFiles/test-quantize-fns.dir/get-model.cpp.o" -o ../bin/test-quantize-fns  -Wl,-rpath,/home/newubuntu/llama.cpp/build_fpga2/bin: ../common/libcommon.a /usr/lib/x86_64-linux-gnu/libcurl.so ../bin/libllama.so ../bin/libggml.so ../bin/libggml-cpu.so ../bin/libggml-base.so

@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O2 -g -DNDEBUG -shared -Wl,-soname,libggml.so -o ../../bin/libggml.so "CMakeFiles/ggml.dir/ggml-backend-reg.cpp.o"  -Wl,-rpath,/home/newubuntu/llama.cpp/build_ver2/bin: -ldl ../../bin/libggml-cpu.so ../../bin/libggml-base.so

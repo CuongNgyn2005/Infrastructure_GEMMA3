@@ -147,15 +147,11 @@ int main(int argc, char ** argv) {
 #ifdef USE_FPGA
     {
         // Đường dẫn này giờ vô nghĩa với code mới, nhưng cần để hàm ko lỗi
-        std::string xclbin_path = "DUMMY_PATH"; 
-        std::string kernel_name = "DUMMY_KERNEL"; 
-
-        std::string fpga_err;
         // Hàm này giờ chỉ làm nhiệm vụ mmap /dev/mem
-        if (fpga_init()) {
+        if (fpga_init() == 0) {
             LOG_INF("%s: FPGA host initialized (Bare-metal mode)\n", __func__);
         } else {
-            LOG_WRN("%s: FPGA host init failed: %s\n", __func__, fpga_err.c_str());
+            LOG_WRN("%s: FPGA host init failed; CPU fallback remains available\n", __func__);
         }
     }
 #endif
