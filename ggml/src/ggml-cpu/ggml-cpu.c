@@ -1261,18 +1261,12 @@ void ggml_compute_forward_mul_mat(
 #ifdef USE_FPGA
     pthread_once(&g_fpga_once, do_fpga_init);  // thread-safe, chạy 1 lần
 
-    static int hook_count = 0;
-    if (hook_count < 5) {
-        printf("[DEBUG-HOOK] FPGA hook active (initialized=%d)\n", g_fpga_initialized);
-        hook_count++;
-    }
-
    if (g_fpga_initialized) {
         int layer_id = extract_layer_id_from_name(src0->name);
         if (fpga_try_matmul_extended(
                 src0, src1, dst, ith,
                 layer_id,  // Which layer
-                0,         // seq_pos (not used for MLP)
+                get_current_seq_pos(),
                 0))        // is_attention = 0
         {
             return;
