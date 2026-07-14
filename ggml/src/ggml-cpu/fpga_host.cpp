@@ -25,7 +25,7 @@
 #include <vector>
 
 #define FPGA_LOG_FILE "/tmp/fpga_debug.log"
-#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-m0-row256-pl-scale-scheduler-v11"
+#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-c0-cache-metrics-v16"
 
 #define MY_IP_BASE_ADDRESS 0x00000000A0000000LL
 #define REG_BASE_PHYS      0x00000000A0000000LL
@@ -94,8 +94,6 @@ static void fpga_log_line(bool enabled, const char * tag, bool force_flush, cons
 #define LOGDATA(fmt, ...)   fpga_log_line(g_trace_data_enabled, "DATA", false, fmt, ##__VA_ARGS__)
 
 static constexpr uint64_t VPU_BASE_PHYS      = MY_IP_BASE_ADDRESS;
-static constexpr size_t   VPU_REG_MMAP_MIN   = 0x00001000;
-static constexpr size_t   VPU_DEV_MEM_MMAP   = 0x10000000;
 static constexpr size_t   DDR_DEV_MEM_MMAP   = 0x80000000;
 
 static constexpr uint32_t REG_CTRL           = 0x00000000;
@@ -108,6 +106,8 @@ static constexpr uint32_t REG_MODE           = 0x00000060;
 static constexpr uint32_t REG_LIMITS         = 0x00000070;
 static constexpr uint32_t REG_PROGRESS       = 0x00000080;
 static constexpr uint32_t REG_CAPS           = 0x00000090;
+static constexpr uint32_t REG_STREAM_PROTOCOL_VERSION = 0x000000F4;
+static constexpr uint32_t REG_BITSTREAM_ID   = 0x000000F8;
 static constexpr uint32_t REG_BANK           = 0x00000100;
 static constexpr uint32_t REG_JOB_ID         = 0x00000110;
 static constexpr uint32_t REG_BANK_STAT      = 0x00000120;
@@ -126,6 +126,8 @@ static constexpr uint32_t REG_SPU_STREAM_DONE  = 0x000001C4;
 static constexpr uint32_t REG_SPU_STREAM_DROP  = 0x000001D0;
 static constexpr uint32_t REG_SPU_STREAM_OUT   = 0x000001D4;
 static constexpr uint32_t REG_SPU_STREAM_ERROR = 0x000001D8;
+static constexpr uint32_t REG_SPU_STREAM_LAST_JOB = 0x000001E8;
+static constexpr uint32_t REG_SPU_STREAM_LAST_BANK = 0x000001EC;
 
 static constexpr uint32_t CTRL_START         = 0x00000001;
 static constexpr uint32_t CTRL_CLEAR_DONE    = 0x00000002;
@@ -144,6 +146,10 @@ static constexpr uint32_t SPU_OUT_END        = 0x00380000;
 static constexpr uint32_t SPU_PARAM_BASE     = 0x00380000;
 static constexpr uint32_t SPU_PARAM_END      = 0x003C0000;
 static constexpr uint32_t SPU_SCRATCH_END    = 0x00400000;
+// All host-visible MY_IP registers and local-memory windows used by this
+// driver lie below this offset.  The Vivado segment is 256 MiB, but the
+// compatibility /dev/mem path must not map the whole segment unnecessarily.
+static constexpr size_t   VPU_DEVMEM_COMPAT_MMAP = SPU_SCRATCH_END;
 static constexpr size_t   DDR_REQUIRED_BYTES = SPU_SCRATCH_END;
 static constexpr uint32_t WEIGHT_CACHE_BASE  = 0x01000000;
 static constexpr size_t   WEIGHT_CACHE_ALIGN = 4096;
@@ -169,6 +175,12 @@ static constexpr uint32_t VPU_CAP_SPU_RAW_STREAM         = 0x00000020;
 static constexpr uint32_t VPU_CAP_SPU_Q8_SCALE_STREAM    = 0x00000040;
 static constexpr uint32_t SPU_CAP_VPU_RAW_STREAM         = 0x00000100;
 static constexpr uint32_t SPU_CAP_VPU_Q8_SCALE_STREAM    = 0x00000200;
+static constexpr uint32_t SPU_CAP_SILU_MUL               = 0x00000004;
+static constexpr uint32_t SPU_CAP_RMSNORM                = 0x00000008;
+static constexpr uint32_t SPU_CAP_ROPE                   = 0x00000010;
+static constexpr uint32_t SPU_CAP_SOFTMAX                = 0x00000020;
+static constexpr uint32_t FPGA_REQUIRED_STREAM_PROTOCOL_VERSION = 1;
+static constexpr uint32_t FPGA_EXPECTED_BITSTREAM_ID = 0x56505531U; // "VPU1"
 
 static constexpr long long FPGA_DEFAULT_DMA_TIMEOUT_US = 5000000LL;
 static constexpr long long FPGA_DEFAULT_IP_TIMEOUT_US  = 5000000LL;
@@ -176,6 +188,7 @@ static constexpr int      FPGA_DEFAULT_STATUS_EVERY    = 0;
 static constexpr int      FPGA_DEFAULT_PROFILE_EVERY   = 1;
 static constexpr int      FPGA_DEFAULT_DETAIL_EVERY    = 0;
 static constexpr long long FPGA_DEFAULT_LARGE_MATRIX_MIN_MACS = 1000000LL;
+static constexpr long long FPGA_STREAM_POLL_LOG_INTERVAL_US = 50000LL;
 
 typedef uint32_t U32;
 
@@ -241,6 +254,9 @@ typedef struct {
     long long host_accum_us;
     long long weight_cache_hits;
     long long weight_cache_misses;
+    long long weight_cache_lookup_us;
+    long long weight_cache_crc_us;
+    long long weight_pack_us;
     size_t    activation_bytes;
     size_t    weight_bytes;
     size_t    scale_bytes;
@@ -281,9 +297,30 @@ typedef struct {
     int                        max_group_blocks;
     uint32_t                   base_off;
     size_t                     bytes;
+    uint32_t                   header_off;
+    uint32_t                   payload_crc32;
+    bool                       valid;
+    bool                       crc_validated;
     std::vector<fpga_weight_tile_cache_t> tiles;
     std::vector<float>                  scales;
 } fpga_weight_cache_entry_t;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t format_version;
+    uint32_t tensor_hash;
+    uint32_t tile_shape;
+    uint32_t ddr_offset;
+    uint32_t byte_length;
+    uint32_t crc32;
+    uint32_t valid;
+} fpga_weight_cache_header_t;
+
+static_assert(sizeof(fpga_weight_cache_header_t) == 32,
+              "unexpected weight-cache header layout");
+
+static constexpr uint32_t FPGA_WEIGHT_CACHE_MAGIC = 0x46504348U; // "FPCH"
+static constexpr uint32_t FPGA_WEIGHT_CACHE_FORMAT_VERSION = 1U;
 
 typedef struct {
     int bank;
@@ -320,6 +357,8 @@ typedef struct {
     long long ip_compute_us;
     long long host_result_us;
     uint32_t vpu_status;
+    uint32_t spu_stream_count_before;
+    uint32_t spu_stream_done_before;
     uint32_t spu_stream_out_before;
     uint32_t spu_stream_drop_before;
     uint32_t spu_stream_error_before;
@@ -350,6 +389,8 @@ static void *              g_ddr_map_base  = nullptr;
 static size_t              g_dma_map_size  = 0;
 static size_t              g_vpu_map_size  = 0;
 static size_t              g_ddr_map_size  = 0;
+static size_t              g_ddr_advertised_size = 0;
+static size_t              g_ddr_requested_map_size = DDR_REQUIRED_BYTES;
 static std::string         g_dma_map_source;
 static std::string         g_vpu_map_source;
 static std::string         g_ddr_map_source;
@@ -367,6 +408,9 @@ static long long           g_weight_cache_builds = 0;
 static long long           g_weight_cache_hits = 0;
 static long long           g_weight_cache_misses = 0;
 static long long           g_weight_cache_bytes = 0;
+static long long           g_weight_cache_lookup_us = 0;
+static long long           g_weight_cache_crc_us = 0;
+static long long           g_weight_pack_us = 0;
 static long long           g_last_token_us = 0;
 static int                 g_last_token_seq = INT_MIN;
 static long long           g_token_matmuls = 0;
@@ -381,6 +425,10 @@ static int                 g_packed_q8_result_words = VPU_DEFAULT_ROWS;
 static bool                g_vpu_pingpong_supported = false;
 static bool                g_vpu_descriptor_supported = false;
 static bool                g_spu_q8_scale_stream_supported = false;
+static bool                g_spu_silu_supported = false;
+static bool                g_spu_rmsnorm_supported = false;
+static bool                g_spu_rope_supported = false;
+static bool                g_spu_softmax_supported = false;
 static bool                g_pingpong_scheduler_enabled = false;
 static uint32_t            g_next_job_id = 1;
 
@@ -394,13 +442,19 @@ static bool                g_cleanup_done = false;
 static bool                g_atexit_registered = false;
 static bool                g_abort_on_cpu_fallback = true;
 static bool                g_uio_inventory_logged = false;
+static bool                g_allow_devmem_fallback = false;
+static bool                g_allow_vpu_devmem_compat = true;
+static bool                g_strict_coherency = false;
+static bool                g_coherency_platform_whitelisted = false;
+static bool                g_run_coherency_stress = false;
 static bool                g_ddr_msync_unsupported_logged = false;
 static bool                g_weight_cache_enabled = false;
 static bool                g_weight_cache_full_logged = false;
+static bool                g_weight_cache_crc_verify_each_lookup = false;
 static bool                g_activation_cache_enabled = false;
 static bool                g_contract_check_abort = false;
 static bool                g_clear_result_before_run = false;
-static bool                g_contract_raw_repair_enabled = true;
+static bool                g_contract_raw_repair_enabled = false;
 static bool                g_vocab_projection_cpu_bypass = false;
 static int                 g_profile_every = FPGA_DEFAULT_PROFILE_EVERY;
 static int                 g_ip_status_every = FPGA_DEFAULT_STATUS_EVERY;
@@ -421,6 +475,9 @@ static long long           g_contract_raw_repairs = 0;
 static long long           g_contract_value_mismatches = 0;
 static uint32_t            g_weight_cache_next_off = WEIGHT_CACHE_BASE;
 static uint32_t            g_weight_cache_end_off  = WEIGHT_CACHE_BASE;
+static uint32_t            g_stream_protocol_version = 0;
+static uint32_t            g_bitstream_id = 0;
+static long long           g_weight_cache_budget_mb = 0;
 
 static int g_current_layer_id = 0;
 int        g_current_seq_pos  = 0;
@@ -695,6 +752,46 @@ static void ddr_read_i32x4(uint32_t off, int32_t out[4]) {
     }
 }
 
+static uint32_t fpga_crc32_ddr(uint32_t off, size_t bytes) {
+    volatile const uint8_t * data = (volatile const uint8_t *) ddr_ptr(off, bytes);
+    uint32_t crc = 0xFFFFFFFFU;
+    for (size_t i = 0; i < bytes; ++i) {
+        crc ^= (uint32_t) data[i];
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc >> 1) ^ ((crc & 1U) ? 0xEDB88320U : 0U);
+        }
+    }
+    return ~crc;
+}
+
+static void ddr_write_weight_cache_header(
+        uint32_t off,
+        const fpga_weight_cache_header_t & header) {
+    if ((off & 0x3U) != 0U) {
+        fpga_fatal("weight-cache header requires 32-bit alignment off=0x%08x", off);
+    }
+    volatile uint32_t * dst = (volatile uint32_t *) ddr_ptr(off, sizeof(header));
+    const uint32_t * src = (const uint32_t *) &header;
+    for (size_t i = 0; i < sizeof(header) / sizeof(uint32_t); ++i) {
+        dst[i] = src[i];
+    }
+    mmio_fence();
+}
+
+static fpga_weight_cache_header_t ddr_read_weight_cache_header(uint32_t off) {
+    fpga_weight_cache_header_t header = {};
+    if ((off & 0x3U) != 0U) {
+        return header;
+    }
+    volatile const uint32_t * src =
+        (volatile const uint32_t *) ddr_ptr(off, sizeof(header));
+    uint32_t * dst = (uint32_t *) &header;
+    for (size_t i = 0; i < sizeof(header) / sizeof(uint32_t); ++i) {
+        dst[i] = src[i];
+    }
+    return header;
+}
+
 static int64_t ddr_read_spu_q16_row(uint32_t off, uint16_t * row_id) {
     if ((off & 0x3U) != 0) {
         fpga_fatal("DDR SPU row read requires 32-bit alignment off=0x%08x", off);
@@ -801,6 +898,33 @@ static bool parse_uio_map_addr(const std::string & uio, uint64_t * map_addr) {
     return true;
 }
 
+static bool parse_uio_map_offset(const std::string & uio, uint64_t * map_offset) {
+    std::string offset_text;
+    if (!read_text_file("/sys/class/uio/" + uio + "/maps/map0/offset", &offset_text)) {
+        return false;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = strtoull(offset_text.c_str(), &end, 0);
+    if (errno != 0 || end == offset_text.c_str()) {
+        return false;
+    }
+
+    *map_offset = (uint64_t) parsed;
+    return true;
+}
+
+static bool uio_name_from_dev_path(const std::string & dev_path, std::string * uio_name) {
+    const size_t slash = dev_path.find_last_of('/');
+    const std::string base = slash == std::string::npos ? dev_path : dev_path.substr(slash + 1);
+    if (base.compare(0, 3, "uio") != 0) {
+        return false;
+    }
+    *uio_name = base;
+    return true;
+}
+
 static void log_uio_inventory_once(void) {
     if (g_uio_inventory_logged) {
         return;
@@ -879,7 +1003,7 @@ static bool find_uio_device(const char * wanted_name, std::string * dev_path, si
 
     closedir(dir);
     if (!found) {
-        LOGINIT("UIO name=%s not found; trying physical-address match or /dev/mem fallback",
+        LOGINIT("UIO name=%s not found; trying physical-address match",
                 wanted_name);
         log_uio_inventory_once();
     }
@@ -922,7 +1046,7 @@ static bool find_uio_device_by_addr(uint64_t wanted_addr, std::string * dev_path
 
     closedir(dir);
     if (!found) {
-        LOGINIT("UIO addr=0x%llx not found; falling back to /dev/mem unless an override is set",
+        LOGINIT("UIO addr=0x%llx not found",
                 (unsigned long long) wanted_addr);
     }
     return found;
@@ -966,8 +1090,10 @@ static bool map_uio_region(
         uint64_t phys,
         size_t required_size,
         const char * tag,
+        size_t requested_map_size,
         void ** map_base,
         size_t * map_size,
+        size_t * advertised_size,
         std::string * source) {
     std::string dev_path;
     std::string resolved_name;
@@ -975,7 +1101,7 @@ static bool map_uio_region(
     const char * override_ref = env_name ? getenv(env_name) : nullptr;
     if (override_ref && override_ref[0] != '\0') {
         if (!find_uio_device_from_ref(override_ref, &dev_path, &uio_size, &resolved_name)) {
-            LOGE("%s=%s could not be resolved for %s; trying /dev/mem fallback",
+            LOGE("%s=%s could not be resolved for %s",
                  env_name, override_ref, tag);
             return false;
         }
@@ -993,31 +1119,58 @@ static bool map_uio_region(
         }
     }
     if (uio_size < required_size) {
-        LOGE("UIO %s for %s is too small: size=0x%zx required=0x%zx; trying /dev/mem fallback",
+        LOGE("UIO %s for %s is too small: size=0x%zx required=0x%zx",
              dev_path.c_str(), tag, uio_size, required_size);
+        return false;
+    }
+
+    std::string uio;
+    uint64_t uio_addr = 0;
+    uint64_t uio_offset = 0;
+    if (!uio_name_from_dev_path(dev_path, &uio) ||
+        !parse_uio_map_addr(uio, &uio_addr) ||
+        !parse_uio_map_offset(uio, &uio_offset)) {
+        LOGE("UIO %s for %s has unreadable map0 addr/offset metadata", dev_path.c_str(), tag);
+        return false;
+    }
+    if (uio_addr != phys || uio_offset != 0U) {
+        LOGE("UIO %s for %s does not match required resource: expected_phys=0x%llx got_phys=0x%llx map_offset=0x%llx",
+             dev_path.c_str(), tag, (unsigned long long) phys,
+             (unsigned long long) uio_addr, (unsigned long long) uio_offset);
+        return false;
+    }
+
+    const size_t actual_map_size = requested_map_size == 0 ? uio_size : requested_map_size;
+    if (actual_map_size < required_size || actual_map_size > uio_size) {
+        LOGE("UIO %s for %s cannot satisfy requested mapping: requested=0x%zx required=0x%zx advertised=0x%zx",
+             dev_path.c_str(), tag, actual_map_size, required_size, uio_size);
         return false;
     }
 
     int fd = open(dev_path.c_str(), O_RDWR | O_SYNC);
     if (fd < 0) {
-        LOGE("open %s for %s failed errno=%d (%s); trying /dev/mem fallback",
+        LOGE("open %s for %s failed errno=%d (%s)",
              dev_path.c_str(), tag, errno, strerror(errno));
         return false;
     }
-    void * ptr = mmap(nullptr, uio_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void * ptr = mmap(nullptr, actual_map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     const int saved_errno = errno;
     close(fd);
     if (ptr == MAP_FAILED) {
-        LOGE("mmap %s for %s size=0x%zx failed errno=%d (%s); trying /dev/mem fallback",
-             dev_path.c_str(), tag, uio_size, saved_errno, strerror(saved_errno));
+        LOGE("mmap %s for %s size=0x%zx failed errno=%d (%s)",
+             dev_path.c_str(), tag, actual_map_size, saved_errno, strerror(saved_errno));
         return false;
     }
 
     *map_base = ptr;
-    *map_size = uio_size;
+    *map_size = actual_map_size;
+    if (advertised_size) {
+        *advertised_size = uio_size;
+    }
     *source = dev_path + "(" + resolved_name + ",O_SYNC)";
-    LOGINIT("mapped %s via UIO expected_name=%s resolved_name=%s dev=%s virt=%p size=0x%zx",
-            tag, uio_name, resolved_name.c_str(), dev_path.c_str(), ptr, uio_size);
+    LOGINIT("mapped %s via UIO expected_name=%s resolved_name=%s dev=%s phys=0x%llx virt=%p mapped_size=0x%zx advertised_size=0x%zx",
+            tag, uio_name, resolved_name.c_str(), dev_path.c_str(),
+            (unsigned long long) uio_addr, ptr, actual_map_size, uio_size);
     return true;
 }
 
@@ -1076,36 +1229,102 @@ static bool map_region_prefer_uio(
         size_t devmem_size,
         size_t required_size,
         const char * tag,
+        size_t requested_map_size,
+        bool allow_devmem_fallback,
+        const char * fallback_policy,
         void ** map_base,
         size_t * map_size,
+        size_t * advertised_size,
         std::string * source) {
-    if (map_uio_region(uio_name, env_name, phys, required_size, tag, map_base, map_size, source)) {
+    if (map_uio_region(uio_name, env_name, phys, required_size, tag, requested_map_size,
+                       map_base, map_size, advertised_size, source)) {
         return true;
     }
-    return map_devmem_region(phys, devmem_size, tag, map_base, map_size, source);
+    if (!allow_devmem_fallback) {
+        LOGE("mapping denied for %s expected_phys=0x%llx required=0x%zx policy=%s; install/fix the UIO device tree node or explicitly enable the documented compatibility policy",
+             tag, (unsigned long long) phys, required_size,
+             fallback_policy ? fallback_policy : "uio_required");
+        return false;
+    }
+    if (fallback_policy && strcmp(fallback_policy, "vpu_devmem_compat") == 0) {
+        LOGI("MY_IP UIO is unavailable; using bounded /dev/mem compatibility mapping for %s phys=0x%llx size=0x%zx. Set FPGA_VPU_UIO_REQUIRED=1 or FPGA_VPU_DEVMEM_COMPAT=0 to require UIO.",
+             tag, (unsigned long long) phys, devmem_size);
+    } else {
+        LOGE("DIAGNOSTIC ONLY: FPGA_ALLOW_DEVMEM=1 permits /dev/mem mapping for %s; this is not a production-safe mapping policy",
+             tag);
+    }
+    const size_t actual_map_size = requested_map_size == 0 ? devmem_size : requested_map_size;
+    const bool ok = map_devmem_region(phys, actual_map_size, tag, map_base, map_size, source);
+    if (ok && advertised_size) {
+        *advertised_size = actual_map_size;
+    }
+    return ok;
 }
 
 static bool map_registers_dma_ddr(void) {
     if (!map_region_prefer_uio("dma-controller", "FPGA_DMA_UIO", DMA_BASE_PHYS, DMA_MMAP_SIZE,
-                               sizeof(dma_ctrl), "ZDMA", &g_dma_map_base,
-                               &g_dma_map_size, &g_dma_map_source)) {
+                               sizeof(dma_ctrl), "ZDMA", 0,
+                               g_allow_devmem_fallback, "uio_required", &g_dma_map_base,
+                               &g_dma_map_size, nullptr, &g_dma_map_source)) {
         return false;
     }
     g_dma = (volatile dma_ctrl *) g_dma_map_base;
 
-    if (!map_region_prefer_uio("MY_IP", "FPGA_VPU_UIO", REG_BASE_PHYS, VPU_DEV_MEM_MMAP,
-                               VPU_REG_MMAP_MIN, "MY_IP/VPU", &g_vpu_map_base,
-                               &g_vpu_map_size, &g_vpu_map_source)) {
+    if (!map_region_prefer_uio("MY_IP", "FPGA_VPU_UIO", REG_BASE_PHYS, VPU_DEVMEM_COMPAT_MMAP,
+                               VPU_DEVMEM_COMPAT_MMAP, "MY_IP/VPU", 0,
+                               g_allow_devmem_fallback || g_allow_vpu_devmem_compat,
+                               g_allow_devmem_fallback ? "diagnostic_all_resources" : "vpu_devmem_compat",
+                               &g_vpu_map_base,
+                               &g_vpu_map_size, nullptr, &g_vpu_map_source)) {
         return false;
     }
     g_vpu = (volatile uint8_t *) g_vpu_map_base;
 
     if (!map_region_prefer_uio("ddr_high", "FPGA_DDR_UIO", DDR_BASE_PHYS, DDR_DEV_MEM_MMAP,
-                               DDR_REQUIRED_BYTES, "ddr_high", &g_ddr_map_base,
-                               &g_ddr_map_size, &g_ddr_map_source)) {
+                               DDR_REQUIRED_BYTES, "ddr_high", g_ddr_requested_map_size,
+                               g_allow_devmem_fallback, "uio_required",
+                               &g_ddr_map_base, &g_ddr_map_size, &g_ddr_advertised_size,
+                               &g_ddr_map_source)) {
         return false;
     }
     g_ddr = (uint8_t *) g_ddr_map_base;
+    return true;
+}
+
+static bool configure_ddr_mapping_policy(void) {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        LOGE("cannot determine page size for ddr_high mapping");
+        return false;
+    }
+
+    g_weight_cache_budget_mb = 0;
+    g_ddr_requested_map_size = align_up_size(DDR_REQUIRED_BYTES, (size_t) page_size);
+    if (!g_weight_cache_enabled) {
+        LOGINIT("DDR map policy: cache=disabled requested_size=0x%zx", g_ddr_requested_map_size);
+        return true;
+    }
+
+    const char * cache_mb_text = getenv("FPGA_WEIGHT_CACHE_MB");
+    const long long cache_mb = env_int64_value("FPGA_WEIGHT_CACHE_MB", 0, 0, 16384);
+    if (!cache_mb_text || cache_mb_text[0] == '\0' || cache_mb <= 0) {
+        LOGE("FPGA_WEIGHT_CACHE=1 requires a positive FPGA_WEIGHT_CACHE_MB; refusing an unbounded DDR cache");
+        return false;
+    }
+
+    const uint64_t payload_bytes = (uint64_t) cache_mb * 1024ULL * 1024ULL;
+    const uint64_t required_bytes = (uint64_t) WEIGHT_CACHE_BASE + payload_bytes;
+    if (required_bytes > DDR_DEV_MEM_MMAP) {
+        LOGE("requested FPGA_WEIGHT_CACHE_MB=%lld requires 0x%llx bytes, above DDR high window 0x%zx",
+             cache_mb, (unsigned long long) required_bytes, DDR_DEV_MEM_MMAP);
+        return false;
+    }
+
+    g_weight_cache_budget_mb = cache_mb;
+    g_ddr_requested_map_size =
+        align_up_size((size_t) required_bytes, (size_t) page_size);
+    LOGINIT("DDR map policy: cache=enabled budget_mb=%lld requested_size=0x%zx",
+            g_weight_cache_budget_mb, g_ddr_requested_map_size);
     return true;
 }
 
@@ -1126,11 +1345,15 @@ static void configure_weight_cache(void) {
         return;
     }
 
-    size_t available = g_ddr_map_size - (size_t) WEIGHT_CACHE_BASE;
-    const long long limit_mb = env_int64_value("FPGA_WEIGHT_CACHE_MB", 0, 0, 16384);
-    if (limit_mb > 0) {
-        available = std::min(available, (size_t) limit_mb * 1024U * 1024U);
+    if (g_weight_cache_budget_mb <= 0) {
+        g_weight_cache_enabled = false;
+        LOGE("weight tile cache disabled: no validated FPGA_WEIGHT_CACHE_MB budget is available");
+        return;
     }
+
+    size_t available = g_ddr_map_size - (size_t) WEIGHT_CACHE_BASE;
+    const size_t budget_bytes = (size_t) g_weight_cache_budget_mb * 1024U * 1024U;
+    available = std::min(available, budget_bytes);
     available = (available / WEIGHT_CACHE_ALIGN) * WEIGHT_CACHE_ALIGN;
     if (available < WEIGHT_CACHE_ALIGN) {
         g_weight_cache_enabled = false;
@@ -1140,11 +1363,12 @@ static void configure_weight_cache(void) {
 
     const uint64_t end = (uint64_t) WEIGHT_CACHE_BASE + (uint64_t) available;
     g_weight_cache_end_off = end > UINT32_MAX ? UINT32_MAX : (uint32_t) end;
-    LOGE("weight tile cache enabled: this writes ddr_high beyond ACT/WEIGHT/RESULT scratch windows; "
-         "use only if that DDR range is reserved for FPGA");
-    LOGI("weight tile cache enabled base=0x%08x end=0x%08x bytes=%zu",
+    LOGI("weight tile cache enabled base=0x%08x end=0x%08x bytes=%zu budget_mb=%lld mapped_ddr=0x%zx advertised_ddr=0x%zx",
          WEIGHT_CACHE_BASE, g_weight_cache_end_off,
-         (size_t) (g_weight_cache_end_off - WEIGHT_CACHE_BASE));
+         (size_t) (g_weight_cache_end_off - WEIGHT_CACHE_BASE),
+         g_weight_cache_budget_mb,
+         g_ddr_map_size,
+         g_ddr_advertised_size);
 }
 
 static bool msync_ddr_range(uint32_t off, size_t bytes, bool invalidate, const char * tag) {
@@ -1166,7 +1390,7 @@ static bool msync_ddr_range(uint32_t off, size_t bytes, bool invalidate, const c
         const bool likely_uncached_mapping =
             g_ddr_map_source.find("O_SYNC") != std::string::npos ||
             g_ddr_map_source.find("/dev/uio") != std::string::npos;
-        if (!env_flag_enabled("FPGA_STRICT_MSYNC") &&
+        if (!g_strict_coherency && !env_flag_enabled("FPGA_STRICT_MSYNC") &&
             likely_uncached_mapping &&
             (saved_errno == EINVAL || saved_errno == ENODEV)) {
             if (!g_ddr_msync_unsupported_logged) {
@@ -1174,6 +1398,13 @@ static bool msync_ddr_range(uint32_t off, size_t bytes, bool invalidate, const c
                      g_ddr_map_source.c_str(), saved_errno, strerror(saved_errno));
                 g_ddr_msync_unsupported_logged = true;
             }
+            mmio_fence();
+            return true;
+        }
+        if ((saved_errno == EINVAL || saved_errno == ENODEV) &&
+            g_strict_coherency && g_coherency_platform_whitelisted) {
+            LOGI("strict coherency whitelist accepts unsupported msync for ddr_high source=%s; CPU barriers remain enabled",
+                 g_ddr_map_source.c_str());
             mmio_fence();
             return true;
         }
@@ -1358,6 +1589,55 @@ static bool fpga_dma_read_from_ip(uint32_t offset, size_t bytes, const char * ta
                          tag);
 }
 
+static bool fpga_ddr_coherency_stress_test(void) {
+    const int iterations = env_int_value("FPGA_COHERENCY_STRESS_ITERS", 2048, 1, 100000);
+    static constexpr size_t kBytes = 64U;
+    static_assert((kBytes % sizeof(uint32_t)) == 0U, "coherency pattern alignment");
+    if (!ddr_range_fits(ACT_BASE, kBytes)) {
+        LOGE("coherency stress cannot access ACT staging off=0x%08x bytes=%zu", ACT_BASE, kBytes);
+        return false;
+    }
+
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        volatile uint32_t * pattern = (volatile uint32_t *) ddr_ptr(ACT_BASE, kBytes);
+        uint32_t expected[kBytes / sizeof(uint32_t)] = {};
+        for (size_t word = 0; word < kBytes / sizeof(uint32_t); ++word) {
+            expected[word] = 0xA5C30000U ^ ((uint32_t) iteration * 0x9E3779B9U) ^ (uint32_t) word;
+            pattern[word] = expected[word];
+        }
+        if (!msync_ddr_range(ACT_BASE, kBytes, false, "coherency_write")) {
+            return false;
+        }
+        if (!fpga_dma_write_to_ip(ACT_BASE, kBytes, "coherency_ddr_to_ip")) {
+            return false;
+        }
+
+        for (size_t word = 0; word < kBytes / sizeof(uint32_t); ++word) {
+            pattern[word] = 0U;
+        }
+        if (!msync_ddr_range(ACT_BASE, kBytes, false, "coherency_clear")) {
+            return false;
+        }
+        if (!fpga_dma_read_from_ip(ACT_BASE, kBytes, "coherency_ip_to_ddr")) {
+            return false;
+        }
+
+        for (size_t word = 0; word < kBytes / sizeof(uint32_t); ++word) {
+            const uint32_t actual = pattern[word];
+            if (actual != expected[word]) {
+                LOGE("coherency stress mismatch iteration=%d word=%zu expected=0x%08x actual=0x%08x",
+                     iteration, word, expected[word], actual);
+                return false;
+            }
+        }
+    }
+
+    LOGI("coherency stress passed iterations=%d bytes_per_iteration=%zu source=%s strict=%d whitelist=%d",
+         iterations, kBytes, g_ddr_map_source.c_str(), g_strict_coherency ? 1 : 0,
+         g_coherency_platform_whitelisted ? 1 : 0);
+    return true;
+}
+
 static void configure_vpu(int rows, int col_beats, uint32_t mode) {
     const int cols = col_beats * VPU_NUM_LANES;
     vpu_wr32(REG_ROWS, (uint32_t) rows);
@@ -1400,37 +1680,72 @@ static bool wait_vpu_done(uint32_t * final_status) {
 }
 
 static bool wait_spu_stream_outputs(const fpga_tile_job_t & job) {
-    const uint32_t target = job.spu_stream_out_before + (uint32_t) job.rows;
+    const uint32_t target_out = job.spu_stream_out_before + (uint32_t) job.rows;
+    const uint32_t expected_raw = job.spu_stream_count_before +
+        (uint32_t) job.rows * (uint32_t) job.group_blocks;
+    const uint32_t expected_done = job.spu_stream_done_before + 1U;
     const long long t0 = now_us();
+    long long last_log_us = t0;
     long long polls = 0;
+    uint32_t last_count = job.spu_stream_count_before;
+    uint32_t last_done = job.spu_stream_done_before;
+    uint32_t last_out = job.spu_stream_out_before;
+    uint32_t last_drop = job.spu_stream_drop_before;
+    uint32_t last_error = job.spu_stream_error_before;
     while (true) {
+        const long long now = now_us();
+        const uint32_t count = vpu_rd32(REG_SPU_STREAM_COUNT);
+        const uint32_t done_count = vpu_rd32(REG_SPU_STREAM_DONE);
         const uint32_t out_count = vpu_rd32(REG_SPU_STREAM_OUT);
         const uint32_t drop_count = vpu_rd32(REG_SPU_STREAM_DROP);
         const uint32_t error_count = vpu_rd32(REG_SPU_STREAM_ERROR);
         if (drop_count != job.spu_stream_drop_before ||
             error_count != job.spu_stream_error_before) {
-            LOGE("SPU stream failed job=%u bank=%d out=%u target=%u drop_before=%u drop_now=%u error_before=%u error_now=%u",
-                 job.job_id,
-                 job.bank,
-                 out_count,
-                 target,
-                 job.spu_stream_drop_before,
-                 drop_count,
-                 job.spu_stream_error_before,
-                 error_count);
+            LOGE("SPU stream failed job=%u bank=%d expected_raw=%u expected_out=%u count=%u done=%u out=%u drop_before=%u drop_now=%u error_before=%u error_now=%u active_job=%u done_job=%u bank_stat=0x%08x progress=0x%08x last_job=%u last_bank=%u",
+                 job.job_id, job.bank, expected_raw, target_out, count, done_count, out_count,
+                 job.spu_stream_drop_before, drop_count, job.spu_stream_error_before, error_count,
+                 vpu_rd32(REG_ACTIVE_JOB), vpu_rd32(REG_DONE_JOB), vpu_rd32(REG_BANK_STAT),
+                 vpu_rd32(REG_PROGRESS), vpu_rd32(REG_SPU_STREAM_LAST_JOB),
+                 vpu_rd32(REG_SPU_STREAM_LAST_BANK));
             return false;
         }
-        if (out_count >= target) {
+        if (done_count >= expected_done && count != expected_raw) {
+            LOGE("SPU stream protocol_mismatch job=%u bank=%d expected_raw=%u count=%u expected_done=%u done=%u out=%u expected_out=%u active_job=%u done_job=%u bank_stat=0x%08x",
+                 job.job_id, job.bank, expected_raw, count, expected_done, done_count,
+                 out_count, target_out, vpu_rd32(REG_ACTIVE_JOB), vpu_rd32(REG_DONE_JOB),
+                 vpu_rd32(REG_BANK_STAT));
+            return false;
+        }
+        if (out_count >= target_out) {
+            if (count != expected_raw || done_count != expected_done) {
+                LOGE("SPU stream completion_mismatch job=%u bank=%d expected_raw=%u count=%u expected_done=%u done=%u expected_out=%u out=%u",
+                     job.job_id, job.bank, expected_raw, count, expected_done, done_count,
+                     target_out, out_count);
+                return false;
+            }
             return true;
         }
-        if (now_us() - t0 > g_ip_timeout_us) {
-            LOGE("SPU stream timeout job=%u bank=%d out=%u target=%u stream_count=%u done=%u",
-                 job.job_id,
-                 job.bank,
-                 out_count,
-                 target,
-                 vpu_rd32(REG_SPU_STREAM_COUNT),
-                 vpu_rd32(REG_SPU_STREAM_DONE));
+        const bool counters_changed =
+            count != last_count || done_count != last_done || out_count != last_out ||
+            drop_count != last_drop || error_count != last_error;
+        if (counters_changed || now - last_log_us >= FPGA_STREAM_POLL_LOG_INTERVAL_US) {
+            LOGIP("SPU poll job=%u bank=%d expected_raw=%u expected_out=%u count=%u done=%u out=%u drop=%u error=%u active_job=%u done_job=%u bank_stat=0x%08x status=0x%08x progress=0x%08x last_job=%u last_bank=%u",
+                  job.job_id, job.bank, expected_raw, target_out, count, done_count, out_count,
+                  drop_count, error_count, vpu_rd32(REG_ACTIVE_JOB), vpu_rd32(REG_DONE_JOB),
+                  vpu_rd32(REG_BANK_STAT), vpu_rd32(REG_STATUS), vpu_rd32(REG_PROGRESS),
+                  vpu_rd32(REG_SPU_STREAM_LAST_JOB), vpu_rd32(REG_SPU_STREAM_LAST_BANK));
+            last_count = count;
+            last_done = done_count;
+            last_out = out_count;
+            last_drop = drop_count;
+            last_error = error_count;
+            last_log_us = now;
+        }
+        if (now - t0 > g_ip_timeout_us) {
+            LOGE("SPU stream timeout job=%u bank=%d expected_raw=%u expected_out=%u count=%u done=%u out=%u drop=%u error=%u active_job=%u done_job=%u bank_stat=0x%08x progress=0x%08x",
+                 job.job_id, job.bank, expected_raw, target_out, count, done_count, out_count,
+                 drop_count, error_count, vpu_rd32(REG_ACTIVE_JOB), vpu_rd32(REG_DONE_JOB),
+                 vpu_rd32(REG_BANK_STAT), vpu_rd32(REG_PROGRESS));
             return false;
         }
         polls++;
@@ -2086,7 +2401,8 @@ static int packed_q8_group_blocks_for_rows(int rows, int remaining_blocks) {
 static bool weight_cache_entry_matches(
         const fpga_weight_cache_entry_t & entry,
         const struct ggml_tensor * src0) {
-    return entry.tensor == src0 &&
+    return entry.valid &&
+           entry.tensor == src0 &&
            entry.data == src0->data &&
            entry.k == src0->ne[0] &&
            entry.n == src0->ne[1] &&
@@ -2096,16 +2412,77 @@ static bool weight_cache_entry_matches(
            entry.max_group_blocks == g_packed_q8_max_blocks;
 }
 
-static fpga_weight_cache_entry_t * find_weight_cache_entry(const struct ggml_tensor * src0) {
+static bool validate_weight_cache_entry(
+        fpga_weight_cache_entry_t * entry,
+        fpga_stage_totals_t * totals) {
+    if (!entry || !entry->valid || !ddr_range_fits(entry->header_off, sizeof(fpga_weight_cache_header_t)) ||
+        !ddr_range_fits(entry->base_off, entry->bytes)) {
+        return false;
+    }
+
+    const fpga_weight_cache_header_t header = ddr_read_weight_cache_header(entry->header_off);
+    const uint32_t expected_tensor_hash = fpga_tensor_id_from_ptr(entry->tensor);
+    const uint32_t expected_tile_shape =
+        ((uint32_t) entry->max_rows & 0xFFFFU) |
+        (((uint32_t) entry->max_group_blocks & 0xFFFFU) << 16);
+    const bool header_ok =
+        header.magic == FPGA_WEIGHT_CACHE_MAGIC &&
+        header.format_version == FPGA_WEIGHT_CACHE_FORMAT_VERSION &&
+        header.tensor_hash == expected_tensor_hash &&
+        header.tile_shape == expected_tile_shape &&
+        header.ddr_offset == entry->base_off &&
+        header.byte_length == entry->bytes &&
+        header.crc32 == entry->payload_crc32 &&
+        header.valid == 1U;
+    if (!header_ok) {
+        LOGE("weight tile cache header/CRC mismatch tensor=%s header_off=0x%08x payload_off=0x%08x bytes=%zu header_ok=%d expected_crc=0x%08x actual_crc=0x%08x; entry invalidated",
+             tensor_name_or_unknown(entry->tensor), entry->header_off, entry->base_off, entry->bytes,
+             0, entry->payload_crc32, 0U);
+        entry->valid = false;
+        return false;
+    }
+
+    // A full CRC reads the entire tensor through an uncached UIO mapping.  On
+    // this board that would cost hundreds of milliseconds per decode token.
+    // The header is checked on every lookup; the payload CRC is checked once
+    // after construction, or on every lookup only when explicitly requested
+    // for a corruption diagnostic.
+    if (!entry->crc_validated || g_weight_cache_crc_verify_each_lookup) {
+        const long long crc0 = now_us();
+        const uint32_t computed_crc = fpga_crc32_ddr(entry->base_off, entry->bytes);
+        const long long crc_us = now_us() - crc0;
+        if (totals) {
+            totals->weight_cache_crc_us += crc_us;
+        }
+        g_weight_cache_crc_us += crc_us;
+        if (computed_crc != entry->payload_crc32) {
+            LOGE("weight tile cache CRC mismatch tensor=%s header_off=0x%08x payload_off=0x%08x bytes=%zu expected_crc=0x%08x actual_crc=0x%08x; entry invalidated",
+                 tensor_name_or_unknown(entry->tensor), entry->header_off, entry->base_off,
+                 entry->bytes, entry->payload_crc32, computed_crc);
+            entry->valid = false;
+            return false;
+        }
+        entry->crc_validated = true;
+    }
+    return true;
+}
+
+static fpga_weight_cache_entry_t * find_weight_cache_entry(
+        const struct ggml_tensor * src0,
+        fpga_stage_totals_t * totals) {
     for (fpga_weight_cache_entry_t & entry : g_weight_cache) {
         if (weight_cache_entry_matches(entry, src0)) {
-            return &entry;
+            if (validate_weight_cache_entry(&entry, totals)) {
+                return &entry;
+            }
         }
     }
     return nullptr;
 }
 
-static fpga_weight_cache_entry_t * build_weight_cache_entry(const struct ggml_tensor * src0) {
+static fpga_weight_cache_entry_t * build_weight_cache_entry(
+        const struct ggml_tensor * src0,
+        fpga_stage_totals_t * totals) {
     if (!g_weight_cache_enabled || !ddr_is_mapped()) {
         return nullptr;
     }
@@ -2139,8 +2516,10 @@ static fpga_weight_cache_entry_t * build_weight_cache_entry(const struct ggml_te
         }
     }
 
-    const uint64_t cache_start = align_up_size((size_t) g_weight_cache_next_off, WEIGHT_CACHE_ALIGN);
-    const uint64_t cache_end = cache_start + (uint64_t) total_bytes;
+    const uint64_t header_off = align_up_size((size_t) g_weight_cache_next_off, WEIGHT_CACHE_ALIGN);
+    const uint64_t payload_off = align_up_size(
+        (size_t) header_off + sizeof(fpga_weight_cache_header_t), WEIGHT_CACHE_ALIGN);
+    const uint64_t cache_end = payload_off + (uint64_t) total_bytes;
     if (cache_end > (uint64_t) g_weight_cache_end_off || cache_end > UINT32_MAX) {
         if (!g_weight_cache_full_logged) {
             LOGE("weight tile cache full; tensor=%s needs=%zu available=%zu. Continuing with per-run weight packing for uncached tensors.",
@@ -2162,10 +2541,33 @@ static fpga_weight_cache_entry_t * build_weight_cache_entry(const struct ggml_te
     entry.max_rows = g_vpu_max_rows;
     entry.max_beats = g_vpu_max_beats;
     entry.max_group_blocks = g_packed_q8_max_blocks;
-    entry.base_off = (uint32_t) cache_start;
+    entry.header_off = (uint32_t) header_off;
+    entry.base_off = (uint32_t) payload_off;
     entry.bytes = total_bytes;
+    entry.valid = false;
+    entry.crc_validated = false;
     entry.tiles = std::move(tiles);
     entry.scales.resize(total_scales);
+
+    const fpga_weight_cache_header_t pending_header = {
+        FPGA_WEIGHT_CACHE_MAGIC,
+        FPGA_WEIGHT_CACHE_FORMAT_VERSION,
+        fpga_tensor_id_from_ptr(src0),
+        ((uint32_t) entry.max_rows & 0xFFFFU) |
+            (((uint32_t) entry.max_group_blocks & 0xFFFFU) << 16),
+        entry.base_off,
+        (uint32_t) entry.bytes,
+        0U,
+        0U,
+    };
+    const long long pack0 = now_us();
+    ddr_write_weight_cache_header(entry.header_off, pending_header);
+    ddr_zero_range32(entry.base_off, entry.bytes);
+    if (!msync_ddr_range(entry.header_off,
+                         (size_t) (entry.base_off - entry.header_off) + entry.bytes,
+                         false, "weight_cache_prepare")) {
+        return nullptr;
+    }
 
     uint32_t next_off = entry.base_off;
     for (fpga_weight_tile_cache_t & tile : entry.tiles) {
@@ -2196,27 +2598,63 @@ static fpga_weight_cache_entry_t * build_weight_cache_entry(const struct ggml_te
     }
 
     mmio_fence();
+    if (!msync_ddr_range(entry.base_off, entry.bytes, false, "weight_cache_payload")) {
+        return nullptr;
+    }
+    const long long crc0 = now_us();
+    entry.payload_crc32 = fpga_crc32_ddr(entry.base_off, entry.bytes);
+    const long long crc_us = now_us() - crc0;
+    if (totals) {
+        totals->weight_cache_crc_us += crc_us;
+    }
+    g_weight_cache_crc_us += crc_us;
+    fpga_weight_cache_header_t committed_header = pending_header;
+    committed_header.crc32 = entry.payload_crc32;
+    committed_header.valid = 1U;
+    ddr_write_weight_cache_header(entry.header_off, committed_header);
+    if (!msync_ddr_range(entry.header_off, sizeof(committed_header), false, "weight_cache_commit")) {
+        return nullptr;
+    }
+    entry.valid = true;
+    entry.crc_validated = true;
+    const long long pack_us = now_us() - pack0;
+    if (totals) {
+        totals->weight_pack_us += pack_us;
+    }
+    g_weight_pack_us += pack_us;
     g_weight_cache_next_off = next_off;
     g_weight_cache_bytes += (long long) entry.bytes;
     g_weight_cache_builds++;
-    LOGI("weight tile cache build tensor=%s tiles=%zu bytes=%zu scales=%zu base=0x%08x next=0x%08x",
+    LOGI("weight tile cache build tensor=%s tiles=%zu bytes=%zu scales=%zu header=0x%08x base=0x%08x crc32=0x%08x pack_ms=%.3f crc_ms=%.3f next=0x%08x",
          tensor_name_or_unknown(src0),
          entry.tiles.size(),
          entry.bytes,
          entry.scales.size(),
+         entry.header_off,
          entry.base_off,
+         entry.payload_crc32,
+         (double) pack_us / 1000.0,
+         (double) crc_us / 1000.0,
          g_weight_cache_next_off);
 
     g_weight_cache.push_back(std::move(entry));
     return &g_weight_cache.back();
 }
 
-static fpga_weight_cache_entry_t * get_weight_cache_entry(const struct ggml_tensor * src0) {
-    fpga_weight_cache_entry_t * entry = find_weight_cache_entry(src0);
+static fpga_weight_cache_entry_t * get_weight_cache_entry(
+        const struct ggml_tensor * src0,
+        fpga_stage_totals_t * totals) {
+    const long long lookup0 = now_us();
+    fpga_weight_cache_entry_t * entry = find_weight_cache_entry(src0, totals);
+    const long long lookup_us = now_us() - lookup0;
+    if (totals) {
+        totals->weight_cache_lookup_us += lookup_us;
+    }
+    g_weight_cache_lookup_us += lookup_us;
     if (entry) {
         return entry;
     }
-    return build_weight_cache_entry(src0);
+    return build_weight_cache_entry(src0, totals);
 }
 
 static bool fpga_prepare_q8_tile_job(
@@ -2425,6 +2863,8 @@ static bool fpga_submit_q8_tile_job(
     job.dma_act_us = dma_act1 - dma_act0;
     job.dma_weight_us = dma_weight1 - dma_weight0;
     job.dma_scale_us = dma_scale1 - dma_scale0;
+    job.spu_stream_count_before = vpu_rd32(REG_SPU_STREAM_COUNT);
+    job.spu_stream_done_before = vpu_rd32(REG_SPU_STREAM_DONE);
     job.spu_stream_out_before = vpu_rd32(REG_SPU_STREAM_OUT);
     job.spu_stream_drop_before = vpu_rd32(REG_SPU_STREAM_DROP);
     job.spu_stream_error_before = vpu_rd32(REG_SPU_STREAM_ERROR);
@@ -3036,7 +3476,7 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip(
     }
 
     const long long weight_cache0 = now_us();
-    fpga_weight_cache_entry_t * weight_cache = get_weight_cache_entry(src0);
+    fpga_weight_cache_entry_t * weight_cache = get_weight_cache_entry(src0, totals);
     if (totals) {
         totals->prep_us += now_us() - weight_cache0;
     }
@@ -3143,9 +3583,19 @@ int fpga_init(void) {
     g_trace_data_enabled = env_flag_enabled("FPGA_TRACE_DATA");
     g_weight_cache_enabled = env_flag_enabled("FPGA_WEIGHT_CACHE");
     g_activation_cache_enabled = env_flag_enabled("FPGA_ACTIVATION_CACHE");
+    g_allow_devmem_fallback = env_flag_enabled("FPGA_ALLOW_DEVMEM");
+    g_allow_vpu_devmem_compat =
+        !env_flag_enabled("FPGA_VPU_UIO_REQUIRED") &&
+        !env_flag_disabled("FPGA_VPU_DEVMEM_COMPAT");
+    g_strict_coherency = env_flag_enabled("FPGA_STRICT_COHERENCY");
+    g_coherency_platform_whitelisted = env_flag_enabled("FPGA_COHERENCY_PLATFORM_VERIFIED");
+    g_run_coherency_stress = env_flag_enabled("FPGA_COHERENCY_STRESS") || g_strict_coherency;
     g_contract_check_abort = env_flag_enabled("FPGA_CONTRACT_ABORT");
     g_clear_result_before_run = env_flag_enabled("FPGA_CLEAR_RESULT");
-    g_contract_raw_repair_enabled = !env_flag_disabled("FPGA_CONTRACT_RAW_REPAIR");
+    // A repair changes the value consumed by the model, so it is a diagnostic
+    // opt-in only.  Correctness runs must report mismatches, not hide them.
+    g_contract_raw_repair_enabled = env_flag_enabled("FPGA_CONTRACT_RAW_REPAIR");
+    g_weight_cache_crc_verify_each_lookup = env_flag_enabled("FPGA_WEIGHT_CACHE_CRC_EACH_LOOKUP");
     g_vocab_projection_cpu_bypass =
         env_flag_enabled("FPGA_VOCAB_PROJECTION_CPU") &&
         !env_flag_enabled("FPGA_ACCELERATE_VOCAB");
@@ -3177,12 +3627,18 @@ int fpga_init(void) {
     g_contract_rtol = env_double_value("FPGA_CONTRACT_RTOL", 1.0e-4, 0.0, 1.0e9);
     g_abort_on_cpu_fallback = !env_flag_disabled("FPGA_ABORT_ON_CPU_FALLBACK");
 
+    if (!configure_ddr_mapping_policy()) {
+        fpga_fatal("DDR cache/mapping policy is invalid; refusing FPGA initialization");
+    }
     if (!map_registers_dma_ddr()) {
         fpga_fatal("ZDMA DDR-to-IP FPGA init failed; refusing CPU fallback");
     }
     configure_weight_cache();
     if (!fpga_dma_init()) {
         fpga_fatal("ZDMA init failed; refusing CPU fallback");
+    }
+    if (g_run_coherency_stress && !fpga_ddr_coherency_stress_test()) {
+        fpga_fatal("DDR coherency stress test failed; refusing FPGA execution");
     }
 
     g_fpga_start_us = now_us();
@@ -3196,6 +3652,8 @@ int fpga_init(void) {
     const uint32_t limits = vpu_rd32(REG_LIMITS);
     const uint32_t caps = vpu_rd32(REG_CAPS);
     const uint32_t spu_caps = vpu_rd32(REG_SPU_CAPS);
+    g_stream_protocol_version = vpu_rd32(REG_STREAM_PROTOCOL_VERSION);
+    g_bitstream_id = vpu_rd32(REG_BITSTREAM_ID);
     const int limit_rows  = (int) (limits & 0xFFFFU);
     const int limit_beats = (int) ((limits >> 16) & 0xFFFFU);
     if (limit_rows > 0 && limit_rows <= VPU_DEFAULT_ROWS) {
@@ -3219,25 +3677,16 @@ int fpga_init(void) {
             LOGE("REG_CAPS=0x%08x exposes packed_q8 without compact weight layout; host requires compact active-stride layout", caps);
         }
     }
-    if (!g_packed_q8_supported && !caps_valid) {
-        LOGI("REG_CAPS returned 0x%08x; assuming legacy VPU register map and validating packed Q8 by self-test",
-             caps);
-        if (g_vpu_max_beats > VPU_LEGACY_BEATS) {
-            g_vpu_max_beats = VPU_LEGACY_BEATS;
-            g_vpu_max_cols = g_vpu_max_beats * VPU_NUM_LANES;
-        }
-        g_packed_q8_supported = 1;
-        g_packed_q8_max_blocks = std::min(VPU_LEGACY_PACKED_Q8_MAX_BLOCKS, g_vpu_max_beats / VPU_BLOCK_BEATS);
-        g_packed_q8_result_words =
-            (g_vpu_max_rows * g_packed_q8_max_blocks + VPU_RESULT_PACK_LANES - 1) /
-            VPU_RESULT_PACK_LANES;
+    if (!caps_valid) {
+        fpga_fatal("REG_CAPS=0x%08x is invalid; refusing legacy capability assumptions", caps);
     }
-    if (env_flag_enabled("FPGA_FORCE_PACKED_Q8") && !g_packed_q8_supported) {
-        g_packed_q8_supported = 1;
-        g_packed_q8_max_blocks = std::min(VPU_PACKED_Q8_MAX_BLOCKS, g_vpu_max_beats / VPU_BLOCK_BEATS);
-        g_packed_q8_result_words =
-            (g_vpu_max_rows * g_packed_q8_max_blocks + VPU_RESULT_PACK_LANES - 1) /
-            VPU_RESULT_PACK_LANES;
+    if (env_flag_enabled("FPGA_FORCE_PACKED_Q8")) {
+        fpga_fatal("FPGA_FORCE_PACKED_Q8 is not permitted in the production host; the bitstream must advertise packed-Q8 capability");
+    }
+    const bool bitstream_id_compatible = g_bitstream_id == FPGA_EXPECTED_BITSTREAM_ID;
+    if (!bitstream_id_compatible) {
+        LOGI("bitstream identity is legacy/unknown got=0x%08x expected=0x%08x; raw CPU-scale compatibility path remains enabled, but PL-scale and pipeline opt-ins are prohibited",
+             g_bitstream_id, FPGA_EXPECTED_BITSTREAM_ID);
     }
     if (g_runtime_max_rows > 0 && g_runtime_max_rows < g_vpu_max_rows) {
         g_vpu_max_rows = g_runtime_max_rows;
@@ -3248,21 +3697,41 @@ int fpga_init(void) {
     g_vpu_pingpong_supported = caps_valid && ((caps & VPU_CAP_PINGPONG_BANKS) != 0U);
     g_vpu_descriptor_supported = caps_valid && ((caps & VPU_CAP_JOB_DESCRIPTOR) != 0U);
     const bool spu_caps_valid = spu_caps != 0U && spu_caps != 0xFFFFFFFFU;
+    g_spu_silu_supported = spu_caps_valid && ((spu_caps & SPU_CAP_SILU_MUL) != 0U);
+    g_spu_rmsnorm_supported = spu_caps_valid && ((spu_caps & SPU_CAP_RMSNORM) != 0U);
+    g_spu_rope_supported = spu_caps_valid && ((spu_caps & SPU_CAP_ROPE) != 0U);
+    g_spu_softmax_supported = spu_caps_valid && ((spu_caps & SPU_CAP_SOFTMAX) != 0U);
     g_spu_q8_scale_stream_supported =
         caps_valid &&
         spu_caps_valid &&
+        bitstream_id_compatible &&
+        (g_stream_protocol_version == FPGA_REQUIRED_STREAM_PROTOCOL_VERSION) &&
         ((caps & VPU_CAP_SPU_RAW_STREAM) != 0U) &&
         ((caps & VPU_CAP_SPU_Q8_SCALE_STREAM) != 0U) &&
         ((spu_caps & SPU_CAP_VPU_RAW_STREAM) != 0U) &&
         ((spu_caps & SPU_CAP_VPU_Q8_SCALE_STREAM) != 0U) &&
+        env_flag_enabled("FPGA_PL_SCALE_ENABLE") &&
         !env_flag_enabled("FPGA_PL_SCALE_DISABLE");
     g_pingpong_scheduler_enabled =
         g_vpu_pingpong_supported &&
         g_vpu_descriptor_supported &&
+        bitstream_id_compatible &&
+        env_flag_enabled("FPGA_PIPELINE_ENABLE") &&
         !env_flag_enabled("FPGA_PIPELINE_DISABLE");
+    if (env_flag_enabled("FPGA_PL_SCALE_ENABLE") && !g_spu_q8_scale_stream_supported) {
+        fpga_fatal("FPGA_PL_SCALE_ENABLE requested but stream capability/protocol is not compatible: caps=0x%08x spu_caps=0x%08x protocol=0x%08x required=%u",
+                   caps, spu_caps, g_stream_protocol_version, FPGA_REQUIRED_STREAM_PROTOCOL_VERSION);
+    }
+    if (env_flag_enabled("FPGA_PIPELINE_ENABLE") && !g_pingpong_scheduler_enabled) {
+        fpga_fatal("FPGA_PIPELINE_ENABLE requested but ping-pong descriptor capability is unavailable caps=0x%08x", caps);
+    }
     vpu_select_banks(0, 0);
 
-    LOGI("ready version=%s path=%s rows=%d host_row_limit=%d col_beats=%d cols=%d packed_q8=%d max_group_blocks=%d result_words=%d pingpong_cap=%d descriptor_cap=%d scheduler=%d pl_scale=%d weight_cache=%d activation_cache=%d vocab_cpu_bypass=%d vocab_min_n=%lld contract_check=%d contract_abort=%d raw_retry=%d raw_repair=%d result_clear=%d clock_mhz=%.3f profile_log=1 dma_detail=%d ip_detail=%d detail_every=%d flush_every=%d",
+    const char * mapping_policy =
+        g_allow_devmem_fallback ? "diagnostic_all_resources" :
+        (g_allow_vpu_devmem_compat ? "uio_dma_ddr+vpu_devmem_compat" : "uio_required");
+
+    LOGI("ready version=%s path=%s rows=%d host_row_limit=%d col_beats=%d cols=%d packed_q8=%d max_group_blocks=%d result_words=%d pingpong_cap=%d descriptor_cap=%d scheduler=%d scheduler_policy=opt_in pl_scale=%d pl_scale_policy=opt_in stream_protocol=0x%08x bitstream_id=0x%08x spu_silu=%d spu_rms=%d spu_rope=%d spu_softmax=%d weight_cache=%d activation_cache=%d vocab_cpu_bypass=%d vocab_min_n=%lld contract_check=%d contract_abort=%d raw_retry=%d raw_repair=%d result_clear=%d strict_coherency=%d clock_mhz=%.3f profile_log=1 dma_detail=%d ip_detail=%d detail_every=%d flush_every=%d",
          FPGA_HOST_TRACE_VERSION,
          path ? path : "dma(default)",
          g_vpu_max_rows,
@@ -3273,6 +3742,12 @@ int fpga_init(void) {
          g_vpu_descriptor_supported ? 1 : 0,
          g_pingpong_scheduler_enabled ? 1 : 0,
          g_spu_q8_scale_stream_supported ? 1 : 0,
+         g_stream_protocol_version,
+         g_bitstream_id,
+         g_spu_silu_supported ? 1 : 0,
+         g_spu_rmsnorm_supported ? 1 : 0,
+         g_spu_rope_supported ? 1 : 0,
+         g_spu_softmax_supported ? 1 : 0,
          g_weight_cache_enabled ? 1 : 0,
          g_activation_cache_enabled ? 1 : 0,
          g_vocab_projection_cpu_bypass ? 1 : 0,
@@ -3282,22 +3757,35 @@ int fpga_init(void) {
          g_contract_raw_retry_limit,
          g_contract_raw_repair_enabled ? 1 : 0,
          g_clear_result_before_run ? 1 : 0,
+         g_strict_coherency ? 1 : 0,
          g_fpga_clock_mhz,
          g_dma_timing_enabled ? 1 : 0,
          g_ip_timing_enabled ? 1 : 0,
          g_detail_every,
          g_log_flush_every);
-    LOGI("manifest host_version=%s host_build=\"%s %s\" limits=0x%08x caps=0x%08x spu_caps=0x%08x pingpong_cap=%d descriptor_cap=%d scheduler=%d pl_scale=%d bases my_ip=0x%llx dma=0x%llx ddr=0x%llx windows act=0x%08x weight=0x%08x result=0x%08x spu_out=0x%08x spu_param=0x%08x block_q8_0_size=%zu compact_weight_layout_required=1",
+    LOGI("manifest host_version=%s host_build=\"%s %s\" limits=0x%08x caps=0x%08x spu_caps=0x%08x stream_protocol=0x%08x required_protocol=%u bitstream_id=0x%08x expected_bitstream_id=0x%08x bitstream_id_compatible=%d pingpong_cap=%d descriptor_cap=%d scheduler=%d scheduler_policy=opt_in pl_scale=%d pl_scale_policy=opt_in devmem_all_resources=%d vpu_devmem_compat=%d mapping_policy=%s spu_silu=%d spu_rms=%d spu_rope=%d spu_softmax=%d bases my_ip=0x%llx dma=0x%llx ddr=0x%llx windows act=0x%08x weight=0x%08x result=0x%08x spu_out=0x%08x spu_param=0x%08x block_q8_0_size=%zu compact_weight_layout_required=1",
          FPGA_HOST_TRACE_VERSION,
          __DATE__,
          __TIME__,
          limits,
          caps,
          spu_caps,
+         g_stream_protocol_version,
+         FPGA_REQUIRED_STREAM_PROTOCOL_VERSION,
+         g_bitstream_id,
+         FPGA_EXPECTED_BITSTREAM_ID,
+         bitstream_id_compatible ? 1 : 0,
          g_vpu_pingpong_supported ? 1 : 0,
          g_vpu_descriptor_supported ? 1 : 0,
          g_pingpong_scheduler_enabled ? 1 : 0,
          g_spu_q8_scale_stream_supported ? 1 : 0,
+         g_allow_devmem_fallback ? 1 : 0,
+         g_allow_vpu_devmem_compat ? 1 : 0,
+         mapping_policy,
+         g_spu_silu_supported ? 1 : 0,
+         g_spu_rmsnorm_supported ? 1 : 0,
+         g_spu_rope_supported ? 1 : 0,
+         g_spu_softmax_supported ? 1 : 0,
          (unsigned long long) MY_IP_BASE_ADDRESS,
          (unsigned long long) DMA_BASE_PHYS,
          (unsigned long long) DDR_BASE_PHYS,
@@ -3313,18 +3801,21 @@ int fpga_init(void) {
             (unsigned long long) LMM_BASE_PHYS,
             (unsigned long long) DMA_BASE_PHYS,
             (unsigned long long) DDR_BASE_PHYS);
-    LOGINIT("mappings dma=%s virt=0x%llx size=0x%zx vpu=%s virt=0x%llx size=0x%zx ddr=%s virt=0x%llx size=0x%zx",
+    LOGI("mappings policy=%s dma=%s virt=0x%llx size=0x%zx vpu=%s virt=0x%llx size=0x%zx ddr=%s virt=0x%llx mapped_size=0x%zx advertised_size=0x%zx",
+            mapping_policy,
             g_dma_map_source.c_str(), fpga_ptr_addr(g_dma), g_dma_map_size,
             g_vpu_map_source.c_str(), fpga_ptr_addr(g_vpu), g_vpu_map_size,
-            g_ddr_map_source.c_str(), fpga_ptr_addr(g_ddr), g_ddr_map_size);
+            g_ddr_map_source.c_str(), fpga_ptr_addr(g_ddr), g_ddr_map_size,
+            g_ddr_advertised_size);
     LOGINIT("VPU windows act=0x%08x weight=0x%08x result=0x%08x spu_out=0x%08x spu_param=0x%08x data_movement=ZDMA_bulk_copy no_axi_stream_main=1",
             ACT_BASE, WEIGHT_BASE, RESULT_BASE, SPU_OUT_BASE, SPU_PARAM_BASE);
     LOGINIT("VPU raw_limits=0x%08x caps=0x%08x spu_caps=0x%08x", limits, caps, spu_caps);
     if (g_vpu_max_beats == 256) {
         LOGE("MAX_COL_BEATS=256 detected; DMA-to-IP path will run, but this large BRAM setting is still suspicious for timing/resource use");
     }
-    LOGINIT("cache coherency: ddr_high mapped through %s; using msync barriers before DMA reads from DRAM and after DMA writes to DRAM",
-            g_ddr_map_source.c_str());
+    LOGI("cache coherency source=%s strict=%d whitelist=%d stress=%d; msync barriers are issued before DDR-to-device and after device-to-DDR transfers",
+         g_ddr_map_source.c_str(), g_strict_coherency ? 1 : 0,
+         g_coherency_platform_whitelisted ? 1 : 0, g_run_coherency_stress ? 1 : 0);
     LOGINIT("fallback policy: FPGA_ABORT_ON_CPU_FALLBACK=%d default_no_cpu_matmul_fallback=1",
             g_abort_on_cpu_fallback ? 1 : 0);
 
@@ -3352,6 +3843,21 @@ void fpga_cleanup(void) {
     }
     g_cleanup_done = true;
 
+    if (ddr_is_mapped()) {
+        for (fpga_weight_cache_entry_t & entry : g_weight_cache) {
+            if (entry.valid && ddr_range_fits(entry.header_off, sizeof(fpga_weight_cache_header_t))) {
+                fpga_weight_cache_header_t header = ddr_read_weight_cache_header(entry.header_off);
+                header.valid = 0U;
+                ddr_write_weight_cache_header(entry.header_off, header);
+                entry.valid = false;
+            }
+        }
+        if (!g_weight_cache.empty()) {
+            LOGI("weight tile cache metadata invalidated entries=%zu; payload was left intact", g_weight_cache.size());
+        }
+        g_weight_cache.clear();
+    }
+
     if (g_ddr_map_base && g_ddr_map_base != MAP_FAILED) {
         munmap(g_ddr_map_base, g_ddr_map_size);
     }
@@ -3376,7 +3882,7 @@ void fpga_cleanup(void) {
     }
 
     const long long elapsed_us = g_fpga_start_us > 0 ? now_us() - g_fpga_start_us : 0;
-    LOGI("cleanup complete fpga_calls=%lld vpu_runs=%lld rejects=%lld attention_cpu_bypass=%lld vocab_projection_cpu_bypass=%lld elapsed_s=%.3f pingpong_cap=%d descriptor_cap=%d scheduler=%d activation_cache_enabled=%d activation_cache_hits=%lld misses=%lld weight_cache_builds=%lld hits=%lld misses=%lld bytes=%lld contract_checks=%lld raw_mismatches=%lld raw_repairs=%lld value_mismatches=%lld",
+    LOGI("cleanup complete fpga_calls=%lld vpu_runs=%lld rejects=%lld attention_cpu_bypass=%lld vocab_projection_cpu_bypass=%lld elapsed_s=%.3f pingpong_cap=%d descriptor_cap=%d scheduler=%d activation_cache_enabled=%d activation_cache_hits=%lld misses=%lld weight_cache_builds=%lld hits=%lld misses=%lld bytes=%lld cache_lookup_ms=%.3f cache_crc_ms=%.3f weight_pack_ms=%.3f contract_checks=%lld raw_mismatches=%lld raw_repairs=%lld value_mismatches=%lld",
          g_fpga_count,
          g_fpga_vpu_runs,
          g_reject_count,
@@ -3393,6 +3899,9 @@ void fpga_cleanup(void) {
          g_weight_cache_hits,
          g_weight_cache_misses,
          g_weight_cache_bytes,
+         (double) g_weight_cache_lookup_us / 1000.0,
+         (double) g_weight_cache_crc_us / 1000.0,
+         (double) g_weight_pack_us / 1000.0,
          g_contract_checks_done,
          g_contract_raw_mismatches,
          g_contract_raw_repairs,
@@ -3606,6 +4115,9 @@ extern "C" int fpga_try_matmul_extended(
     const double dma_out_ms = (double) totals.dma_result_us / 1000.0;
     const double host_result_ms = (double) totals.host_result_us / 1000.0;
     const double host_accum_ms = (double) totals.host_accum_us / 1000.0;
+    const double cache_lookup_ms = (double) totals.weight_cache_lookup_us / 1000.0;
+    const double cache_crc_ms = (double) totals.weight_cache_crc_us / 1000.0;
+    const double weight_pack_ms = (double) totals.weight_pack_us / 1000.0;
 
     const char * dominant = "prep";
     double dominant_ms = prep_ms;
@@ -3640,7 +4152,7 @@ extern "C" int fpga_try_matmul_extended(
         ((double) totals.ip_compute_us * g_fpga_clock_mhz / (double) totals.vpu_runs) : 0.0;
 
     if (g_profile_every > 0 && (g_fpga_count == 1 || (g_fpga_count % g_profile_every) == 0)) {
-        LOGSTAGE("tensor=%s layer=%d seq=%d phase=%s shape=K%lld_N%lld_M%lld row_tiles=%lld group_tiles=%lld q8_blocks=%lld vpu_runs=%lld prep_ms=%.3f dma_input_ms=%.3f act_dma_ms=%.3f weight_dma_ms=%.3f scale_dma_ms=%.3f ip_compute_ms=%.3f dma_output_ms=%.3f host_result_ms=%.3f host_accum_ms=%.3f total_ms=%.3f dominant=%s pl_scale=%d effective_GMAC/s=%.3f effective_MiB/s=%.1f act_bytes=%zu weight_bytes=%zu scale_bytes=%zu result_bytes=%zu weight_cache_hits=%lld weight_cache_misses=%lld cycles_per_run=%.1f",
+        LOGSTAGE("tensor=%s layer=%d seq=%d phase=%s shape=K%lld_N%lld_M%lld row_tiles=%lld group_tiles=%lld q8_blocks=%lld vpu_runs=%lld prep_ms=%.3f cache_lookup_ms=%.3f cache_crc_ms=%.3f weight_pack_ms=%.3f dma_input_ms=%.3f act_dma_ms=%.3f weight_dma_ms=%.3f scale_dma_ms=%.3f ip_compute_ms=%.3f dma_output_ms=%.3f host_result_ms=%.3f host_accum_ms=%.3f total_ms=%.3f dominant=%s pl_scale=%d effective_GMAC/s=%.3f effective_MiB/s=%.1f act_bytes=%zu weight_bytes=%zu scale_bytes=%zu result_bytes=%zu weight_cache_hits=%lld weight_cache_misses=%lld cycles_per_run=%.1f",
                  tensor_name,
                  effective_layer_id,
                  seq_pos,
@@ -3653,6 +4165,9 @@ extern "C" int fpga_try_matmul_extended(
                  (long long) q8_blocks,
                  totals.vpu_runs,
                  prep_ms,
+                 cache_lookup_ms,
+                 cache_crc_ms,
+                 weight_pack_ms,
                  dma_in_ms,
                  dma_act_ms,
                  dma_weight_ms,

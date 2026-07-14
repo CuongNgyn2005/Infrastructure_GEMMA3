@@ -4,8 +4,73 @@
 #include "log.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <cstdio>
+#include <limits>
 #include <unordered_map>
 #include <algorithm>
+
+// C0 correctness aid.  This traces the unmodified model logits immediately
+// before the sampler chain.  It is deliberately off by default and has no
+// effect on candidate ordering or sampling.
+static int llama_logit_trace_every() {
+    static const int every = []() {
+        const char * value = std::getenv("LLAMA_LOGIT_TRACE_EVERY");
+        if (!value || value[0] == '\0') {
+            return std::getenv("LLAMA_LOGIT_TRACE") ? 1 : 0;
+        }
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        return end != value && parsed > 0 && parsed <= 1000000 ? (int) parsed : 0;
+    }();
+    return every;
+}
+
+static void llama_logit_trace_top5(const float * logits, int n_vocab) {
+    const int every = llama_logit_trace_every();
+    if (every <= 0 || !logits || n_vocab <= 0) {
+        return;
+    }
+
+    static uint64_t trace_call = 0;
+    trace_call++;
+    if ((trace_call % (uint64_t) every) != 0U) {
+        return;
+    }
+
+    struct top_logit_t {
+        int token;
+        float logit;
+    } top[5];
+    for (int i = 0; i < 5; ++i) {
+        top[i] = {-1, -std::numeric_limits<float>::infinity()};
+    }
+
+    for (int token = 0; token < n_vocab; ++token) {
+        const float logit = logits[token];
+        if (!std::isfinite(logit)) {
+            continue;
+        }
+        for (int rank = 0; rank < 5; ++rank) {
+            if (logit > top[rank].logit) {
+                for (int move = 4; move > rank; --move) {
+                    top[move] = top[move - 1];
+                }
+                top[rank] = {token, logit};
+                break;
+            }
+        }
+    }
+
+    LOG_INF("[LOGIT_TRACE] call=%llu top5="
+            "%d:%.7g,%d:%.7g,%d:%.7g,%d:%.7g,%d:%.7g\n",
+            (unsigned long long) trace_call,
+            top[0].token, top[0].logit,
+            top[1].token, top[1].logit,
+            top[2].token, top[2].logit,
+            top[3].token, top[3].logit,
+            top[4].token, top[4].logit);
+}
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
@@ -125,6 +190,8 @@ struct common_sampler {
         for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
             cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
         }
+
+        llama_logit_trace_top5(logits, n_vocab);
 
         cur_p = { cur.data(), cur.size(), -1, false };
     }
