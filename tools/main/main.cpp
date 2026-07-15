@@ -6,7 +6,10 @@
 #include "llama.h"
 #include "chat.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -45,6 +48,108 @@ static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
+
+static bool env_flag_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    if (!value || value[0] == '\0') {
+        return false;
+    }
+    return std::strcmp(value, "1") == 0 ||
+           std::strcmp(value, "true") == 0 ||
+           std::strcmp(value, "TRUE") == 0 ||
+           std::strcmp(value, "yes") == 0 ||
+           std::strcmp(value, "YES") == 0 ||
+           std::strcmp(value, "on") == 0 ||
+           std::strcmp(value, "ON") == 0;
+}
+
+static std::string logit_trace_escape(const std::string & text) {
+    std::string escaped;
+    escaped.reserve(text.size());
+    for (const unsigned char ch : text) {
+        if (ch == '\n') {
+            escaped += "\\n";
+        } else if (ch == '\r') {
+            escaped += "\\r";
+        } else if (ch == '\t') {
+            escaped += "\\t";
+        } else if (ch >= 0x20U && ch != 0x7FU) {
+            escaped += (char) ch;
+        } else {
+            char byte_text[5] = {};
+            std::snprintf(byte_text, sizeof(byte_text), "\\x%02X", (unsigned) ch);
+            escaped += byte_text;
+        }
+    }
+    return escaped;
+}
+
+static void logit_trace_before_sample(
+        struct llama_context * ctx,
+        const struct llama_vocab * vocab) {
+    struct candidate {
+        float logit;
+        llama_token id;
+    } top[5] = {
+        { -INFINITY, LLAMA_TOKEN_NULL }, { -INFINITY, LLAMA_TOKEN_NULL },
+        { -INFINITY, LLAMA_TOKEN_NULL }, { -INFINITY, LLAMA_TOKEN_NULL },
+        { -INFINITY, LLAMA_TOKEN_NULL },
+    };
+
+    const float * logits = llama_get_logits_ith(ctx, -1);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    if (!logits || n_vocab <= 0) {
+        LOG_WRN("[LOGIT_TRACE] logits unavailable: ptr=%p n_vocab=%d\n", (const void *) logits, n_vocab);
+        return;
+    }
+
+    int32_t finite = 0;
+    int32_t nan = 0;
+    int32_t inf = 0;
+    float min_logit = INFINITY;
+    float max_logit = -INFINITY;
+    for (int32_t id = 0; id < n_vocab; ++id) {
+        const float logit = logits[id];
+        if (std::isnan(logit)) {
+            ++nan;
+            continue;
+        }
+        if (!std::isfinite(logit)) {
+            ++inf;
+            continue;
+        }
+        ++finite;
+        min_logit = std::min(min_logit, logit);
+        max_logit = std::max(max_logit, logit);
+        for (int rank = 0; rank < 5; ++rank) {
+            if (logit <= top[rank].logit) {
+                continue;
+            }
+            for (int move = 4; move > rank; --move) {
+                top[move] = top[move - 1];
+            }
+            top[rank] = { logit, (llama_token) id };
+            break;
+        }
+    }
+
+    std::ostringstream line;
+    line << "[LOGIT_TRACE] pre_sample finite=" << finite
+         << " nan=" << nan
+         << " inf=" << inf
+         << " min=" << min_logit
+         << " max=" << max_logit
+         << " top5=";
+    for (int rank = 0; rank < 5; ++rank) {
+        if (rank != 0) {
+            line << ',';
+        }
+        const std::string piece = top[rank].id == LLAMA_TOKEN_NULL ?
+            "<none>" : logit_trace_escape(common_token_to_piece(ctx, top[rank].id, true));
+        line << top[rank].id << ':' << top[rank].logit << ':' << piece;
+    }
+    LOG_INF("%s\n", line.str().c_str());
+}
 
 static void print_usage(int argc, char ** argv) {
     (void) argc;
@@ -96,6 +201,8 @@ int main(int argc, char ** argv) {
     }
 
     common_init();
+
+    const bool logit_trace_enabled = env_flag_enabled("LLAMA_LOGIT_TRACE");
 
     auto & sparams = params.sampling;
 
@@ -748,7 +855,18 @@ int main(int argc, char ** argv) {
                 LOG_DBG("saved session to %s\n", path_session.c_str());
             }
 
+            if (logit_trace_enabled) {
+                logit_trace_before_sample(ctx, vocab);
+            }
+
             const llama_token id = common_sampler_sample(smpl, ctx, -1);
+
+            if (logit_trace_enabled) {
+                LOG_INF("[LOGIT_TRACE] sampled id=%d eog=%d piece=%s\n",
+                        id,
+                        llama_vocab_is_eog(vocab, id) ? 1 : 0,
+                        logit_trace_escape(common_token_to_piece(ctx, id, true)).c_str());
+            }
 
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
 

@@ -1128,9 +1128,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 g_current_seq_pos++;
                 
-                if (g_current_seq_pos >= 512) {
-                    LLAMA_LOG_WARN("KV cache full at position %d\n", g_current_seq_pos);
-                }
             }
             LLAMA_LOG_DEBUG("seq_pos updated to %d (n_tokens=%d)\n", 
                             g_current_seq_pos, ubatch.n_tokens);
