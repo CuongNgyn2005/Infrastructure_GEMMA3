@@ -255,7 +255,11 @@ int main(int argc, char ** argv) {
     {
         // Đường dẫn này giờ vô nghĩa với code mới, nhưng cần để hàm ko lỗi
         // Hàm này giờ chỉ làm nhiệm vụ mmap /dev/mem
-        if (fpga_init() == 0) {
+        if (fpga_source_audit_only_requested()) {
+            LOG_INF("%s: FPGA source audit requested; host hardware initialization skipped\n", __func__);
+        } else if (fpga_contract_check_requested()) {
+            LOG_INF("%s: FPGA C0 requested; host hardware initialization deferred until model tensor validation completes\n", __func__);
+        } else if (fpga_init() == 0) {
             LOG_INF("%s: FPGA host initialized (Bare-metal mode)\n", __func__);
         } else {
             LOG_WRN("%s: FPGA host init failed; CPU fallback remains available\n", __func__);

@@ -11,6 +11,16 @@ struct ggml_tensor;
 int  fpga_init(void);
 void fpga_cleanup(void);
 
+// Side-effect-free environment queries used before FPGA initialization.
+int fpga_source_audit_only_requested(void);
+int fpga_contract_check_requested(void);
+
+// C0 is allowed to map and drive ZDMA/VPU only after llama-model-loader has
+// validated every model tensor.  This is a process-local handshake; it never
+// accesses board hardware or mutates model data.
+void fpga_mark_model_tensor_validation_passed(void);
+int  fpga_model_tensor_validation_passed(void);
+
 // Legacy low-level API kept for link compatibility. The current DATN_RTL
 // bitstream uses the ggml tensor hook below.
 int fpga_run_matmul(

@@ -3,6 +3,7 @@
 #include "quants.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -26,7 +27,7 @@
 #include <vector>
 
 #define FPGA_LOG_FILE "/tmp/fpga_debug.log"
-#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v35-deep-staging-guard"
+#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v43-loader-handshake-gated-contract"
 
 #define MY_IP_BASE_ADDRESS 0x00000000A0000000LL
 #define REG_BASE_PHYS      0x00000000A0000000LL
@@ -519,6 +520,13 @@ static bool                g_contract_deep_staging = false;
 // value contracts for a complete matmul pass.  It is never a production
 // acceleration mode.
 static bool                g_contract_canonical_dst = false;
+// Diagnostic-only: validate the Q8_0 source tensors in the normal GGML
+// execution order, but return control to CPU before any model GEMV is sent to
+// ZDMA/VPU.  This distinguishes a bad/mutable GGUF source from a fault that
+// only appears after raw FPGA launches.  The ggml caller skips FPGA init in
+// this mode, so source audit never maps or self-tests board hardware.
+static bool                g_q8_source_audit_only = false;
+static bool                g_q8_source_audit_mode_logged = false;
 static bool                g_clear_result_before_run = false;
 static bool                g_contract_raw_repair_enabled = false;
 // The fused path has not yet passed an end-to-end language/logit A/B test on
@@ -559,7 +567,18 @@ static long long           g_contract_raw_repairs = 0;
 static long long           g_contract_value_mismatches = 0;
 static long long           g_contract_canonical_dst_values = 0;
 static long long           g_contract_staging_restage_count = 0;
+static long long           g_q8_source_audit_checks = 0;
+static long long           g_q8_source_audit_failures = 0;
 static long long           g_activation_scale_fp16_overflows = 0;
+// Set only while a C0 source preflight rejects an immutable Q8 tensor.  This
+// lets the outer hook report the real cause instead of mislabelling it as a
+// ZDMA/VPU transfer failure.
+static bool                g_contract_source_validation_failed = false;
+// Set by llama-model-loader only after its complete upstream tensor validation
+// succeeds.  C0 starts before normal FPGA initialization, so this handshake
+// prevents a partially copied frontend build from bypassing the loader gate
+// and reaching MY_IP/ZDMA with an invalid model source.
+static std::atomic<bool>   g_contract_loader_validation_passed{false};
 
 typedef struct {
     uint32_t status;
@@ -723,6 +742,31 @@ static inline void mmio_fence(void) {
 #else
     __sync_synchronize();
 #endif
+}
+
+int fpga_source_audit_only_requested(void) {
+    // ggml-cpu calls this before pthread_once(fpga_init), so it must not map
+    // MY_IP, ZDMA, or DDR high.
+    return env_flag_enabled("FPGA_SOURCE_AUDIT_ONLY") ? 1 : 0;
+}
+
+int fpga_contract_check_requested(void) {
+    // This query is called before fpga_init() by llama-cli.  It must not
+    // access MMIO, map memory, or change any persistent host state.
+    return env_int_value("FPGA_CONTRACT_CHECK", 0, 0, 1000000) > 0 ? 1 : 0;
+}
+
+void fpga_mark_model_tensor_validation_passed(void) {
+    // This function is intentionally board-free: it can run while main has
+    // deferred fpga_init() for C0.  Do not treat a normal model load as C0
+    // evidence; the loader calls it only for C0/source-audit validation.
+    if (fpga_contract_check_requested() || fpga_source_audit_only_requested()) {
+        g_contract_loader_validation_passed.store(true, std::memory_order_release);
+    }
+}
+
+int fpga_model_tensor_validation_passed(void) {
+    return g_contract_loader_validation_passed.load(std::memory_order_acquire) ? 1 : 0;
 }
 
 static inline bool dma_is_mapped(void) {
@@ -1591,7 +1635,7 @@ static bool msync_ddr_range(uint32_t off, size_t bytes, bool invalidate, const c
             likely_uncached_mapping &&
             (saved_errno == EINVAL || saved_errno == ENODEV)) {
             if (!g_ddr_msync_unsupported_logged) {
-                LOGI("msync unsupported for ddr_high source=%s errno=%d (%s); continuing with CPU barriers/O_SYNC mapping assumption",
+                LOGI("msync unsupported for ddr_high source=%s errno=%d (%s); generic-uio physical maps are normally non-cached, but cacheability is kernel-owned. Continuing with ordered volatile DDR accesses; this message alone does not prove a cache fault.",
                      g_ddr_map_source.c_str(), saved_errno, strerror(saved_errno));
                 g_ddr_msync_unsupported_logged = true;
             }
@@ -1771,7 +1815,7 @@ static bool fpga_dma_init(void) {
     mmio_fence();
     const uint32_t stale_total_bytes = zdma_total_byte_clear();
 
-    LOGINIT("ZDMA init base=0x%llx virt=0x%llx status=0x%08x isr=0x%08x ctrl0=0x%08x ctrl1=0x%08x data_attr=0x%08x stale_total_bytes=0x%08x total_bytes_after_clear=0x%08x completion_gate=dma_done_and_ctrl2_en_clear",
+    LOGINIT("ZDMA init base=0x%llx virt=0x%llx status=0x%08x isr=0x%08x ctrl0=0x%08x ctrl1=0x%08x data_attr=0x%08x stale_total_bytes=0x%08x total_bytes_after_clear=0x%08x completion_gate=isr_ack_then_dma_done_and_ctrl2_en_clear",
             (unsigned long long) DMA_BASE_PHYS,
             fpga_ptr_addr(g_dma),
             g_dma->ZDMA_CH_STATUS,
@@ -1821,12 +1865,49 @@ static bool zdma_wait_channel_disabled(const char * tag, const char * phase) {
     return true;
 }
 
+// DMA_DONE is sticky and W1C.  A DSB orders the clear write but does not by
+// itself prove that a subsequent CPU load sees the cleared event.  Without
+// this acknowledgement, the post-START completion loop can accept a previous
+// transfer's DONE bit while CTRL2.EN is still sampled as idle, then let the
+// host reuse ACT/WEIGHT staging before the new transfer has started.
+static bool zdma_clear_isr_for_new_transfer(const char * tag) {
+    if (!dma_is_mapped()) {
+        LOGE("ZDMA ISR-clear gate has no mapped channel tag=%s", tag ? tag : "?");
+        return false;
+    }
+
+    g_dma->ZDMA_CH_ISR = ZDMA_ISR_CLEAR_ALL;
+    mmio_fence();
+
+    const long long t0 = now_us();
+    long long polls = 0;
+    const uint32_t completion_or_error = ZDMA_ISR_DMA_DONE | ZDMA_ISR_ERROR_MASK;
+    while (true) {
+        const uint32_t isr = g_dma->ZDMA_CH_ISR;
+        if ((isr & completion_or_error) == 0U) {
+            mmio_fence();
+            return true;
+        }
+        if (now_us() - t0 > g_dma_timeout_us) {
+            char errors[160];
+            zdma_format_error_mask(isr, errors, sizeof(errors));
+            LOGE("ZDMA ISR clear timeout tag=%s isr=0x%08x errors=%s ctrl2=0x%08x polls=%lld; refusing to start with a stale completion event",
+                 tag ? tag : "?", isr, errors, g_dma->ZDMA_CH_CTRL2, polls);
+            zdma_dump(tag);
+            return false;
+        }
+        ++polls;
+        if ((polls & 0x3FF) == 0) {
+            sched_yield();
+        }
+    }
+}
+
 // CTRL2.EN is a channel-state bit, not an event for the descriptor we just
 // programmed.  Polling only for EN==0 immediately after writing START can
 // observe the old disabled state before the posted start write is accepted.
-// Require the W1C DMA_DONE event for this transfer as well as EN==0.  This
-// makes the handoff from ZDMA to VPU explicit and prevents CTRL_START from
-// racing an ACT/WEIGHT DMA that has not actually completed.
+// The caller has positively cleared the old W1C event, so DMA_DONE here is a
+// completion generated by the descriptor just launched.
 static bool zdma_wait_transfer_complete(const char * tag, zdma_completion_info_t * info) {
     if (!dma_is_mapped()) {
         LOGE("ZDMA completion gate has no mapped channel tag=%s",
@@ -2024,8 +2105,9 @@ static bool fpga_dma_copy_one(uint64_t src_phys, uint64_t dst_phys, size_t bytes
         }
     }
 
-    g_dma->ZDMA_CH_ISR = ZDMA_ISR_CLEAR_ALL;
-    mmio_fence();
+    if (!zdma_clear_isr_for_new_transfer(tag)) {
+        return false;
+    }
     zdma_set_addr(&g_dma->ZDMA_CH_SRC_DSCR_WORD0, &g_dma->ZDMA_CH_SRC_DSCR_WORD1, src_phys);
     g_dma->ZDMA_CH_SRC_DSCR_WORD2 = (U32) bytes;
     // DMA_DONE is a channel-completion event.  Do not request per-descriptor
@@ -2094,7 +2176,7 @@ static bool fpga_dma_copy_one(uint64_t src_phys, uint64_t dst_phys, size_t bytes
         }
     }
 
-    LOGDMA("tag=%s src=0x%llx dst=0x%llx bytes=%zu units=bytes ms=%.3f MiB/s=%.1f completion=dma_done_and_ctrl2_en_clear status=0x%08x state=%u isr=0x%08x",
+    LOGDMA("tag=%s src=0x%llx dst=0x%llx bytes=%zu units=bytes ms=%.3f MiB/s=%.1f completion=isr_ack_then_dma_done_and_ctrl2_en_clear status=0x%08x state=%u isr=0x%08x",
            tag ? tag : "?",
            (unsigned long long) src_phys,
            (unsigned long long) dst_phys,
@@ -2614,6 +2696,140 @@ static void read_result_i32x4_from_ddr(uint32_t result_word, int32_t out[4]) {
     ddr_read_i32x4(RESULT_BASE + result_word * 16U, out);
 }
 
+// When a supposedly immutable GGUF Q8 block is invalid, distinguish an
+// invalid file from a process-memory mutation.  A C0 failure at this point is
+// before VPU launch, so this evidence must come from the host address space,
+// not from ZDMA or PMAU.  This helper runs only on an error path.
+typedef struct {
+    bool      found;
+    uintptr_t start;
+    uintptr_t end;
+    uint64_t  file_offset;
+    char      perms[5];
+    char      path[768];
+} fpga_proc_map_info_t;
+
+static void fpga_trim_leading_space(char * value) {
+    if (!value) {
+        return;
+    }
+    char * first = value;
+    while (*first == ' ' || *first == '\t') {
+        ++first;
+    }
+    if (first != value) {
+        memmove(value, first, strlen(first) + 1U);
+    }
+}
+
+static bool fpga_find_process_mapping(uintptr_t address, fpga_proc_map_info_t * info) {
+    if (!info) {
+        return false;
+    }
+    *info = {};
+
+    FILE * const maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        return false;
+    }
+
+    char line[1024] = {};
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long long start = 0U;
+        unsigned long long end = 0U;
+        unsigned long long file_offset = 0U;
+        unsigned long long inode = 0U;
+        char perms[5] = {};
+        char dev[32] = {};
+        char path[768] = {};
+        const int fields = sscanf(line, "%llx-%llx %4s %llx %31s %llu %767[^\n]",
+                                  &start, &end, perms, &file_offset, dev, &inode, path);
+        if (fields < 6 || address < (uintptr_t) start || address >= (uintptr_t) end) {
+            continue;
+        }
+
+        info->found = true;
+        info->start = (uintptr_t) start;
+        info->end = (uintptr_t) end;
+        info->file_offset = (uint64_t) file_offset;
+        snprintf(info->perms, sizeof(info->perms), "%s", perms);
+        if (fields >= 7) {
+            fpga_trim_leading_space(path);
+            snprintf(info->path, sizeof(info->path), "%s", path);
+        }
+        fclose(maps);
+        return true;
+    }
+
+    fclose(maps);
+    return false;
+}
+
+static void fpga_log_source_file_provenance(const void * source, size_t bytes) {
+    constexpr size_t MAX_PROBE_BYTES = sizeof(block_q8_0_t);
+    if (!source || bytes == 0U) {
+        LOGE("Q8_SOURCE_MAP_PROVENANCE source=%p bytes=%zu result=invalid_request",
+             source, bytes);
+        return;
+    }
+
+    fpga_proc_map_info_t map = {};
+    const uintptr_t address = (uintptr_t) source;
+    if (!fpga_find_process_mapping(address, &map)) {
+        LOGE("Q8_SOURCE_MAP_PROVENANCE source=0x%llx bytes=%zu result=map_not_found errno=%d (%s)",
+             (unsigned long long) address, bytes, errno, strerror(errno));
+        return;
+    }
+
+    const size_t bytes_in_mapping = (size_t) (map.end - address);
+    const size_t probe_bytes = std::min(std::min(bytes, MAX_PROBE_BYTES), bytes_in_mapping);
+    if (probe_bytes == 0U) {
+        LOGE("Q8_SOURCE_MAP_PROVENANCE source=0x%llx bytes=%zu map=[0x%llx,0x%llx) result=empty_map_probe",
+             (unsigned long long) address, bytes,
+             (unsigned long long) map.start, (unsigned long long) map.end);
+        return;
+    }
+    const bool file_backed = map.path[0] == '/';
+    if (!file_backed) {
+        LOGE("Q8_SOURCE_MAP_PROVENANCE source=0x%llx bytes=%zu map=[0x%llx,0x%llx) perms=%s file_offset=0x%llx path=%s result=not_file_backed",
+             (unsigned long long) address, bytes,
+             (unsigned long long) map.start, (unsigned long long) map.end,
+             map.perms, (unsigned long long) map.file_offset,
+             map.path[0] ? map.path : "[anonymous]");
+        return;
+    }
+
+    const int fd = open(map.path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LOGE("Q8_SOURCE_MAP_PROVENANCE source=0x%llx bytes=%zu map=[0x%llx,0x%llx) perms=%s file_offset=0x%llx path=%s result=file_open_failed errno=%d (%s)",
+             (unsigned long long) address, bytes,
+             (unsigned long long) map.start, (unsigned long long) map.end,
+             map.perms, (unsigned long long) map.file_offset, map.path,
+             errno, strerror(errno));
+        return;
+    }
+
+    uint8_t file_bytes[MAX_PROBE_BYTES] = {};
+    const uint64_t mapped_file_offset = map.file_offset + (uint64_t) (address - map.start);
+    const ssize_t read_bytes = pread(fd, file_bytes, probe_bytes, (off_t) mapped_file_offset);
+    const int saved_errno = errno;
+    close(fd);
+
+    const bool complete_read = read_bytes == (ssize_t) probe_bytes;
+    const bool source_matches_file = complete_read &&
+        memcmp(file_bytes, source, probe_bytes) == 0;
+    LOGE("Q8_SOURCE_MAP_PROVENANCE source=0x%llx bytes=%zu probe_bytes=%zu map=[0x%llx,0x%llx) perms=%s map_file_offset=0x%llx source_file_offset=0x%llx path=%s pread=%zd source_matches_file=%d file_bytes=[%02x,%02x,%02x,%02x] source_bytes=[%02x,%02x,%02x,%02x]%s",
+         (unsigned long long) address, bytes, probe_bytes,
+         (unsigned long long) map.start, (unsigned long long) map.end,
+         map.perms, (unsigned long long) map.file_offset,
+         (unsigned long long) mapped_file_offset, map.path, read_bytes,
+         source_matches_file ? 1 : 0,
+         file_bytes[0], file_bytes[1], file_bytes[2], file_bytes[3],
+         ((const uint8_t *) source)[0], ((const uint8_t *) source)[1],
+         ((const uint8_t *) source)[2], ((const uint8_t *) source)[3],
+         complete_read ? "" : strerror(saved_errno));
+}
+
 static float load_dst_value(
         const struct ggml_tensor * dst,
         int64_t row,
@@ -2656,24 +2872,45 @@ static bool fpga_contract_validate_weight_scales(
                 const block_q8_0_t * const live = weight_block(src0, row, block);
                 const bool live_matches_snapshot =
                     memcmp(live, snapshot, sizeof(*snapshot)) == 0;
-                LOGE("CONTRACT_WEIGHT_SCALE_NONFINITE tensor=%s layer=%d row=%lld block=%lld d_bits=0x%04x scale=%.9g live_d_bits=0x%04x live_scale=%.9g live_matches_snapshot=%d src0_type=%d src0_nb=[%lld,%lld,%lld,%lld] snapshot_bytes=%zu qs_first8=[%d,%d,%d,%d,%d,%d,%d,%d]; refusing VPU launch because finite raw dots cannot yield a finite F32 result",
+                block_q8_0_t read_a = {};
+                block_q8_0_t read_b = {};
+                memcpy(&read_a, live, sizeof(read_a));
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                memcpy(&read_b, live, sizeof(read_b));
+                const bool source_reads_stable =
+                    memcmp(&read_a, &read_b, sizeof(read_a)) == 0;
+                const bool upstream_row_valid =
+                    ggml_validate_row_data(src0->type, src0->data, ggml_nbytes(src0));
+                const size_t byte_offset =
+                    (size_t) row * (size_t) src0->nb[1] +
+                    (size_t) block * (size_t) src0->nb[0];
+                LOGE("CONTRACT_WEIGHT_SCALE_NONFINITE tensor=%s layer=%d row=%lld block=%lld byte_offset=%zu d_bits=0x%04x scale=%.9g live_d_bits=0x%04x live_scale=%.9g live_matches_snapshot=%d source_reads_stable=%d upstream_q8_validate=%s src0_type=%d src0_nb=[%lld,%lld,%lld,%lld] snapshot_bytes=%zu raw_bytes=[%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x,%02x] qs_first8=[%d,%d,%d,%d,%d,%d,%d,%d]; refusing VPU launch because finite raw dots cannot yield a finite F32 result",
                      tensor_name ? tensor_name : "?",
                      layer_id,
                      (long long) row,
                      (long long) block,
+                     byte_offset,
                      (unsigned) snapshot->d,
                      scale,
                      (unsigned) live->d,
                      fp16_to_fp32(live->d),
                      live_matches_snapshot ? 1 : 0,
+                     source_reads_stable ? 1 : 0,
+                     upstream_row_valid ? "pass" : "fail",
                      (int) src0->type,
                      (long long) src0->nb[0], (long long) src0->nb[1],
                      (long long) src0->nb[2], (long long) src0->nb[3],
                      ggml_nbytes(src0),
+                     ((const uint8_t *) snapshot)[0], ((const uint8_t *) snapshot)[1],
+                     ((const uint8_t *) snapshot)[2], ((const uint8_t *) snapshot)[3],
+                     ((const uint8_t *) snapshot)[4], ((const uint8_t *) snapshot)[5],
+                     ((const uint8_t *) snapshot)[6], ((const uint8_t *) snapshot)[7],
+                     ((const uint8_t *) snapshot)[8], ((const uint8_t *) snapshot)[9],
                      (int) snapshot->qs[0], (int) snapshot->qs[1],
                      (int) snapshot->qs[2], (int) snapshot->qs[3],
                      (int) snapshot->qs[4], (int) snapshot->qs[5],
                      (int) snapshot->qs[6], (int) snapshot->qs[7]);
+                fpga_log_source_file_provenance(live, sizeof(*live));
                 return false;
             }
             const float abs_scale = std::fabs(scale);
@@ -2696,6 +2933,31 @@ static bool fpga_contract_validate_weight_scales(
          min_abs_scale,
          max_abs_scale,
          ggml_nbytes(src0));
+    return true;
+}
+
+static bool fpga_audit_q8_source_only(
+        const struct ggml_tensor * src0,
+        const char * tensor_name,
+        int layer_id) {
+    if (!src0 || src0->type != GGML_TYPE_Q8_0 || !src0->data) {
+        return true;
+    }
+
+    g_q8_source_audit_checks++;
+    const bool valid = fpga_contract_validate_weight_scales(
+        src0, src0->data, tensor_name, layer_id);
+    if (!valid) {
+        g_q8_source_audit_failures++;
+        LOGE("Q8_SOURCE_AUDIT_FAIL tensor=%s layer=%d check=%lld action=stop_before_model_zdma_vpu_gemv; this run did not submit this tensor to ZDMA/VPU",
+             tensor_name ? tensor_name : "?", layer_id,
+             g_q8_source_audit_checks);
+        return false;
+    }
+
+    LOGI("Q8_SOURCE_AUDIT_PASS tensor=%s layer=%d check=%lld action=cpu_matmul_only",
+         tensor_name ? tensor_name : "?", layer_id,
+         g_q8_source_audit_checks);
     return true;
 }
 
@@ -2913,6 +3175,71 @@ static bool fpga_stage_q8_group_with_contract_guard(
     LOGE("CONTRACT_STAGING_RESTAGE_FAILED tensor=%s layer=%d tile=%u attempts=%d; refusing to launch VPU with an unverified ACT/WEIGHT DDR source",
          tensor_name ? tensor_name : "?", layer_id, tile_id, attempts);
     return false;
+}
+
+// A completed ACT DMA is a read from DDR_HIGH and must not modify the
+// separately staged WEIGHT source.  v35 found a byte change in WEIGHT after
+// ACT completed, before the WEIGHT DMA or VPU start.  Preserve that evidence,
+// then re-stage once so a C0 run can continue to collect raw-contract data.
+// A recovered staging fault is still a C0 failure for primary-FPGA admission:
+// the cleanup summary records staging_restages and must remain zero.
+static bool fpga_contract_restage_after_act_dma(
+        const block_q8_0_t * weight_snapshot,
+        const block_q8_0_t * act_group,
+        int rows,
+        int group_blocks,
+        bool write_weight_payload,
+        uint32_t weight_src_off,
+        size_t act_bytes,
+        size_t weight_bytes,
+        const char * tensor_name,
+        int layer_id,
+        uint32_t tile_id) {
+    const uint64_t act_src_begin = DDR_BASE_PHYS + (uint64_t) ACT_BASE;
+    const uint64_t act_src_end = act_src_begin + (uint64_t) act_bytes;
+    const uint64_t act_dst_begin = LMM_BASE_PHYS + (uint64_t) ACT_BASE;
+    const uint64_t act_dst_end = act_dst_begin + (uint64_t) act_bytes;
+    const uint64_t weight_src_begin = DDR_BASE_PHYS + (uint64_t) weight_src_off;
+    const uint64_t weight_src_end = weight_src_begin + (uint64_t) weight_bytes;
+    const bool source_ranges_disjoint =
+        act_src_end <= weight_src_begin || weight_src_end <= act_src_begin;
+
+    LOGE("CONTRACT_STAGING_ACT_DMA_CONTEXT tensor=%s layer=%d tile=%u act_src=[0x%llx,0x%llx) act_dst=[0x%llx,0x%llx) weight_src=[0x%llx,0x%llx) source_ranges_disjoint=%d write_weight_payload=%d",
+         tensor_name ? tensor_name : "?", layer_id, tile_id,
+         (unsigned long long) act_src_begin,
+         (unsigned long long) act_src_end,
+         (unsigned long long) act_dst_begin,
+         (unsigned long long) act_dst_end,
+         (unsigned long long) weight_src_begin,
+         (unsigned long long) weight_src_end,
+         source_ranges_disjoint ? 1 : 0,
+         write_weight_payload ? 1 : 0);
+    zdma_dump("contract_staging_changed_after_act_dma");
+    fpga_dma_trace_dump("staging_changed_after_act_dma", tensor_name, layer_id,
+                        tile_id, "ACT");
+
+    if (!write_weight_payload) {
+        LOGE("CONTRACT_STAGING_RESTAGE_FAILED tensor=%s layer=%d tile=%u reason=weight_cache_source_changed_after_act_dma",
+             tensor_name ? tensor_name : "?", layer_id, tile_id);
+        return false;
+    }
+
+    fpga_stage_q8_group_payload(weight_snapshot, act_group, rows, group_blocks,
+                                true, weight_src_off);
+    fpga_ddr_staging_readback_commit(ACT_BASE, act_bytes);
+    fpga_ddr_staging_readback_commit(weight_src_off, weight_bytes);
+    if (!fpga_contract_verify_staged_q8_group(
+            weight_snapshot, act_group, rows, group_blocks, weight_src_off,
+            tensor_name, layer_id, tile_id, "after_act_dma_restage")) {
+        LOGE("CONTRACT_STAGING_RESTAGE_FAILED tensor=%s layer=%d tile=%u reason=post_restage_source_mismatch",
+             tensor_name ? tensor_name : "?", layer_id, tile_id);
+        return false;
+    }
+
+    g_contract_staging_restage_count++;
+    LOGE("CONTRACT_STAGING_RESTAGE_RECOVERED tensor=%s layer=%d tile=%u phase=after_act_dma; raw contract will continue, but this run is ineligible for primary-FPGA admission",
+         tensor_name ? tensor_name : "?", layer_id, tile_id);
+    return true;
 }
 
 static bool fpga_contract_verify_weight_source_snapshot(
@@ -3566,6 +3893,7 @@ static bool fpga_validate_tensors(
         const struct ggml_tensor * src0,
         const struct ggml_tensor * src1,
         const struct ggml_tensor * dst,
+        bool require_packed_q8_capability,
         const char ** reason) {
     if (!src0 || !src1 || !dst) {
         *reason = "unsupported DMA-to-IP tiling case: null tensor";
@@ -3616,7 +3944,7 @@ static bool fpga_validate_tensors(
         *reason = "unsupported DMA-to-IP tiling case: destination aliases immutable weight storage";
         return false;
     }
-    if (!g_packed_q8_supported) {
+    if (require_packed_q8_capability && !g_packed_q8_supported) {
         *reason = "unsupported DMA-to-IP tiling case: packed Q8 capability unavailable";
         return false;
     }
@@ -4478,19 +4806,25 @@ static bool fpga_dma_run_q8_group(
         if (!fpga_dma_write_to_ip(ACT_BASE, act_bytes, "ACT")) {
             return false;
         }
-        fpga_ip_dma_readback_fence();
-        // ACT and WEIGHT share one external DDR staging mapping.  Re-establish
-        // source visibility after ACT DMA and immediately before WEIGHT DMA;
-        // this is the exact boundary at which the forensic replay was stable.
-        fpga_ddr_staging_readback_commit(weight_src_off, weight_bytes);
+        // Verify at the exact ACT-DMA boundary.  This deliberately precedes
+        // the optional VPU-register readback fence so a failure can be
+        // attributed to the ZDMA read itself rather than to a later CPU/MMIO
+        // observation step.
         if (staging_guard_active && !fpga_contract_verify_staged_q8_group(
                 weight_snapshot.data(), act_group, rows, group_blocks,
                 weight_src_off, tensor_name, layer_id, tile_id,
-                "after_act_dma_before_weight_dma")) {
-            LOGE("contract staging changed across ACT DMA tensor=%s layer=%d tile=%u",
-                 tensor_name ? tensor_name : "?", layer_id, tile_id);
-            return false;
+                "after_act_dma")) {
+            if (!fpga_contract_restage_after_act_dma(
+                    weight_snapshot.data(), act_group, rows, group_blocks,
+                    !weight_cache_hit, weight_src_off, act_bytes, weight_bytes,
+                    tensor_name, layer_id, tile_id)) {
+                LOGE("contract staging changed across ACT DMA tensor=%s layer=%d tile=%u",
+                     tensor_name ? tensor_name : "?", layer_id, tile_id);
+                return false;
+            }
         }
+        fpga_ip_dma_readback_fence();
+        fpga_ddr_staging_readback_commit(weight_src_off, weight_bytes);
         const long long dma_act1 = now_us();
 
         const long long dma_weight0 = now_us();
@@ -4825,6 +5159,7 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip(
     const bool contract_check_active =
         (g_contract_check_limit > 0) &&
         (g_contract_checks_done < (long long) g_contract_check_limit);
+    g_contract_source_validation_failed = false;
     const size_t weight_tensor_bytes = ggml_nbytes(src0);
     const void * weight_data_base = src0->data;
     if (contract_check_active) {
@@ -4837,6 +5172,7 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip(
         weight_data_base = g_scratch.weight_tensor_snapshot.data();
         if (!fpga_contract_validate_weight_scales(
                 src0, weight_data_base, tensor_name, layer_id)) {
+            g_contract_source_validation_failed = true;
             return false;
         }
     } else {
@@ -5010,13 +5346,24 @@ int fpga_init(void) {
     if (g_vocab_projection_cpu_bypass) {
         LOGPROOF("v23 correctness policy: vocabulary projection remains on CPU; set FPGA_ACCELERATE_VOCAB=1 only after the deployed bitstream reports protocol=1/id=0x56505531 and logits A/B passes");
     }
-    LOGPROOF("v35 numerical policy: C0 validates every immutable Q8_0 weight scale before the first VPU launch, uses ggml quantize_row_q8_0 plus stored FP16 scales, compares dst against ggml_vec_dot_q8_0_q8_0, and rejects every NaN/Inf");
-    LOGPROOF("v35 staging policy: C0/C1 defaults to full staged-byte verification before VPU launch and after ACT DMA because the deployed FPD ZDMA path has no proven data coherency. Set FPGA_CONTRACT_DEEP_STAGING=0 only for a controlled fast-path reproduction.");
+    LOGPROOF("v38 numerical policy: C0 validates every immutable Q8_0 weight scale before the first VPU launch, uses ggml quantize_row_q8_0 plus stored FP16 scales, compares dst against ggml_vec_dot_q8_0_q8_0, and rejects every NaN/Inf");
+    LOGPROOF("v38 ZDMA policy: every descriptor is preceded by a W1C ISR clear that is read back until DMA_DONE and all error bits are zero. The completion loop therefore accepts only a newly generated DONE event. C0 keeps the same ACT/WEIGHT staging sequence as primary raw GEMV; staging_restages must remain zero before primary FPGA use.");
+    LOGPROOF("v43 C0 loader gate: FPGA_CONTRACT_CHECK requires a completed upstream GGUF tensor-validation handshake before this host maps MY_IP/ZDMA/DDRHIGH or launches a model VPU transfer.");
     g_log_flush_every = env_int_value("FPGA_LOG_FLUSH_EVERY", 256, 1, 1000000);
     g_profile_every = env_int_value("FPGA_PROFILE_EVERY", FPGA_DEFAULT_PROFILE_EVERY, 0, 1000000);
     g_ip_status_every = env_int_value("FPGA_IP_STATUS_EVERY", FPGA_DEFAULT_STATUS_EVERY, 0, 1000000);
     g_detail_every = env_int_value("FPGA_DETAIL_EVERY", FPGA_DEFAULT_DETAIL_EVERY, 0, 1000000);
     g_contract_check_limit = env_int_value("FPGA_CONTRACT_CHECK", 0, 0, 1000000);
+    g_q8_source_audit_only = env_flag_enabled("FPGA_SOURCE_AUDIT_ONLY");
+    if (g_q8_source_audit_only && g_contract_check_limit > 0) {
+        fpga_fatal("FPGA_SOURCE_AUDIT_ONLY and FPGA_CONTRACT_CHECK cannot be enabled together; source audit must not launch model GEMVs through ZDMA/VPU");
+    }
+    if (g_contract_check_limit > 0 && !fpga_model_tensor_validation_passed()) {
+        fpga_fatal("C0 loader-validation handshake is missing; no board MMIO was mapped. Rebuild and deploy the coupled frontend files ggml/src/ggml-cpu/fpga_host.{cpp,h}, src/llama-model-loader.cpp, and tools/main/main.cpp from the same source tree, then rerun C0. Do not copy only fpga_host.cpp");
+    }
+    if (g_contract_check_limit > 0) {
+        LOGPROOF("C0 loader-validation handshake=pass; full GGUF tensor validation completed before FPGA initialization");
+    }
     g_contract_deep_staging =
         g_contract_check_limit > 0 && !env_flag_disabled("FPGA_CONTRACT_DEEP_STAGING");
     g_contract_canonical_dst =
@@ -5172,7 +5519,7 @@ int fpga_init(void) {
         g_allow_devmem_fallback ? "diagnostic_all_resources" :
         (g_allow_vpu_devmem_compat ? "uio_dma_ddr+vpu_devmem_compat" : "uio_required");
 
-    LOGPROOF("ready version=%s path=%s rows=%d host_row_limit=%d col_beats=%d cols=%d packed_q8=%d max_group_blocks=%d result_words=%d zdma_max_transfer_bytes=%zu pingpong_cap=%d descriptor_cap=%d scheduler=%d scheduler_policy=opt_in pl_scale=%d pl_scale_policy=opt_in stream_protocol=0x%08x bitstream_id=0x%08x spu_silu=%d spu_rms=%d spu_rope=%d spu_softmax=%d weight_cache=%d activation_cache=%d vocab_cpu_bypass=%d legacy_raw_cpu_bypass=%d vocab_min_n=%lld contract_check=%d contract_abort=%d contract_forensics=%d contract_deep_staging=%d contract_canonical_dst=%d raw_retry=%d raw_repair=%d raw_accum_fused=%d result_clear=%d strict_coherency=%d clock_mhz=%.3f profile_log=1 dma_detail=%d ip_detail=%d detail_every=%d flush_every=%d",
+    LOGPROOF("ready version=%s path=%s rows=%d host_row_limit=%d col_beats=%d cols=%d packed_q8=%d max_group_blocks=%d result_words=%d zdma_max_transfer_bytes=%zu pingpong_cap=%d descriptor_cap=%d scheduler=%d scheduler_policy=opt_in pl_scale=%d pl_scale_policy=opt_in stream_protocol=0x%08x bitstream_id=0x%08x spu_silu=%d spu_rms=%d spu_rope=%d spu_softmax=%d weight_cache=%d activation_cache=%d vocab_cpu_bypass=%d legacy_raw_cpu_bypass=%d vocab_min_n=%lld contract_check=%d source_audit_only=%d contract_abort=%d contract_forensics=%d contract_deep_staging=%d contract_canonical_dst=%d raw_retry=%d raw_repair=%d raw_accum_fused=%d result_clear=%d strict_coherency=%d clock_mhz=%.3f profile_log=1 dma_detail=%d ip_detail=%d detail_every=%d flush_every=%d",
          FPGA_HOST_TRACE_VERSION,
          path ? path : "dma(default)",
          g_vpu_max_rows,
@@ -5196,6 +5543,7 @@ int fpga_init(void) {
          g_legacy_raw_cpu_bypass ? 1 : 0,
          (long long) g_vocab_projection_min_n,
          g_contract_check_limit,
+         g_q8_source_audit_only ? 1 : 0,
          g_contract_check_abort ? 1 : 0,
          g_contract_forensic_replay ? 1 : 0,
          g_contract_deep_staging ? 1 : 0,
@@ -5338,7 +5686,7 @@ void fpga_cleanup(void) {
     }
 
     const long long elapsed_us = g_fpga_start_us > 0 ? now_us() - g_fpga_start_us : 0;
-    LOGPROOF("cleanup complete fpga_calls=%lld vpu_runs=%lld rejects=%lld attention_cpu_bypass=%lld vocab_projection_cpu_bypass=%lld legacy_raw_cpu_bypass=%lld elapsed_s=%.3f pingpong_cap=%d descriptor_cap=%d scheduler=%d activation_cache_enabled=%d activation_cache_hits=%lld misses=%lld weight_cache_builds=%lld hits=%lld misses=%lld bytes=%lld cache_lookup_ms=%.3f cache_crc_ms=%.3f weight_pack_ms=%.3f activation_scale_fp16_overflows=%lld contract_checks=%lld raw_mismatches=%lld raw_repairs=%lld value_mismatches=%lld contract_canonical_dst_values=%lld staging_restages=%lld",
+    LOGPROOF("cleanup complete fpga_calls=%lld vpu_runs=%lld rejects=%lld attention_cpu_bypass=%lld vocab_projection_cpu_bypass=%lld legacy_raw_cpu_bypass=%lld elapsed_s=%.3f pingpong_cap=%d descriptor_cap=%d scheduler=%d activation_cache_enabled=%d activation_cache_hits=%lld misses=%lld weight_cache_builds=%lld hits=%lld misses=%lld bytes=%lld cache_lookup_ms=%.3f cache_crc_ms=%.3f weight_pack_ms=%.3f activation_scale_fp16_overflows=%lld contract_checks=%lld raw_mismatches=%lld raw_repairs=%lld value_mismatches=%lld contract_canonical_dst_values=%lld staging_restages=%lld q8_source_audit_checks=%lld q8_source_audit_failures=%lld",
          g_fpga_count,
          g_fpga_vpu_runs,
          g_reject_count,
@@ -5365,7 +5713,9 @@ void fpga_cleanup(void) {
          g_contract_raw_repairs,
          g_contract_value_mismatches,
          g_contract_canonical_dst_values,
-         g_contract_staging_restage_count);
+         g_contract_staging_restage_count,
+         g_q8_source_audit_checks,
+         g_q8_source_audit_failures);
     fflush(fpga_log_fp());
     pthread_mutex_unlock(&g_mutex);
 }
@@ -5465,6 +5815,41 @@ extern "C" int fpga_try_matmul_extended(
     const int64_t probe_n = src0 ? src0->ne[1] : 0;
     const int64_t probe_m = src1 ? src1->ne[1] : 0;
 
+    // This path deliberately runs before every board-facing policy branch.
+    // It must validate the same Q8 tensors the normal graph would consume,
+    // including the vocabulary projection, while leaving all work to CPU.
+    const bool source_audit_only = fpga_source_audit_only_requested() != 0;
+    if (source_audit_only) {
+        if (env_int_value("FPGA_CONTRACT_CHECK", 0, 0, 1000000) > 0) {
+            fpga_fatal("FPGA_SOURCE_AUDIT_ONLY and FPGA_CONTRACT_CHECK cannot be enabled together; source audit must not launch model GEMVs through ZDMA/VPU");
+        }
+        if (ith != 0) {
+            return 0;
+        }
+        const char * reason = nullptr;
+        if (!fpga_validate_tensors(src0, src1, dst, false, &reason)) {
+            LOGI("Q8_SOURCE_AUDIT_SKIP tensor=%s layer=%d reason=%s",
+                 tensor_name, effective_layer_id, reason ? reason : "unsupported tensor");
+            return 0;
+        }
+        pthread_mutex_lock(&g_mutex);
+        if (!g_q8_source_audit_mode_logged) {
+            g_q8_source_audit_only = true;
+            g_log_flush_every = env_int_value("FPGA_LOG_FLUSH_EVERY", 256, 1, 1000000);
+            LOGPROOF("Q8_SOURCE_AUDIT_MODE version=%s host_hardware_init=skipped board_mmio=not_mapped zdma_selftests=not_run action=validate_q8_source_then_cpu_matmul",
+                     FPGA_HOST_TRACE_VERSION);
+            g_q8_source_audit_mode_logged = true;
+        }
+        const bool source_ok = fpga_audit_q8_source_only(
+            src0, tensor_name, effective_layer_id);
+        pthread_mutex_unlock(&g_mutex);
+        if (!source_ok) {
+            fpga_fatal("Q8 source audit failed tensor=%s layer=%d; refusing to continue with a numerically invalid source tensor",
+                       tensor_name, effective_layer_id);
+        }
+        return 0;
+    }
+
     if (is_attention) {
         if (ith == 0) {
             pthread_mutex_lock(&g_mutex);
@@ -5511,7 +5896,7 @@ extern "C" int fpga_try_matmul_extended(
     }
 
     const char * reason = nullptr;
-    if (!fpga_validate_tensors(src0, src1, dst, &reason)) {
+    if (!fpga_validate_tensors(src0, src1, dst, true, &reason)) {
         if (ith == 0) {
             const int64_t k = src0 ? src0->ne[0] : 0;
             const int64_t n = src0 ? src0->ne[1] : 0;
@@ -5583,7 +5968,12 @@ extern "C" int fpga_try_matmul_extended(
     const bool hw_ok = fpga_hw_q8_0_matmul_dma_to_ip(src0, src1, dst, &totals, tensor_name, effective_layer_id);
     const long long t1 = now_us();
     if (!hw_ok) {
+        const bool source_validation_failed = g_contract_source_validation_failed;
         pthread_mutex_unlock(&g_mutex);
+        if (source_validation_failed) {
+            fpga_fatal("C0 source validation failed before any model ZDMA/VPU launch for tensor=%s layer=%d; the active GGUF contains a non-finite Q8_0 scale. Replace or re-copy the model, then rerun C0. No CPU fallback or scale repair was applied",
+                       tensor_name, effective_layer_id);
+        }
         fpga_fatal("ZDMA-to-IP/VPU matmul failed tensor=%s layer=%d shape=K%lld_N%lld_M%lld; refusing CPU fallback",
                    tensor_name, effective_layer_id, (long long) k, (long long) n, (long long) m);
     }

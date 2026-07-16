@@ -1264,9 +1264,16 @@ void ggml_compute_forward_mul_mat(
 
     // 2. BÂY GIỜ MỚI GỌI FPGA HOOK
 #ifdef USE_FPGA
-    pthread_once(&g_fpga_once, do_fpga_init);  // thread-safe, chạy 1 lần
+    // FPGA_SOURCE_AUDIT_ONLY validates Q8 source tensors without board I/O.
+    // Skipping lazy initialization here is essential: fpga_init() maps
+    // MY_IP/ZDMA/DDR and runs self-tests, which would invalidate the audit's
+    // file-versus-process-memory isolation.
+    const int fpga_source_audit_only = fpga_source_audit_only_requested();
+    if (!fpga_source_audit_only) {
+        pthread_once(&g_fpga_once, do_fpga_init);  // thread-safe
+    }
 
-   if (g_fpga_initialized) {
+   if (g_fpga_initialized || fpga_source_audit_only) {
         int layer_id = extract_layer_id_from_name(src0->name);
         if (fpga_try_matmul_extended(
                 src0, src1, dst, ith,
