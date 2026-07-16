@@ -11,10 +11,10 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
-// FPGA sequence position tracking
-extern void fpga_set_context(int layer_id, int seq_pos, int is_attn);
-extern "C" void fpga_reset_kv_cache(void);  // Đã thêm chuẩn C
-extern int g_current_seq_pos;
+#ifdef USE_FPGA
+extern "C" void fpga_reset_kv_cache(void);
+extern "C" void fpga_advance_sequence_position(int n_tokens);
+#endif
 //
 // llama_context
 //
@@ -827,10 +827,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
    if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
         
-        // Reset FPGA K-V cache cho chuỗi suy luận mới
-        g_current_seq_pos = 0;  
+#ifdef USE_FPGA
         fpga_reset_kv_cache();
         LLAMA_LOG_DEBUG("New sequence detected, FPGA cache reset\n");
+#endif
     }
     // TODO: this clear of the buffer can easily be forgotten - need something better
     embd_seq.clear();
@@ -1125,12 +1125,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
         if (res) {  // Only if generation was successful
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                g_current_seq_pos++;
-                
-            }
-            LLAMA_LOG_DEBUG("seq_pos updated to %d (n_tokens=%d)\n", 
-                            g_current_seq_pos, ubatch.n_tokens);
+#ifdef USE_FPGA
+            fpga_advance_sequence_position((int) ubatch.n_tokens);
+#endif
         }
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {
@@ -2039,8 +2036,9 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
-    g_current_seq_pos = 0;  // Reset FPGA K-V cache position
+#ifdef USE_FPGA
     fpga_reset_kv_cache();
+#endif
 }
 
 //
