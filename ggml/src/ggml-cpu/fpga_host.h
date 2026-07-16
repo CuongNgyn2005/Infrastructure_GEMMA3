@@ -24,6 +24,8 @@ int fpga_run_matmul(
     int ith);
 
 void fpga_set_context(int layer_id, int seq_pos, int is_attn);
+int  fpga_get_sequence_position(void);
+void fpga_advance_sequence_position(int n_tokens);
 
 // High-level hook called from ggml-cpu.c.
 // src0 = Q8_0 weights, src1 = F32 activations, dst = F32 output.

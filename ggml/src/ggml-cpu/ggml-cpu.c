@@ -1227,20 +1227,25 @@ static void do_fpga_init(void) {
 #endif
 #ifdef USE_FPGA
    // Extract layer ID from tensor name
-// Example: "layers.5.mlp.w1" -> returns 5
+// Gemma GGUF tensors are named "blk.<n>.*"; retain the aliases used by
+// other GGUF families so the host and caller report one consistent layer.
 static int extract_layer_id_from_name(const char * name) {
-    if (!name) return 0;
+    if (!name || name[0] == '\0') {
+        return 0;
+    }
     int layer = 0;
-    if (sscanf(name, "layers.%d", &layer) == 1) {
+    if (sscanf(name, "blk.%d.", &layer) == 1 ||
+        sscanf(name, "layers.%d.", &layer) == 1 ||
+        sscanf(name, "model.layers.%d.", &layer) == 1) {
         return layer;
     }
     return 0;
 }
 
-// Get current sequence position (will implement later)
+// Sequence state is owned by the C++ FPGA host; use its C ABI instead of
+// linking this C translation unit to a C++ global variable.
 static int get_current_seq_pos(void) {
-    extern int g_current_seq_pos;  // From fpga_host.cpp
-    return g_current_seq_pos;
+    return fpga_get_sequence_position();
 } 
 #endif
 
