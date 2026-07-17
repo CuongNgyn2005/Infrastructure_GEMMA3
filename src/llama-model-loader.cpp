@@ -1172,18 +1172,20 @@ bool llama_model_loader::load_all_data(
                 }
             }
         }
-        if (progress_callback) {
+        if (progress_callback && !progress_callback(1.0f, progress_callback_user_data)) {
             // Even though the model is done loading, we still honor
-            // cancellation since we need to free allocations.
-            return progress_callback(1.0f, progress_callback_user_data);
+            // cancellation since we need to free allocations.  Do not report
+            // a C0-ready validation result for a load that the caller rejects.
+            return false;
         }
     }
 
 #ifdef USE_FPGA
     if (fpga_source_validation_required && size_done >= size_data) {
         // Reaching this point proves that all async ggml_validate_row_data()
-        // futures completed without an invalid tensor.  Tell the deferred C0
-        // host that mapping MY_IP/ZDMA is now safe for this process.
+        // futures completed, final progress was accepted, and the model load
+        // was not cancelled.  Tell the deferred C0 host that mapping
+        // MY_IP/ZDMA is now safe for this process.
         fpga_mark_model_tensor_validation_passed();
         LLAMA_LOG_INFO("%s: FPGA C0/source-audit tensor-validation handshake complete\n", __func__);
     }

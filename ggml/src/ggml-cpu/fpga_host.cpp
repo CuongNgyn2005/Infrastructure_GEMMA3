@@ -27,7 +27,7 @@
 #include <vector>
 
 #define FPGA_LOG_FILE "/tmp/fpga_debug.log"
-#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v43-loader-handshake-gated-contract"
+#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v50-contract-cpu-shadow"
 
 #define MY_IP_BASE_ADDRESS 0x00000000A0000000LL
 #define REG_BASE_PHYS      0x00000000A0000000LL
@@ -408,7 +408,7 @@ typedef struct {
     std::vector<block_q8_0_t> act_blocks_all;
     std::vector<block_q8_0_t> weight_tile_snapshot;
     std::vector<uint8_t>      weight_tensor_snapshot;
-    std::vector<float>        contract_reference;
+    std::vector<float>        contract_actual;
     std::vector<float>        act_scales;
     std::vector<float>        weight_scales;
     std::vector<int32_t>      partial;
@@ -454,6 +454,15 @@ static std::vector<fpga_weight_cache_entry_t> g_weight_cache;
 static long long           g_fpga_start_us = 0;
 static long long           g_fpga_count    = 0;
 static long long           g_fpga_vpu_runs = 0;
+// Count host-hook decisions independently from VPU runs.  A successful text
+// response alone does not prove that every eligible Q8 GEMV used the FPGA:
+// GGML may legally retain attention and the vocabulary projection on CPU.
+// These atomics give an end-of-process, per-run coverage proof without
+// changing routing or numerical results.
+static std::atomic<long long> g_matmul_hook_calls{0};
+static std::atomic<long long> g_q8_candidate_calls{0};
+static std::atomic<long long> g_q8_intentional_cpu_bypass_calls{0};
+static std::atomic<long long> g_q8_unavailable_cpu_fallback_calls{0};
 static long long           g_reject_count  = 0;
 static long long           g_activation_cache_hits = 0;
 static long long           g_activation_cache_misses = 0;
@@ -493,7 +502,6 @@ static bool                g_status_stderr = false;
 static bool                g_trace_data_enabled = false;
 static bool                g_dma_trace_enabled = false;
 static bool                g_cleanup_done = false;
-static bool                g_atexit_registered = false;
 static bool                g_abort_on_cpu_fallback = true;
 static bool                g_uio_inventory_logged = false;
 static bool                g_allow_devmem_fallback = false;
@@ -514,12 +522,19 @@ static bool                g_contract_forensic_replay = true;
 // not part of the numerical contract and dominates C0 timing.  Keep the
 // bounded ordering fence on every launch; make the exhaustive scan explicit.
 static bool                g_contract_deep_staging = false;
-// Contract mode must prove the raw FPGA path without letting an accepted but
-// non-bit-exact F32 accumulation perturb a later CPU attention/KV operation.
-// This mode writes the canonical GGML Q8_0 reference only after the raw and
-// value contracts for a complete matmul pass.  It is never a production
-// acceleration mode.
-static bool                g_contract_canonical_dst = false;
+// Contract mode must prove the raw FPGA path without taking ownership of the
+// GGML destination tensor.  In this explicit shadow mode, the host retains
+// its hardware result in contract_actual for checking while the upstream
+// threaded kernel writes dst.  It is not a hardware-unavailable CPU fallback
+// and is never the production-acceleration route.
+static bool                g_contract_cpu_shadow_dst = false;
+// Raw-F32 propagation is useful only when deliberately investigating a
+// downstream attention/KV divergence.  It is not a C0/C1 success criterion:
+// a raw/value contract can pass while a later attention score diverges.  Keep
+// it separate from the ordinary C0/C1 shadow route so a stale legacy setting
+// cannot turn a validation command into that forensic experiment accidentally.
+static bool                g_contract_raw_propagation_diagnostic = false;
+static bool                g_contract_legacy_canonical_override_ignored = false;
 // Diagnostic-only: validate the Q8_0 source tensors in the normal GGML
 // execution order, but return control to CPU before any model GEMV is sent to
 // ZDMA/VPU.  This distinguishes a bad/mutable GGUF source from a fault that
@@ -565,7 +580,7 @@ static long long           g_contract_checks_done = 0;
 static long long           g_contract_raw_mismatches = 0;
 static long long           g_contract_raw_repairs = 0;
 static long long           g_contract_value_mismatches = 0;
-static long long           g_contract_canonical_dst_values = 0;
+static long long           g_contract_cpu_shadow_dst_values = 0;
 static long long           g_contract_staging_restage_count = 0;
 static long long           g_q8_source_audit_checks = 0;
 static long long           g_q8_source_audit_failures = 0;
@@ -744,19 +759,19 @@ static inline void mmio_fence(void) {
 #endif
 }
 
-int fpga_source_audit_only_requested(void) {
+extern "C" int fpga_source_audit_only_requested(void) {
     // ggml-cpu calls this before pthread_once(fpga_init), so it must not map
     // MY_IP, ZDMA, or DDR high.
     return env_flag_enabled("FPGA_SOURCE_AUDIT_ONLY") ? 1 : 0;
 }
 
-int fpga_contract_check_requested(void) {
+extern "C" int fpga_contract_check_requested(void) {
     // This query is called before fpga_init() by llama-cli.  It must not
     // access MMIO, map memory, or change any persistent host state.
     return env_int_value("FPGA_CONTRACT_CHECK", 0, 0, 1000000) > 0 ? 1 : 0;
 }
 
-void fpga_mark_model_tensor_validation_passed(void) {
+extern "C" void fpga_mark_model_tensor_validation_passed(void) {
     // This function is intentionally board-free: it can run while main has
     // deferred fpga_init() for C0.  Do not treat a normal model load as C0
     // evidence; the loader calls it only for C0/source-audit validation.
@@ -2679,13 +2694,57 @@ static const block_q8_0_t * weight_block(
     return weight_block_from_base(src0, src0->data, row, block);
 }
 
+static bool checked_size_add(size_t lhs, size_t rhs, size_t * out) {
+    if (lhs > std::numeric_limits<size_t>::max() - rhs) {
+        return false;
+    }
+    *out = lhs + rhs;
+    return true;
+}
+
+static bool checked_size_mul(size_t lhs, size_t rhs, size_t * out) {
+    if (lhs != 0U && rhs > std::numeric_limits<size_t>::max() / lhs) {
+        return false;
+    }
+    *out = lhs * rhs;
+    return true;
+}
+
+// The FPGA hook owns the complete MUL_MAT result, so a wrong tensor stride
+// would otherwise corrupt the CPU allocator and only surface later as a
+// misleading "double free or corruption" during shutdown.  Validate the
+// exact last byte that the host will access before the first VPU launch.
+static bool fpga_tensor_span_covers(
+        const struct ggml_tensor * tensor,
+        int64_t dim0,
+        int64_t dim1,
+        size_t element_bytes) {
+    if (!tensor || !tensor->data || dim0 <= 0 || dim1 <= 0) {
+        return false;
+    }
+
+    size_t dim0_offset = 0U;
+    size_t dim1_offset = 0U;
+    size_t last_offset = 0U;
+    size_t required_bytes = 0U;
+    if (!checked_size_mul((size_t) (dim0 - 1), tensor->nb[0], &dim0_offset) ||
+        !checked_size_mul((size_t) (dim1 - 1), tensor->nb[1], &dim1_offset) ||
+        !checked_size_add(dim0_offset, dim1_offset, &last_offset) ||
+        !checked_size_add(last_offset, element_bytes, &required_bytes)) {
+        return false;
+    }
+
+    return required_bytes <= ggml_nbytes(tensor);
+}
+
 static void store_dst_value(
         const struct ggml_tensor * dst,
         int64_t row,
         int64_t col,
         float value) {
     char * base = (char *) dst->data;
-    *(float *) (base + row * dst->nb[0] + col * dst->nb[1]) = value;
+    const size_t offset = (size_t) row * dst->nb[0] + (size_t) col * dst->nb[1];
+    memcpy(base + offset, &value, sizeof(value));
 }
 
 static void write_i8x16_to_ddr(uint32_t off, const int8_t * lanes) {
@@ -2835,7 +2894,10 @@ static float load_dst_value(
         int64_t row,
         int64_t col) {
     const char * base = (const char *) dst->data;
-    return *(const float *) (base + row * dst->nb[0] + col * dst->nb[1]);
+    const size_t offset = (size_t) row * dst->nb[0] + (size_t) col * dst->nb[1];
+    float value = 0.0f;
+    memcpy(&value, base + offset, sizeof(value));
+    return value;
 }
 
 static int32_t q8_0_raw_dot(const int8_t * a, const int8_t * w) {
@@ -3526,7 +3588,7 @@ static void fpga_contract_forensic_replay(
          got, expected, vpu_status, vpu_rd32(REG_PROGRESS));
 }
 
-static bool fpga_contract_check_dst_values(
+static bool fpga_contract_check_output_values(
         const struct ggml_tensor * src0,
         const struct ggml_tensor * dst,
         const std::vector<block_q8_0_t> & act_blocks_all,
@@ -3542,8 +3604,14 @@ static bool fpga_contract_check_dst_values(
     double max_abs = 0.0;
     double max_rel = 0.0;
     const size_t value_count = (size_t) n * (size_t) m;
-    if (g_contract_canonical_dst) {
-        g_scratch.contract_reference.resize(value_count);
+    const bool cpu_shadow_dst = g_contract_cpu_shadow_dst;
+    if (cpu_shadow_dst && g_scratch.contract_actual.size() != value_count) {
+        LOGE("CONTRACT_CPU_SHADOW_LAYOUT tensor=%s layer=%d actual_values=%zu expected_values=%zu",
+             tensor_name ? tensor_name : "?",
+             layer_id,
+             g_scratch.contract_actual.size(),
+             value_count);
+        return false;
     }
 
     for (int64_t col = 0; col < m; ++col) {
@@ -3553,11 +3621,10 @@ static bool fpga_contract_check_dst_values(
             const block_q8_0_t * weight =
                 weight_block_from_base(src0, weight_data_base, row, 0);
             ggml_vec_dot_q8_0_q8_0((int) k, &ref, 0, weight, 0, act, 0, 1);
-            if (g_contract_canonical_dst) {
-                g_scratch.contract_reference[(size_t) col * (size_t) n + (size_t) row] = ref;
-            }
-
-            const double got = (double) load_dst_value(dst, row, col);
+            const size_t value_index = (size_t) col * (size_t) n + (size_t) row;
+            const double got = cpu_shadow_dst ?
+                (double) g_scratch.contract_actual[value_index] :
+                (double) load_dst_value(dst, row, col);
             const double expected = (double) ref;
 
             if (!std::isfinite(got) || !std::isfinite(expected)) {
@@ -3620,19 +3687,13 @@ static bool fpga_contract_check_dst_values(
          (long long) (n * m),
          max_abs,
          max_rel);
-    if (g_contract_canonical_dst) {
-        // The raw VPU values have already been checked above.  C0/C1 must
-        // now feed the precise GGML value into subsequent CPU attention/KV
-        // nodes, otherwise an allowed non-bit-exact F32 accumulation can
-        // obscure the location of the first end-to-end divergence.
-        for (int64_t col = 0; col < m; ++col) {
-            for (int64_t row = 0; row < n; ++row) {
-                store_dst_value(dst, row, col,
-                                g_scratch.contract_reference[(size_t) col * (size_t) n + (size_t) row]);
-            }
-        }
-        g_contract_canonical_dst_values += (long long) value_count;
-        LOGI("CONTRACT_CANONICAL_DST tensor=%s layer=%d values=%zu reference=ggml_vec_dot_q8_0_q8_0 purpose=downstream_attention_kv_isolation",
+    if (cpu_shadow_dst) {
+        // ggml-cpu.c receives FPGA_MATMUL_CONTRACT_CPU_SHADOW and continues
+        // into its upstream threaded kernel.  Do not write dst here: doing so
+        // would race that kernel and would replace its output with a second
+        // implementation during a contract run.
+        g_contract_cpu_shadow_dst_values += (long long) value_count;
+        LOGI("CONTRACT_CPU_SHADOW_DST tensor=%s layer=%d values=%zu hardware_result=validated native_ggml_dst=deferred purpose=contract_isolation_not_cpu_fallback",
              tensor_name ? tensor_name : "?",
              layer_id,
              value_count);
@@ -3936,10 +3997,23 @@ static bool fpga_validate_tensors(
         *reason = "unsupported DMA-to-IP tiling case: tensor stride is smaller than its logical row";
         return false;
     }
+    if (!fpga_tensor_span_covers(src0, k / VPU_QK8_0, n, sizeof(block_q8_0_t)) ||
+        !fpga_tensor_span_covers(src1, k, m, sizeof(float)) ||
+        !fpga_tensor_span_covers(dst, n, m, sizeof(float))) {
+        *reason = "unsupported DMA-to-IP tiling case: tensor byte span does not cover host read/write layout";
+        return false;
+    }
+
+    const size_t src0_bytes = ggml_nbytes(src0);
+    const size_t dst_bytes = ggml_nbytes(dst);
     const uintptr_t src0_begin = (uintptr_t) src0->data;
-    const uintptr_t src0_end = src0_begin + ggml_nbytes(src0);
+    const uintptr_t src0_end = src0_begin + src0_bytes;
     const uintptr_t dst_begin = (uintptr_t) dst->data;
-    const uintptr_t dst_end = dst_begin + ggml_nbytes(dst);
+    const uintptr_t dst_end = dst_begin + dst_bytes;
+    if (src0_end < src0_begin || dst_end < dst_begin) {
+        *reason = "unsupported DMA-to-IP tiling case: tensor address range overflow";
+        return false;
+    }
     if (src0_begin < dst_end && dst_begin < src0_end) {
         *reason = "unsupported DMA-to-IP tiling case: destination aliases immutable weight storage";
         return false;
@@ -4902,22 +4976,51 @@ static bool fpga_dma_run_q8_group(
         if (!contract_check_active && g_fuse_raw_result_accum) {
             // The legacy raw-result bitstream needs the PS to apply Q8 scales,
             // but it does not need an intermediate partial[] vector.  Consume
-            // each 128-bit result word once and accumulate values in exactly
-            // the original row-major/group-major order.  This removes the
-            // partial write/read pass without changing a raw result or the
-            // floating-point expression used for each group.
+            // each 128-bit result word once and accumulate values in the same
+            // row-major/group-major order as the non-fused implementation.
+            //
+            // Do not derive row/group with division and modulo for every raw
+            // result.  On the PS that arithmetic was slower than retaining
+            // partial[], so v45 advances an explicit row/group cursor and
+            // writes the accumulator once per completed row.  It neither
+            // changes the VPU result nor reorders floating-point additions.
             const long long result_unpack0 = now_us();
-            uint32_t next_index = 0;
+            uint32_t row = 0;
+            uint32_t gb = 0;
+            float row_accum = rows > 0 ? accum_col[0] : 0.0f;
             int32_t lanes[VPU_RESULT_PACK_LANES] = {};
             for (uint32_t word = 0; word < result_words; ++word) {
                 read_result_i32x4_from_ddr(word, lanes);
-                for (int lane = 0; lane < VPU_RESULT_PACK_LANES && next_index < result_values; ++lane, ++next_index) {
-                    const uint32_t row = next_index / (uint32_t) group_blocks;
-                    const uint32_t gb = next_index - row * (uint32_t) group_blocks;
-                    accum_col[row] +=
+                const uint32_t word_base = word * (uint32_t) VPU_RESULT_PACK_LANES;
+                const uint32_t lane_count =
+                    std::min((uint32_t) VPU_RESULT_PACK_LANES, result_values - word_base);
+                for (uint32_t lane = 0; lane < lane_count; ++lane) {
+                    if (row >= (uint32_t) rows || gb >= (uint32_t) group_blocks) {
+                        LOGE("fused raw-result cursor overflow tensor=%s tile=%u word=%u row=%u group=%u rows=%d group_blocks=%d result_values=%u",
+                             tensor_name ? tensor_name : "?", tile_id, word,
+                             row, gb, rows, group_blocks, result_values);
+                        return false;
+                    }
+                    const uint32_t scale_index = row * (uint32_t) group_blocks + gb;
+                    row_accum +=
                         (float) lanes[lane] * act_scales_group[gb] *
-                        weight_scale_values[next_index];
+                        weight_scale_values[scale_index];
+                    ++gb;
+                    if (gb == (uint32_t) group_blocks) {
+                        accum_col[row] = row_accum;
+                        ++row;
+                        gb = 0;
+                        if (row < (uint32_t) rows) {
+                            row_accum = accum_col[row];
+                        }
+                    }
                 }
+            }
+            if (row != (uint32_t) rows || gb != 0U) {
+                LOGE("fused raw-result cursor incomplete tensor=%s tile=%u rows_done=%u expected_rows=%d remaining_group=%u result_values=%u",
+                     tensor_name ? tensor_name : "?", tile_id, row, rows,
+                     gb, result_values);
+                return false;
             }
             if (totals) {
                 totals->host_result_us += now_us() - result_unpack0;
@@ -5159,6 +5262,7 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip(
     const bool contract_check_active =
         (g_contract_check_limit > 0) &&
         (g_contract_checks_done < (long long) g_contract_check_limit);
+    const bool cpu_shadow_dst = g_contract_cpu_shadow_dst;
     g_contract_source_validation_failed = false;
     const size_t weight_tensor_bytes = ggml_nbytes(src0);
     const void * weight_data_base = src0->data;
@@ -5181,7 +5285,8 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip(
     const bool use_pl_scale_path =
         g_pingpong_scheduler_enabled &&
         g_spu_q8_scale_stream_supported &&
-        !contract_check_active;
+        !contract_check_active &&
+        !cpu_shadow_dst;
 
     const long long quant0 = now_us();
     if (!ensure_quantized_activation_matrix(src1, m, k, act_blocks_all, act_scales,
@@ -5207,6 +5312,11 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip(
 
     uint32_t tile_id = 0;
     uint32_t weight_tile_index = 0;
+    if (contract_check_active && cpu_shadow_dst) {
+        g_scratch.contract_actual.assign((size_t) n * (size_t) m, 0.0f);
+    } else {
+        g_scratch.contract_actual.clear();
+    }
     for (int64_t row0 = 0; row0 < n; row0 += g_vpu_max_rows) {
         const int rows = (int) std::min<int64_t>(g_vpu_max_rows, n - row0);
         accum.assign((size_t) (m * rows), 0.0f);
@@ -5270,7 +5380,12 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip(
         for (int64_t col = 0; col < m; ++col) {
             const float * accum_col = &accum[(size_t) (col * rows)];
             for (int row = 0; row < rows; ++row) {
-                store_dst_value(dst, row0 + row, col, accum_col[(size_t) row]);
+                if (contract_check_active && cpu_shadow_dst) {
+                    g_scratch.contract_actual[(size_t) col * (size_t) n +
+                                              (size_t) (row0 + row)] = accum_col[(size_t) row];
+                } else if (!cpu_shadow_dst) {
+                    store_dst_value(dst, row0 + row, col, accum_col[(size_t) row]);
+                }
             }
         }
         if (totals) {
@@ -5293,8 +5408,8 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip(
             return false;
         }
         g_contract_checks_done++;
-        if (!fpga_contract_check_dst_values(src0, dst, act_blocks_all,
-                                            weight_data_base, tensor_name, layer_id)) {
+        if (!fpga_contract_check_output_values(src0, dst, act_blocks_all,
+                                               weight_data_base, tensor_name, layer_id)) {
             return false;
         }
     }
@@ -5346,9 +5461,9 @@ int fpga_init(void) {
     if (g_vocab_projection_cpu_bypass) {
         LOGPROOF("v23 correctness policy: vocabulary projection remains on CPU; set FPGA_ACCELERATE_VOCAB=1 only after the deployed bitstream reports protocol=1/id=0x56505531 and logits A/B passes");
     }
-    LOGPROOF("v38 numerical policy: C0 validates every immutable Q8_0 weight scale before the first VPU launch, uses ggml quantize_row_q8_0 plus stored FP16 scales, compares dst against ggml_vec_dot_q8_0_q8_0, and rejects every NaN/Inf");
+    LOGPROOF("v50 numerical policy: C0 validates every immutable Q8_0 weight scale before the first VPU launch, uses ggml quantize_row_q8_0 plus stored FP16 scales, compares the hardware result against ggml_vec_dot_q8_0_q8_0, and rejects every NaN/Inf");
     LOGPROOF("v38 ZDMA policy: every descriptor is preceded by a W1C ISR clear that is read back until DMA_DONE and all error bits are zero. The completion loop therefore accepts only a newly generated DONE event. C0 keeps the same ACT/WEIGHT staging sequence as primary raw GEMV; staging_restages must remain zero before primary FPGA use.");
-    LOGPROOF("v43 C0 loader gate: FPGA_CONTRACT_CHECK requires a completed upstream GGUF tensor-validation handshake before this host maps MY_IP/ZDMA/DDRHIGH or launches a model VPU transfer.");
+    LOGPROOF("v44 C0 loader gate: FPGA_CONTRACT_CHECK requires a completed upstream GGUF tensor-validation handshake before this host maps MY_IP/ZDMA/DDRHIGH or launches a model VPU transfer.");
     g_log_flush_every = env_int_value("FPGA_LOG_FLUSH_EVERY", 256, 1, 1000000);
     g_profile_every = env_int_value("FPGA_PROFILE_EVERY", FPGA_DEFAULT_PROFILE_EVERY, 0, 1000000);
     g_ip_status_every = env_int_value("FPGA_IP_STATUS_EVERY", FPGA_DEFAULT_STATUS_EVERY, 0, 1000000);
@@ -5366,12 +5481,27 @@ int fpga_init(void) {
     }
     g_contract_deep_staging =
         g_contract_check_limit > 0 && !env_flag_disabled("FPGA_CONTRACT_DEEP_STAGING");
-    g_contract_canonical_dst =
-        g_contract_check_limit > 0 && !env_flag_disabled("FPGA_CONTRACT_CANONICAL_DST");
-    if (g_contract_canonical_dst) {
-        LOGPROOF("v34 C0/C1 isolation policy: after a raw/value-checked matmul passes, the downstream tensor is replaced with the exact ggml_vec_dot_q8_0_q8_0 result before CPU attention/KV; raw FPGA execution and contracts remain active. Set FPGA_CONTRACT_CANONICAL_DST=0 only for a controlled raw-F32 propagation diagnostic.");
+    // C0/C1 validates hardware first, but must not overwrite dst while the
+    // GGML worker pool owns it.  The ordinary contract route therefore stores
+    // the verified hardware result privately and lets the native kernel write
+    // dst.  Raw propagation remains an explicit forensic opt-in.
+    g_contract_raw_propagation_diagnostic =
+        g_contract_check_limit > 0 &&
+        env_flag_enabled("FPGA_CONTRACT_RAW_PROPAGATION_DIAGNOSTIC");
+    const char * const legacy_canonical_override = getenv("FPGA_CONTRACT_CANONICAL_DST");
+    g_contract_legacy_canonical_override_ignored =
+        g_contract_check_limit > 0 &&
+        legacy_canonical_override != nullptr &&
+        env_flag_disabled("FPGA_CONTRACT_CANONICAL_DST");
+    g_contract_cpu_shadow_dst =
+        g_contract_check_limit > 0 && !g_contract_raw_propagation_diagnostic;
+    if (g_contract_cpu_shadow_dst) {
+        LOGPROOF("v50 C0/C1 shadow policy: every eligible GEMV still runs on ZDMA/VPU and is raw/value checked, but its result is retained privately while upstream GGML writes dst. This avoids a contract-mode dst race and is not a CPU fallback. Use FPGA_CONTRACT_RAW_PROPAGATION_DIAGNOSTIC=1 only for raw-F32 propagation.");
+        if (g_contract_legacy_canonical_override_ignored) {
+            LOGPROOF("v50 compatibility: FPGA_CONTRACT_CANONICAL_DST=0 is ignored for C0/C1. Use FPGA_CONTRACT_RAW_PROPAGATION_DIAGNOSTIC=1 only for a forensic raw-propagation run.");
+        }
     } else if (g_contract_check_limit > 0) {
-        LOGPROOF("v34 C0/C1 isolation policy is disabled by FPGA_CONTRACT_CANONICAL_DST=0; accepted raw-F32 FPGA results will propagate into CPU attention/KV for forensic reproduction.");
+        LOGPROOF("v49 forensic policy: FPGA_CONTRACT_RAW_PROPAGATION_DIAGNOSTIC=1; accepted raw-F32 FPGA results will propagate into CPU attention/KV. This mode diagnoses end-to-end sensitivity and is not a C0/C1 pass.");
     }
     g_dma_trace_enabled = env_flag_enabled("FPGA_DMA_AUDIT") || g_contract_check_limit > 0;
     memset(g_dma_trace, 0, sizeof(g_dma_trace));
@@ -5425,10 +5555,6 @@ int fpga_init(void) {
     g_fpga_start_us = now_us();
     g_cleanup_done = false;
     g_scratch.activation_cache_valid = false;
-    if (!g_atexit_registered) {
-        atexit(fpga_cleanup);
-        g_atexit_registered = true;
-    }
 
     const uint32_t limits = vpu_rd32(REG_LIMITS);
     const uint32_t caps = vpu_rd32(REG_CAPS);
@@ -5519,7 +5645,7 @@ int fpga_init(void) {
         g_allow_devmem_fallback ? "diagnostic_all_resources" :
         (g_allow_vpu_devmem_compat ? "uio_dma_ddr+vpu_devmem_compat" : "uio_required");
 
-    LOGPROOF("ready version=%s path=%s rows=%d host_row_limit=%d col_beats=%d cols=%d packed_q8=%d max_group_blocks=%d result_words=%d zdma_max_transfer_bytes=%zu pingpong_cap=%d descriptor_cap=%d scheduler=%d scheduler_policy=opt_in pl_scale=%d pl_scale_policy=opt_in stream_protocol=0x%08x bitstream_id=0x%08x spu_silu=%d spu_rms=%d spu_rope=%d spu_softmax=%d weight_cache=%d activation_cache=%d vocab_cpu_bypass=%d legacy_raw_cpu_bypass=%d vocab_min_n=%lld contract_check=%d source_audit_only=%d contract_abort=%d contract_forensics=%d contract_deep_staging=%d contract_canonical_dst=%d raw_retry=%d raw_repair=%d raw_accum_fused=%d result_clear=%d strict_coherency=%d clock_mhz=%.3f profile_log=1 dma_detail=%d ip_detail=%d detail_every=%d flush_every=%d",
+    LOGPROOF("ready version=%s path=%s rows=%d host_row_limit=%d col_beats=%d cols=%d packed_q8=%d max_group_blocks=%d result_words=%d zdma_max_transfer_bytes=%zu pingpong_cap=%d descriptor_cap=%d scheduler=%d scheduler_policy=opt_in pl_scale=%d pl_scale_policy=opt_in stream_protocol=0x%08x bitstream_id=0x%08x spu_silu=%d spu_rms=%d spu_rope=%d spu_softmax=%d weight_cache=%d activation_cache=%d vocab_cpu_bypass=%d legacy_raw_cpu_bypass=%d vocab_min_n=%lld contract_check=%d source_audit_only=%d contract_abort=%d contract_forensics=%d contract_deep_staging=%d contract_cpu_shadow_dst=%d contract_raw_propagation_diagnostic=%d raw_retry=%d raw_repair=%d raw_accum_fused=%d result_clear=%d strict_coherency=%d clock_mhz=%.3f profile_log=1 dma_detail=%d ip_detail=%d detail_every=%d flush_every=%d",
          FPGA_HOST_TRACE_VERSION,
          path ? path : "dma(default)",
          g_vpu_max_rows,
@@ -5547,7 +5673,8 @@ int fpga_init(void) {
          g_contract_check_abort ? 1 : 0,
          g_contract_forensic_replay ? 1 : 0,
          g_contract_deep_staging ? 1 : 0,
-         g_contract_canonical_dst ? 1 : 0,
+         g_contract_cpu_shadow_dst ? 1 : 0,
+         g_contract_raw_propagation_diagnostic ? 1 : 0,
          g_contract_raw_retry_limit,
          g_contract_raw_repair_enabled ? 1 : 0,
          g_fuse_raw_result_accum ? 1 : 0,
@@ -5646,6 +5773,11 @@ void fpga_cleanup(void) {
         return;
     }
     g_cleanup_done = true;
+    LOGPROOF("cleanup begin lifecycle=explicit-before-backend-free ddr_mapped=%d vpu_mapped=%d dma_mapped=%d weight_cache_entries=%zu",
+             ddr_is_mapped() ? 1 : 0,
+             vpu_is_mapped() ? 1 : 0,
+             dma_is_mapped() ? 1 : 0,
+             g_weight_cache.size());
 
     if (ddr_is_mapped()) {
         for (fpga_weight_cache_entry_t & entry : g_weight_cache) {
@@ -5686,7 +5818,33 @@ void fpga_cleanup(void) {
     }
 
     const long long elapsed_us = g_fpga_start_us > 0 ? now_us() - g_fpga_start_us : 0;
-    LOGPROOF("cleanup complete fpga_calls=%lld vpu_runs=%lld rejects=%lld attention_cpu_bypass=%lld vocab_projection_cpu_bypass=%lld legacy_raw_cpu_bypass=%lld elapsed_s=%.3f pingpong_cap=%d descriptor_cap=%d scheduler=%d activation_cache_enabled=%d activation_cache_hits=%lld misses=%lld weight_cache_builds=%lld hits=%lld misses=%lld bytes=%lld cache_lookup_ms=%.3f cache_crc_ms=%.3f weight_pack_ms=%.3f activation_scale_fp16_overflows=%lld contract_checks=%lld raw_mismatches=%lld raw_repairs=%lld value_mismatches=%lld contract_canonical_dst_values=%lld staging_restages=%lld q8_source_audit_checks=%lld q8_source_audit_failures=%lld",
+    const long long hook_calls = g_matmul_hook_calls.load(std::memory_order_relaxed);
+    const long long q8_candidates = g_q8_candidate_calls.load(std::memory_order_relaxed);
+    const long long q8_intentional_cpu =
+        g_q8_intentional_cpu_bypass_calls.load(std::memory_order_relaxed);
+    const long long q8_unavailable_cpu =
+        g_q8_unavailable_cpu_fallback_calls.load(std::memory_order_relaxed);
+    const long long q8_expected_fpga =
+        q8_candidates >= q8_intentional_cpu + q8_unavailable_cpu ?
+        q8_candidates - q8_intentional_cpu - q8_unavailable_cpu : -1;
+    const bool q8_coverage_complete =
+        q8_expected_fpga >= 0 &&
+        q8_unavailable_cpu == 0 &&
+        g_fpga_count == q8_expected_fpga;
+    const char * fpga_block_gemv_mode =
+        q8_candidates == 0 ? "not_applicable" :
+        g_legacy_raw_cpu_bypass_count > 0 ? "cpu_quarantine" :
+        q8_coverage_complete ? "active" : "incomplete";
+    LOGPROOF("FPGA_GEMV_COVERAGE hook_calls=%lld q8_candidates=%lld q8_expected_fpga=%lld q8_hw_completed=%lld q8_intentional_cpu_bypass=%lld q8_unavailable_cpu_fallback=%lld routing_verdict=%s fpga_block_gemv=%s",
+             hook_calls,
+             q8_candidates,
+             q8_expected_fpga,
+             g_fpga_count,
+             q8_intentional_cpu,
+             q8_unavailable_cpu,
+             q8_coverage_complete ? "complete" : "incomplete",
+             fpga_block_gemv_mode);
+    LOGPROOF("cleanup complete fpga_calls=%lld vpu_runs=%lld rejects=%lld attention_cpu_bypass=%lld vocab_projection_cpu_bypass=%lld legacy_raw_cpu_bypass=%lld elapsed_s=%.3f pingpong_cap=%d descriptor_cap=%d scheduler=%d activation_cache_enabled=%d activation_cache_hits=%lld misses=%lld weight_cache_builds=%lld hits=%lld misses=%lld bytes=%lld cache_lookup_ms=%.3f cache_crc_ms=%.3f weight_pack_ms=%.3f activation_scale_fp16_overflows=%lld contract_checks=%lld raw_mismatches=%lld raw_repairs=%lld value_mismatches=%lld contract_cpu_shadow_dst_values=%lld staging_restages=%lld q8_source_audit_checks=%lld q8_source_audit_failures=%lld",
          g_fpga_count,
          g_fpga_vpu_runs,
          g_reject_count,
@@ -5712,7 +5870,7 @@ void fpga_cleanup(void) {
          g_contract_raw_mismatches,
          g_contract_raw_repairs,
          g_contract_value_mismatches,
-         g_contract_canonical_dst_values,
+         g_contract_cpu_shadow_dst_values,
          g_contract_staging_restage_count,
          g_q8_source_audit_checks,
          g_q8_source_audit_failures);
@@ -5862,8 +6020,26 @@ extern "C" int fpga_try_matmul_extended(
         return 0;
     }
 
+    // Only count the single thread that owns this matmul result.  The GGML
+    // CPU scheduler may call the hook from multiple workers, but non-zero
+    // workers return success below without launching their own VPU job.
+    const bool q8_f32_f32_candidate =
+        src0 && src1 && dst &&
+        src0->type == GGML_TYPE_Q8_0 &&
+        src1->type == GGML_TYPE_F32 &&
+        dst->type == GGML_TYPE_F32;
+    if (ith == 0) {
+        g_matmul_hook_calls.fetch_add(1, std::memory_order_relaxed);
+        if (q8_f32_f32_candidate) {
+            g_q8_candidate_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     if (should_bypass_vocab_projection_to_cpu(tensor_name, probe_k, probe_n, probe_m)) {
         if (ith == 0) {
+            if (q8_f32_f32_candidate) {
+                g_q8_intentional_cpu_bypass_calls.fetch_add(1, std::memory_order_relaxed);
+            }
             pthread_mutex_lock(&g_mutex);
             g_vocab_projection_bypass_count++;
             if (g_vocab_projection_bypass_count == 1) {
@@ -5881,6 +6057,9 @@ extern "C" int fpga_try_matmul_extended(
 
     if (g_legacy_raw_cpu_bypass) {
         if (ith == 0) {
+            if (q8_f32_f32_candidate) {
+                g_q8_intentional_cpu_bypass_calls.fetch_add(1, std::memory_order_relaxed);
+            }
             pthread_mutex_lock(&g_mutex);
             g_legacy_raw_cpu_bypass_count++;
             if (g_legacy_raw_cpu_bypass_count == 1) {
@@ -5898,6 +6077,9 @@ extern "C" int fpga_try_matmul_extended(
     const char * reason = nullptr;
     if (!fpga_validate_tensors(src0, src1, dst, true, &reason)) {
         if (ith == 0) {
+            if (q8_f32_f32_candidate) {
+                g_q8_unavailable_cpu_fallback_calls.fetch_add(1, std::memory_order_relaxed);
+            }
             const int64_t k = src0 ? src0->ne[0] : 0;
             const int64_t n = src0 ? src0->ne[1] : 0;
             const int64_t m = src1 ? src1->ne[1] : 0;
@@ -5922,6 +6104,9 @@ extern "C" int fpga_try_matmul_extended(
 
     if (!dma_is_mapped() || !vpu_is_mapped() || !ddr_is_mapped()) {
         if (ith == 0) {
+            if (q8_f32_f32_candidate) {
+                g_q8_unavailable_cpu_fallback_calls.fetch_add(1, std::memory_order_relaxed);
+            }
             LOGE("FPGA/ZDMA/VPU/DDR is not initialized for tensor=%s", tensor_name);
             if (g_abort_on_cpu_fallback) {
                 fpga_fatal("FPGA/ZDMA/VPU/DDR is not initialized; refusing CPU fallback");
@@ -5931,7 +6116,8 @@ extern "C" int fpga_try_matmul_extended(
     }
 
     if (ith != 0) {
-        return 1;
+        return g_contract_cpu_shadow_dst ?
+            FPGA_MATMUL_CONTRACT_CPU_SHADOW : FPGA_MATMUL_FPGA_DST;
     }
 
     pthread_mutex_lock(&g_mutex);
@@ -6101,7 +6287,8 @@ extern "C" int fpga_try_matmul_extended(
     (void) g_current_layer_id;
     (void) g_is_attention_op;
     pthread_mutex_unlock(&g_mutex);
-    return 1;
+    return g_contract_cpu_shadow_dst ?
+        FPGA_MATMUL_CONTRACT_CPU_SHADOW : FPGA_MATMUL_FPGA_DST;
 }
 
 extern "C" void fpga_reset_kv_cache(void) {

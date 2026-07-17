@@ -1275,14 +1275,18 @@ void ggml_compute_forward_mul_mat(
 
    if (g_fpga_initialized || fpga_source_audit_only) {
         int layer_id = extract_layer_id_from_name(src0->name);
-        if (fpga_try_matmul_extended(
+        const int fpga_route = fpga_try_matmul_extended(
                 src0, src1, dst, ith,
                 layer_id,  // Which layer
                 get_current_seq_pos(),
-                0))        // is_attention = 0
-        {
+                0);       // is_attention = 0
+        if (fpga_route == FPGA_MATMUL_FPGA_DST) {
             return;
         }
+        // FPGA_MATMUL_CONTRACT_CPU_SHADOW deliberately falls through to the
+        // upstream threaded kernel.  The FPGA operation and its contracts
+        // already completed; GGML writes dst so attention/KV sees its native
+        // result.  This is a verification shadow, not a fallback.
     }
 #endif
 

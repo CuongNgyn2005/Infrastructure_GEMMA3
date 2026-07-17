@@ -8,6 +8,15 @@ extern "C" {
 
 struct ggml_tensor;
 
+// Return values from fpga_try_matmul[_extended]().  CPU shadow is an explicit
+// contract mode: the VPU result is checked but GGML retains ownership of dst.
+// It is not a hardware-unavailable CPU fallback.
+enum fpga_matmul_route {
+    FPGA_MATMUL_NOT_HANDLED          = 0,
+    FPGA_MATMUL_FPGA_DST             = 1,
+    FPGA_MATMUL_CONTRACT_CPU_SHADOW  = 2,
+};
+
 int  fpga_init(void);
 void fpga_cleanup(void);
 

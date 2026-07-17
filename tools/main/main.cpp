@@ -1154,14 +1154,25 @@ int main(int argc, char ** argv) {
 
     common_sampler_free(smpl);
 
-    llama_backend_free();
+    // common_init_result owns model/context/LoRA objects.  Destroy those
+    // objects while every backend is still alive, rather than leaving their
+    // implicit destruction until after llama_backend_free() at function exit.
+    // This is particularly important for the long FPGA C1 path, whose normal
+    // inference has already completed when the allocator previously reported
+    // a double-free during process teardown.
+    llama_init.lora.clear();
+    llama_init.context.reset();
+    llama_init.model.reset();
+
+    // The FPGA host owns MMIO mappings and scratch allocations.  Release them
+    // before its CPU backend and thread-pool dependencies are torn down.
+#ifdef USE_FPGA
+    fpga_cleanup();
+#endif
 
     ggml_threadpool_free_fn(threadpool);
     ggml_threadpool_free_fn(threadpool_batch);
 
-     // Shutdown FPGA host
-    #ifdef USE_FPGA
-    fpga_cleanup();
-    #endif
+    llama_backend_free();
     return 0;
 }
