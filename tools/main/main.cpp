@@ -48,6 +48,15 @@ static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
+// SIGINT may interrupt the final destruction sequence.  Once teardown begins,
+// the signal handler must not inspect the raw aliases below: their pointees can
+// be in the middle of destruction.
+static volatile sig_atomic_t g_teardown_in_progress = 0;
+
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+static struct sigaction g_previous_sigint_action;
+static volatile sig_atomic_t g_sigint_handler_installed = 0;
+#endif
 
 static bool env_flag_enabled(const char * name) {
     const char * value = std::getenv(name);
@@ -61,6 +70,19 @@ static bool env_flag_enabled(const char * name) {
            std::strcmp(value, "YES") == 0 ||
            std::strcmp(value, "on") == 0 ||
            std::strcmp(value, "ON") == 0;
+}
+
+static bool fpga_teardown_trace_enabled() {
+    return env_flag_enabled("FPGA_TEARDOWN_TRACE");
+}
+
+static void fpga_teardown_trace(const char * stage) {
+    if (!fpga_teardown_trace_enabled()) {
+        return;
+    }
+
+    std::fprintf(stderr, "[FPGA][TEARDOWN] stage=%s\n", stage);
+    std::fflush(stderr);
 }
 
 static std::string logit_trace_escape(const std::string & text) {
@@ -175,6 +197,13 @@ static bool file_is_empty(const std::string & path) {
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
 static void sigint_handler(int signo) {
     if (signo == SIGINT) {
+        // Do not follow the main-thread aliases during teardown.  _exit() is
+        // async-signal-safe and avoids invoking destructors on half-destroyed
+        // sampler/context/model state.
+        if (g_teardown_in_progress || !g_params || !g_ctx || !g_smpl || !*g_ctx || !*g_smpl) {
+            _exit(130);
+        }
+
         if (!is_interacting && g_params->interactive) {
             is_interacting  = true;
             need_insert_eot = true;
@@ -573,7 +602,11 @@ int main(int argc, char ** argv) {
         sigint_action.sa_handler = sigint_handler;
         sigemptyset (&sigint_action.sa_mask);
         sigint_action.sa_flags = 0;
-        sigaction(SIGINT, &sigint_action, NULL);
+        if (sigaction(SIGINT, &sigint_action, &g_previous_sigint_action) == 0) {
+            g_sigint_handler_installed = 1;
+        } else {
+            LOG_WRN("%s: unable to install SIGINT handler\n", __func__);
+        }
 #elif defined (_WIN32)
         auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
             return (ctrl_type == CTRL_C_EVENT) ? (sigint_handler(SIGINT), true) : false;
@@ -1152,7 +1185,39 @@ int main(int argc, char ** argv) {
     LOG("\n\n");
     common_perf_print(ctx, smpl);
 
+    // A SIGINT can arrive at any instruction below.  Mark teardown before
+    // releasing the sampler, then restore the caller's Unix SIGINT handler so
+    // our handler cannot dereference aliases while they are being destroyed.
+    g_teardown_in_progress = 1;
+    fpga_teardown_trace("begin");
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+    if (g_sigint_handler_installed) {
+        fpga_teardown_trace("sigint_restore_begin");
+        if (sigaction(SIGINT, &g_previous_sigint_action, NULL) == 0) {
+            g_sigint_handler_installed = 0;
+            fpga_teardown_trace("sigint_restore_complete");
+        } else {
+            // The teardown guard remains active if restoring the prior handler
+            // fails, so SIGINT still exits without touching stale aliases.
+            fpga_teardown_trace("sigint_restore_failed");
+        }
+    }
+#endif
+
+    fpga_teardown_trace("sampler_free_begin");
     common_sampler_free(smpl);
+    smpl = nullptr;
+    g_smpl = nullptr;
+    fpga_teardown_trace("sampler_free_complete");
+
+    // The FPGA host owns MMIO mappings and scratch allocations.  Release them
+    // while the backend and thread pools that supported the completed graph
+    // remain alive, but after the sampler no longer has model/context state.
+#ifdef USE_FPGA
+    fpga_teardown_trace("fpga_cleanup_begin");
+    fpga_cleanup();
+    fpga_teardown_trace("fpga_cleanup_complete");
+#endif
 
     // common_init_result owns model/context/LoRA objects.  Destroy those
     // objects while every backend is still alive, rather than leaving their
@@ -1160,19 +1225,38 @@ int main(int argc, char ** argv) {
     // This is particularly important for the long FPGA C1 path, whose normal
     // inference has already completed when the allocator previously reported
     // a double-free during process teardown.
+    fpga_teardown_trace("lora_clear_begin");
     llama_init.lora.clear();
+    fpga_teardown_trace("lora_clear_complete");
+
+    // Remove the raw aliases before deleting their owning common_init_result
+    // objects.  The local pointers are cleared immediately after reset for
+    // the same reason; no signal path may observe a freed object.
+    g_ctx = nullptr;
+    fpga_teardown_trace("context_reset_begin");
     llama_init.context.reset();
+    ctx = nullptr;
+    fpga_teardown_trace("context_reset_complete");
+
+    g_model = nullptr;
+    fpga_teardown_trace("model_reset_begin");
     llama_init.model.reset();
+    model = nullptr;
+    fpga_teardown_trace("model_reset_complete");
 
-    // The FPGA host owns MMIO mappings and scratch allocations.  Release them
-    // before its CPU backend and thread-pool dependencies are torn down.
-#ifdef USE_FPGA
-    fpga_cleanup();
-#endif
-
+    fpga_teardown_trace("threadpool_free_begin");
     ggml_threadpool_free_fn(threadpool);
-    ggml_threadpool_free_fn(threadpool_batch);
+    threadpool = nullptr;
+    fpga_teardown_trace("threadpool_free_complete");
 
+    fpga_teardown_trace("threadpool_batch_free_begin");
+    ggml_threadpool_free_fn(threadpool_batch);
+    threadpool_batch = nullptr;
+    fpga_teardown_trace("threadpool_batch_free_complete");
+
+    fpga_teardown_trace("backend_free_begin");
     llama_backend_free();
+    g_params = nullptr;
+    fpga_teardown_trace("backend_free_complete");
     return 0;
 }

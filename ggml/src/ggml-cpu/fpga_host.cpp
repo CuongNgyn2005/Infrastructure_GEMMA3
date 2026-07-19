@@ -27,7 +27,7 @@
 #include <vector>
 
 #define FPGA_LOG_FILE "/tmp/fpga_debug.log"
-#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v50-contract-cpu-shadow"
+#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v55-spu-scale-sequential-contract"
 
 #define MY_IP_BASE_ADDRESS 0x00000000A0000000LL
 #define REG_BASE_PHYS      0x00000000A0000000LL
@@ -406,6 +406,11 @@ typedef struct {
 
 typedef struct {
     std::vector<block_q8_0_t> act_blocks_all;
+    // Used only by FPGA_INPUT_INTEGRITY_CHECK.  It records the logical F32
+    // activation columns before a raw-FPGA matmul, independent of padding in
+    // src1->nb[1], so a host output store cannot silently damage the next
+    // consumer in a multi-column graph.
+    std::vector<uint8_t>      activation_input_snapshot;
     std::vector<block_q8_0_t> weight_tile_snapshot;
     std::vector<uint8_t>      weight_tensor_snapshot;
     std::vector<float>        contract_actual;
@@ -515,6 +520,11 @@ static bool                g_weight_cache_enabled = false;
 static bool                g_weight_cache_full_logged = false;
 static bool                g_weight_cache_crc_verify_each_lookup = false;
 static bool                g_activation_cache_enabled = false;
+// Qualification-only input ownership proof.  This is intentionally opt-in:
+// it copies each logical F32 activation matrix before/after a raw FPGA
+// matmul, which is appropriate for validating M>1 graph layouts but not for
+// production throughput measurement.
+static bool                g_activation_input_integrity_check = false;
 static bool                g_contract_check_abort = false;
 static bool                g_contract_forensic_replay = true;
 // Full byte-for-byte staging scans are valuable for a single forensic replay,
@@ -566,6 +576,12 @@ static int                 g_profile_every = FPGA_DEFAULT_PROFILE_EVERY;
 static int                 g_ip_status_every = FPGA_DEFAULT_STATUS_EVERY;
 static int                 g_detail_every = FPGA_DEFAULT_DETAIL_EVERY;
 static int                 g_contract_check_limit = 0;
+// P2 has its own bounded contract.  It proves the VPU->SPU path before a
+// scaled result is permitted to own a live GGML destination.  This must not
+// be combined with C0: C0 proves raw VPU arithmetic while this contract proves
+// fixed-point scale/accumulate and SPU output ownership.
+static int                 g_spu_scale_contract_check_limit = 0;
+static double              g_spu_scale_contract_atol = 2.0e-3;
 static int                 g_contract_raw_retry_limit = 1;
 static int                 g_runtime_max_rows = VPU_SAFE_RUNTIME_ROWS;
 static int64_t             g_vocab_projection_min_n = 65536;
@@ -582,8 +598,24 @@ static long long           g_contract_raw_repairs = 0;
 static long long           g_contract_value_mismatches = 0;
 static long long           g_contract_cpu_shadow_dst_values = 0;
 static long long           g_contract_staging_restage_count = 0;
+// C0 is a bounded hardware qualification. Once its requested number of
+// checked GEMVs has completed, later graph GEMVs must execute only in the
+// native CPU backend. Launching unverified VPU work after that boundary can
+// turn a later CPU-side failure into misleading C0 evidence.
+static long long           g_contract_limit_cpu_bypass_count = 0;
+static bool                g_contract_limit_cpu_bypass_logged = false;
+static long long           g_spu_scale_contract_checks_done = 0;
+static long long           g_spu_scale_contract_limit_cpu_bypass_count = 0;
+static bool                g_spu_scale_contract_limit_cpu_bypass_logged = false;
+static long long           g_spu_scale_contract_tile_checks = 0;
+static long long           g_spu_scale_contract_raw_mismatches = 0;
+static long long           g_spu_scale_contract_value_mismatches = 0;
+static long long           g_spu_scale_contract_cpu_shadow_dst_values = 0;
+static bool                g_spu_scale_contract_cpu_shadow_dst = false;
 static long long           g_q8_source_audit_checks = 0;
 static long long           g_q8_source_audit_failures = 0;
+static long long           g_activation_input_integrity_checks = 0;
+static long long           g_activation_input_integrity_failures = 0;
 static long long           g_activation_scale_fp16_overflows = 0;
 // Set only while a C0 source preflight rejects an immutable Q8 tensor.  This
 // lets the outer hook report the real cause instead of mislabelling it as a
@@ -892,7 +924,11 @@ static bool range_fits(uint32_t off, size_t bytes, uint32_t begin, uint32_t end)
 }
 
 static bool ddr_range_fits(uint32_t off, size_t bytes) {
-    return ddr_is_mapped() && bytes > 0 && (uint64_t) off + (uint64_t) bytes <= (uint64_t) g_ddr_map_size;
+    if (!ddr_is_mapped() || bytes == 0U) {
+        return false;
+    }
+    const size_t offset = (size_t) off;
+    return offset <= g_ddr_map_size && bytes <= g_ddr_map_size - offset;
 }
 
 static uint8_t * ddr_ptr(uint32_t off, size_t bytes) {
@@ -1505,8 +1541,11 @@ static bool map_registers_dma_ddr(void) {
     }
     g_dma = (volatile dma_ctrl *) g_dma_map_base;
 
+    // A MY_IP UIO resource can advertise the entire Vivado segment.  This
+    // driver uses only the established 4 MiB register/local-memory ABI, so
+    // never turn an advertised UIO size into a larger process mapping.
     if (!map_region_prefer_uio("MY_IP", "FPGA_VPU_UIO", REG_BASE_PHYS, VPU_DEVMEM_COMPAT_MMAP,
-                               VPU_DEVMEM_COMPAT_MMAP, "MY_IP/VPU", 0,
+                               VPU_DEVMEM_COMPAT_MMAP, "MY_IP/VPU", VPU_DEVMEM_COMPAT_MMAP,
                                g_allow_devmem_fallback || g_allow_vpu_devmem_compat,
                                g_allow_devmem_fallback ? "diagnostic_all_resources" : "vpu_devmem_compat",
                                &g_vpu_map_base,
@@ -1675,15 +1714,29 @@ static bool msync_ddr_range(uint32_t off, size_t bytes, bool invalidate, const c
 }
 
 static bool phys_to_ddr_offset(uint64_t phys, size_t bytes, uint32_t * off) {
-    if (phys < DDR_BASE_PHYS) {
+    if (!off || bytes == 0U || phys < DDR_BASE_PHYS) {
         return false;
     }
     const uint64_t delta = phys - DDR_BASE_PHYS;
-    if (delta > UINT32_MAX || delta + bytes > g_ddr_map_size) {
+    if (delta > UINT32_MAX || delta > (uint64_t) g_ddr_map_size ||
+        (uint64_t) bytes > (uint64_t) g_ddr_map_size - delta) {
         return false;
     }
     *off = (uint32_t) delta;
     return true;
+}
+
+static bool phys_range_fits(
+        uint64_t phys,
+        size_t bytes,
+        uint64_t base,
+        size_t mapped_size) {
+    if (bytes == 0U || phys < base) {
+        return false;
+    }
+    const uint64_t delta = phys - base;
+    return delta <= (uint64_t) mapped_size &&
+           (uint64_t) bytes <= (uint64_t) mapped_size - delta;
 }
 
 static void zdma_set_addr(volatile U32 * lo, volatile U32 * hi, uint64_t value) {
@@ -2296,6 +2349,24 @@ static bool fpga_dma_copy(uint64_t src_phys, uint64_t dst_phys, size_t bytes, co
         LOGE("invalid ZDMA byte count tag=%s bytes=%zu", tag ? tag : "?", bytes);
         return false;
     }
+    const bool ddr_to_ip =
+        phys_range_fits(src_phys, bytes, DDR_BASE_PHYS, g_ddr_map_size) &&
+        phys_range_fits(dst_phys, bytes, LMM_BASE_PHYS, g_vpu_map_size);
+    const bool ip_to_ddr =
+        phys_range_fits(src_phys, bytes, LMM_BASE_PHYS, g_vpu_map_size) &&
+        phys_range_fits(dst_phys, bytes, DDR_BASE_PHYS, g_ddr_map_size);
+    if (!ddr_to_ip && !ip_to_ddr) {
+        LOGE("ZDMA physical range rejected tag=%s src=0x%llx dst=0x%llx bytes=%zu ddr=[0x%llx,+0x%zx) my_ip=[0x%llx,+0x%zx); require one bounded DDR<->MY_IP transfer",
+             tag ? tag : "?",
+             (unsigned long long) src_phys,
+             (unsigned long long) dst_phys,
+             bytes,
+             (unsigned long long) DDR_BASE_PHYS,
+             g_ddr_map_size,
+             (unsigned long long) LMM_BASE_PHYS,
+             g_vpu_map_size);
+        return false;
+    }
     if (g_zdma_max_transfer_bytes < 16U ||
         (g_zdma_max_transfer_bytes & 0xFU) != 0U) {
         LOGE("invalid ZDMA descriptor policy max_bytes=%zu; require a positive 16-byte multiple",
@@ -2304,7 +2375,7 @@ static bool fpga_dma_copy(uint64_t src_phys, uint64_t dst_phys, size_t bytes, co
     }
 
     const size_t chunk_bytes = std::min(bytes, g_zdma_max_transfer_bytes);
-    const size_t chunk_count = (bytes + chunk_bytes - 1U) / chunk_bytes;
+    const size_t chunk_count = bytes / chunk_bytes + (bytes % chunk_bytes != 0U ? 1U : 0U);
     for (size_t chunk = 0U; chunk < chunk_count; ++chunk) {
         const size_t offset = chunk * chunk_bytes;
         const size_t this_bytes = std::min(chunk_bytes, bytes - offset);
@@ -2599,6 +2670,13 @@ static bool ensure_quantized_activation_matrix(
         const char * tensor_name,
         int layer_id) {
     const int64_t nb = k / VPU_QK8_0;
+    if (nb <= 0 || (uint64_t) m > (uint64_t) std::numeric_limits<size_t>::max() / (uint64_t) nb) {
+        LOGE("activation quantization allocation overflow tensor=%s layer=%d K=%lld M=%lld blocks_per_col=%lld",
+             tensor_name ? tensor_name : "?", layer_id,
+             (long long) k, (long long) m, (long long) nb);
+        return false;
+    }
+    const size_t total_blocks = (size_t) m * (size_t) nb;
     const bool cache_hit =
         g_activation_cache_enabled &&
         g_scratch.activation_cache_valid &&
@@ -2608,16 +2686,16 @@ static bool ensure_quantized_activation_matrix(
         g_scratch.cached_k == k &&
         g_scratch.cached_nb0 == src1->nb[0] &&
         g_scratch.cached_nb1 == src1->nb[1] &&
-        (!store_act_scales || act_scales.size() == (size_t) (m * nb));
+        (!store_act_scales || act_scales.size() == total_blocks);
 
     if (cache_hit) {
         g_activation_cache_hits++;
         return true;
     }
 
-    act_blocks_all.resize((size_t) (m * nb));
+    act_blocks_all.resize(total_blocks);
     if (store_act_scales) {
-        act_scales.resize((size_t) (m * nb));
+        act_scales.resize(total_blocks);
     } else {
         act_scales.clear();
     }
@@ -2625,12 +2703,12 @@ static bool ensure_quantized_activation_matrix(
     stats.first_overflow_col = -1;
     stats.first_overflow_block = -1;
     for (int64_t col = 0; col < m; ++col) {
-        block_q8_0_t * col_blocks = &act_blocks_all[(size_t) (col * nb)];
+        block_q8_0_t * col_blocks = &act_blocks_all[(size_t) col * (size_t) nb];
         int64_t bad_block = -1;
         int bad_lane = -1;
         float bad_value = 0.0f;
         float * stored_scales = store_act_scales ?
-            &act_scales[(size_t) (col * nb)] : nullptr;
+            &act_scales[(size_t) col * (size_t) nb] : nullptr;
         if (!quantize_activation_vector_to(src1, col, k, col_blocks, stored_scales,
                                            &stats, tensor_name, layer_id,
                                            &bad_block, &bad_lane, &bad_value)) {
@@ -2710,16 +2788,29 @@ static bool checked_size_mul(size_t lhs, size_t rhs, size_t * out) {
     return true;
 }
 
+typedef struct {
+    uintptr_t begin;
+    uintptr_t end;
+    size_t    bytes;
+} fpga_tensor_access_range_t;
+
 // The FPGA hook owns the complete MUL_MAT result, so a wrong tensor stride
 // would otherwise corrupt the CPU allocator and only surface later as a
-// misleading "double free or corruption" during shutdown.  Validate the
-// exact last byte that the host will access before the first VPU launch.
-static bool fpga_tensor_span_covers(
+// misleading "double free or corruption" during shutdown.  Calculate the
+// exact byte interval that the host will read/write before the first VPU
+// launch; this also lets the host reject an output that aliases a live F32
+// activation tensor.
+static bool fpga_tensor_access_range(
         const struct ggml_tensor * tensor,
         int64_t dim0,
         int64_t dim1,
-        size_t element_bytes) {
+        size_t element_bytes,
+        fpga_tensor_access_range_t * range) {
     if (!tensor || !tensor->data || dim0 <= 0 || dim1 <= 0) {
+        return false;
+    }
+    if ((uint64_t) dim0 > (uint64_t) std::numeric_limits<size_t>::max() ||
+        (uint64_t) dim1 > (uint64_t) std::numeric_limits<size_t>::max()) {
         return false;
     }
 
@@ -2734,7 +2825,101 @@ static bool fpga_tensor_span_covers(
         return false;
     }
 
-    return required_bytes <= ggml_nbytes(tensor);
+    const uintptr_t begin = (uintptr_t) tensor->data;
+    if (begin > std::numeric_limits<uintptr_t>::max() - required_bytes) {
+        return false;
+    }
+    if (range) {
+        range->begin = begin;
+        range->end = begin + required_bytes;
+        range->bytes = required_bytes;
+    }
+    return true;
+}
+
+static bool fpga_tensor_ranges_overlap(
+        const fpga_tensor_access_range_t & lhs,
+        const fpga_tensor_access_range_t & rhs) {
+    return lhs.begin < rhs.end && rhs.begin < lhs.end;
+}
+
+static bool fpga_capture_activation_input_snapshot(
+        const struct ggml_tensor * src1,
+        int64_t k,
+        int64_t m,
+        std::vector<uint8_t> & snapshot) {
+    size_t column_bytes = 0U;
+    size_t total_bytes = 0U;
+    if (!src1 || !src1->data ||
+        !checked_size_mul((size_t) k, sizeof(float), &column_bytes) ||
+        !checked_size_mul((size_t) m, column_bytes, &total_bytes)) {
+        return false;
+    }
+
+    snapshot.resize(total_bytes);
+    const char * const base = (const char *) src1->data;
+    for (int64_t col = 0; col < m; ++col) {
+        memcpy(snapshot.data() + (size_t) col * column_bytes,
+               base + (size_t) col * src1->nb[1], column_bytes);
+    }
+    return true;
+}
+
+static bool fpga_verify_activation_input_snapshot(
+        const struct ggml_tensor * src1,
+        const struct ggml_tensor * dst,
+        int64_t k,
+        int64_t m,
+        const std::vector<uint8_t> & snapshot,
+        const char * consumer_tensor_name,
+        int consumer_layer_id) {
+    size_t column_bytes = 0U;
+    size_t expected_bytes = 0U;
+    if (!src1 || !dst || !src1->data ||
+        !checked_size_mul((size_t) k, sizeof(float), &column_bytes) ||
+        !checked_size_mul((size_t) m, column_bytes, &expected_bytes) ||
+        snapshot.size() != expected_bytes) {
+        LOGE("FPGA_INPUT_INTEGRITY_INTERNAL_ERROR tensor=%s layer=%d reason=invalid_snapshot_shape K=%lld M=%lld snapshot_bytes=%zu",
+             consumer_tensor_name ? consumer_tensor_name : "?", consumer_layer_id,
+             (long long) k, (long long) m, snapshot.size());
+        return false;
+    }
+
+    const char * const base = (const char *) src1->data;
+    for (int64_t col = 0; col < m; ++col) {
+        const uint8_t * const expected = snapshot.data() + (size_t) col * column_bytes;
+        const uint8_t * const actual = (const uint8_t *) base + (size_t) col * src1->nb[1];
+        if (memcmp(expected, actual, column_bytes) == 0) {
+            continue;
+        }
+
+        size_t first_byte = 0U;
+        while (first_byte < column_bytes && expected[first_byte] == actual[first_byte]) {
+            ++first_byte;
+        }
+        const size_t first_index = first_byte / sizeof(float);
+        uint32_t expected_bits = 0U;
+        uint32_t actual_bits = 0U;
+        if (first_index < (size_t) k) {
+            memcpy(&expected_bits, expected + first_index * sizeof(float), sizeof(expected_bits));
+            memcpy(&actual_bits, actual + first_index * sizeof(float), sizeof(actual_bits));
+        }
+        fpga_tensor_access_range_t src_range = {};
+        fpga_tensor_access_range_t dst_range = {};
+        const bool src_range_ok = fpga_tensor_access_range(src1, k, m, sizeof(float), &src_range);
+        const bool dst_range_ok = fpga_tensor_access_range(dst, dst->ne[0], dst->ne[1], sizeof(float), &dst_range);
+        LOGE("FPGA_INPUT_MUTATION tensor=%s layer=%d source=%s col=%lld index=%zu byte=%zu expected_bits=0x%08x actual_bits=0x%08x src=[0x%llx,0x%llx) dst=[0x%llx,0x%llx) ranges_overlap=%d; raw FPGA matmul modified its F32 input",
+             consumer_tensor_name ? consumer_tensor_name : "?", consumer_layer_id,
+             tensor_name_or_unknown(src1), (long long) col, first_index, first_byte,
+             expected_bits, actual_bits,
+             (unsigned long long) (src_range_ok ? src_range.begin : 0U),
+             (unsigned long long) (src_range_ok ? src_range.end : 0U),
+             (unsigned long long) (dst_range_ok ? dst_range.begin : 0U),
+             (unsigned long long) (dst_range_ok ? dst_range.end : 0U),
+             src_range_ok && dst_range_ok && fpga_tensor_ranges_overlap(src_range, dst_range) ? 1 : 0);
+        return false;
+    }
+    return true;
 }
 
 static void store_dst_value(
@@ -3594,7 +3779,14 @@ static bool fpga_contract_check_output_values(
         const std::vector<block_q8_0_t> & act_blocks_all,
         const void * weight_data_base,
         const char * tensor_name,
-        int layer_id) {
+        int layer_id,
+        bool cpu_shadow_dst,
+        double atol,
+        double rtol,
+        bool abort_on_mismatch,
+        const char * contract_tag,
+        long long * mismatch_total,
+        long long * shadow_value_total) {
     const int64_t k = src0->ne[0];
     const int64_t n = src0->ne[1];
     const int64_t m = dst->ne[1];
@@ -3604,9 +3796,9 @@ static bool fpga_contract_check_output_values(
     double max_abs = 0.0;
     double max_rel = 0.0;
     const size_t value_count = (size_t) n * (size_t) m;
-    const bool cpu_shadow_dst = g_contract_cpu_shadow_dst;
     if (cpu_shadow_dst && g_scratch.contract_actual.size() != value_count) {
-        LOGE("CONTRACT_CPU_SHADOW_LAYOUT tensor=%s layer=%d actual_values=%zu expected_values=%zu",
+        LOGE("%s_CPU_SHADOW_LAYOUT tensor=%s layer=%d actual_values=%zu expected_values=%zu",
+             contract_tag,
              tensor_name ? tensor_name : "?",
              layer_id,
              g_scratch.contract_actual.size(),
@@ -3629,7 +3821,8 @@ static bool fpga_contract_check_output_values(
 
             if (!std::isfinite(got) || !std::isfinite(expected)) {
                 if (bad < 4) {
-                    LOGE("CONTRACT_VALUE_NONFINITE tensor=%s layer=%d row=%lld col=%lld got=%.9g expected=%.9g; matching NaN/Inf is a correctness failure",
+                    LOGE("%s_NONFINITE tensor=%s layer=%d row=%lld col=%lld got=%.9g expected=%.9g; matching NaN/Inf is a correctness failure",
+                         contract_tag,
                          tensor_name ? tensor_name : "?",
                          layer_id,
                          (long long) row,
@@ -3648,9 +3841,10 @@ static bool fpga_contract_check_output_values(
             const double rel_err = abs_err / (std::fabs(expected) + 1.0e-12);
             max_abs = std::max(max_abs, abs_err);
             max_rel = std::max(max_rel, rel_err);
-            if (abs_err > g_contract_atol && rel_err > g_contract_rtol) {
+            if (abs_err > atol && rel_err > rtol) {
                 if (bad < 4) {
-                    LOGE("CONTRACT_VALUE_MISMATCH tensor=%s layer=%d row=%lld col=%lld got=%.9g expected=%.9g abs=%.9g rel=%.9g",
+                    LOGE("%s_MISMATCH tensor=%s layer=%d row=%lld col=%lld got=%.9g expected=%.9g abs=%.9g rel=%.9g",
+                         contract_tag,
                          tensor_name ? tensor_name : "?",
                          layer_id,
                          (long long) row,
@@ -3666,8 +3860,11 @@ static bool fpga_contract_check_output_values(
     }
 
     if (bad > 0) {
-        g_contract_value_mismatches += bad;
-        LOGE("CONTRACT_VALUE_SUMMARY tensor=%s layer=%d checked=%lld bad=%lld nonfinite=%lld max_abs=%.9g max_rel=%.9g atol=%.9g rtol=%.9g action=%s",
+        if (mismatch_total) {
+            *mismatch_total += bad;
+        }
+        LOGE("%s_SUMMARY tensor=%s layer=%d checked=%lld bad=%lld nonfinite=%lld max_abs=%.9g max_rel=%.9g atol=%.9g rtol=%.9g action=%s",
+             contract_tag,
              tensor_name ? tensor_name : "?",
              layer_id,
              (long long) (n * m),
@@ -3675,13 +3872,14 @@ static bool fpga_contract_check_output_values(
              nonfinite,
              max_abs,
              max_rel,
-             g_contract_atol,
-             g_contract_rtol,
-             g_contract_check_abort ? "abort" : "log_only");
-        return !g_contract_check_abort;
+             atol,
+             rtol,
+             abort_on_mismatch ? "abort" : "log_only");
+        return !abort_on_mismatch;
     }
 
-    LOGI("CONTRACT_VALUE_PASS tensor=%s layer=%d checked=%lld nonfinite=0 max_abs=%.9g max_rel=%.9g reference=ggml_vec_dot_q8_0_q8_0",
+    LOGI("%s_PASS tensor=%s layer=%d checked=%lld nonfinite=0 max_abs=%.9g max_rel=%.9g reference=ggml_vec_dot_q8_0_q8_0",
+         contract_tag,
          tensor_name ? tensor_name : "?",
          layer_id,
          (long long) (n * m),
@@ -3692,8 +3890,11 @@ static bool fpga_contract_check_output_values(
         // into its upstream threaded kernel.  Do not write dst here: doing so
         // would race that kernel and would replace its output with a second
         // implementation during a contract run.
-        g_contract_cpu_shadow_dst_values += (long long) value_count;
-        LOGI("CONTRACT_CPU_SHADOW_DST tensor=%s layer=%d values=%zu hardware_result=validated native_ggml_dst=deferred purpose=contract_isolation_not_cpu_fallback",
+        if (shadow_value_total) {
+            *shadow_value_total += (long long) value_count;
+        }
+        LOGI("%s_CPU_SHADOW_DST tensor=%s layer=%d values=%zu hardware_result=validated native_ggml_dst=deferred purpose=contract_isolation_not_cpu_fallback",
+             contract_tag,
              tensor_name ? tensor_name : "?",
              layer_id,
              value_count);
@@ -3980,6 +4181,12 @@ static bool fpga_validate_tensors(
         *reason = "unsupported DMA-to-IP tiling case: K is not divisible by 32";
         return false;
     }
+    if ((uint64_t) k > (uint64_t) std::numeric_limits<size_t>::max() ||
+        (uint64_t) n > (uint64_t) std::numeric_limits<size_t>::max() ||
+        (uint64_t) m > (uint64_t) std::numeric_limits<size_t>::max()) {
+        *reason = "unsupported DMA-to-IP tiling case: tensor dimensions exceed host size arithmetic";
+        return false;
+    }
     if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
         src1->ne[2] != 1 || src1->ne[3] != 1 ||
         dst->ne[2]  != 1 || dst->ne[3]  != 1) {
@@ -3990,32 +4197,58 @@ static bool fpga_validate_tensors(
         *reason = "unsupported DMA-to-IP tiling case: non-F32 row stride";
         return false;
     }
+    size_t src0_row_bytes = 0U;
+    size_t src1_row_bytes = 0U;
+    size_t dst_row_bytes = 0U;
+    size_t activation_block_count = 0U;
+    if (!checked_size_mul((size_t) (k / VPU_QK8_0), sizeof(block_q8_0_t), &src0_row_bytes) ||
+        !checked_size_mul((size_t) k, sizeof(float), &src1_row_bytes) ||
+        !checked_size_mul((size_t) n, sizeof(float), &dst_row_bytes) ||
+        !checked_size_mul((size_t) m, (size_t) (k / VPU_QK8_0), &activation_block_count)) {
+        *reason = "unsupported DMA-to-IP tiling case: tensor layout size overflows host allocation arithmetic";
+        return false;
+    }
+    (void) activation_block_count;
     if (src0->nb[0] != sizeof(block_q8_0_t) ||
-        src0->nb[1] < (size_t) (k / VPU_QK8_0) * sizeof(block_q8_0_t) ||
-        src1->nb[1] < (size_t) k * sizeof(float) ||
-        dst->nb[1] < (size_t) n * sizeof(float)) {
+        src0->nb[1] < src0_row_bytes ||
+        src1->nb[1] < src1_row_bytes ||
+        dst->nb[1] < dst_row_bytes) {
         *reason = "unsupported DMA-to-IP tiling case: tensor stride is smaller than its logical row";
         return false;
     }
-    if (!fpga_tensor_span_covers(src0, k / VPU_QK8_0, n, sizeof(block_q8_0_t)) ||
-        !fpga_tensor_span_covers(src1, k, m, sizeof(float)) ||
-        !fpga_tensor_span_covers(dst, n, m, sizeof(float))) {
+    if ((src0->nb[1] % alignof(block_q8_0_t)) != 0U ||
+        (src1->nb[1] % alignof(float)) != 0U ||
+        (dst->nb[1] % alignof(float)) != 0U ||
+        ((uintptr_t) src0->data % alignof(block_q8_0_t)) != 0U ||
+        ((uintptr_t) src1->data % alignof(float)) != 0U ||
+        ((uintptr_t) dst->data % alignof(float)) != 0U) {
+        *reason = "unsupported DMA-to-IP tiling case: typed Q8/F32 data or padded row stride is misaligned";
+        return false;
+    }
+    fpga_tensor_access_range_t src0_range = {};
+    fpga_tensor_access_range_t src1_range = {};
+    fpga_tensor_access_range_t dst_range = {};
+    if (!fpga_tensor_access_range(src0, k / VPU_QK8_0, n, sizeof(block_q8_0_t), &src0_range) ||
+        !fpga_tensor_access_range(src1, k, m, sizeof(float), &src1_range) ||
+        !fpga_tensor_access_range(dst, n, m, sizeof(float), &dst_range) ||
+        src0_range.bytes > ggml_nbytes(src0) ||
+        src1_range.bytes > ggml_nbytes(src1) ||
+        dst_range.bytes > ggml_nbytes(dst)) {
         *reason = "unsupported DMA-to-IP tiling case: tensor byte span does not cover host read/write layout";
         return false;
     }
 
-    const size_t src0_bytes = ggml_nbytes(src0);
-    const size_t dst_bytes = ggml_nbytes(dst);
-    const uintptr_t src0_begin = (uintptr_t) src0->data;
-    const uintptr_t src0_end = src0_begin + src0_bytes;
-    const uintptr_t dst_begin = (uintptr_t) dst->data;
-    const uintptr_t dst_end = dst_begin + dst_bytes;
-    if (src0_end < src0_begin || dst_end < dst_begin) {
-        *reason = "unsupported DMA-to-IP tiling case: tensor address range overflow";
+    if (fpga_tensor_ranges_overlap(src0_range, dst_range)) {
+        *reason = "unsupported DMA-to-IP tiling case: destination aliases immutable weight storage";
         return false;
     }
-    if (src0_begin < dst_end && dst_begin < src0_end) {
-        *reason = "unsupported DMA-to-IP tiling case: destination aliases immutable weight storage";
+    if (fpga_tensor_ranges_overlap(src1_range, dst_range)) {
+        // Q, K, and V consume the same normalized activation tensor in the
+        // Gemma graph.  An accelerator path cannot own a dst interval that
+        // overlaps that live input; it would turn a valid later K/V input into
+        // unrelated result bits.  The native CPU route has no such ownership
+        // transfer, so reject this layout rather than silently corrupt it.
+        *reason = "unsupported DMA-to-IP tiling case: destination aliases live F32 activation storage";
         return false;
     }
     if (require_packed_q8_capability && !g_packed_q8_supported) {
@@ -5436,7 +5669,10 @@ int fpga_init(void) {
     g_status_stderr = env_flag_enabled("FPGA_STATUS_STDERR");
     g_trace_data_enabled = env_flag_enabled("FPGA_TRACE_DATA");
     g_weight_cache_enabled = env_flag_enabled("FPGA_WEIGHT_CACHE");
-    g_activation_cache_enabled = env_flag_enabled("FPGA_ACTIVATION_CACHE");
+    if (env_flag_enabled("FPGA_ACTIVATION_CACHE")) {
+        fpga_fatal("FPGA_ACTIVATION_CACHE is unsupported: the existing key is pointer/shape based and cannot prove immutable activation contents; refusing a stale-activation cache");
+    }
+    g_activation_cache_enabled = false;
     g_allow_devmem_fallback = env_flag_enabled("FPGA_ALLOW_DEVMEM");
     g_allow_vpu_devmem_compat =
         !env_flag_enabled("FPGA_VPU_UIO_REQUIRED") &&
@@ -5537,6 +5773,14 @@ int fpga_init(void) {
     g_contract_atol = env_double_value("FPGA_CONTRACT_ATOL", 1.0e-3, 0.0, 1.0e9);
     g_contract_rtol = env_double_value("FPGA_CONTRACT_RTOL", 1.0e-4, 0.0, 1.0e9);
     g_abort_on_cpu_fallback = !env_flag_disabled("FPGA_ABORT_ON_CPU_FALLBACK");
+    g_activation_input_integrity_check =
+        env_flag_enabled("FPGA_INPUT_INTEGRITY_CHECK");
+    if (g_contract_check_limit > 0 && !g_activation_input_integrity_check) {
+        // C0 deliberately exercises M>1 layouts. It must always prove that
+        // the host/VPU path leaves each live F32 source activation intact.
+        g_activation_input_integrity_check = true;
+        LOGPROOF("C0 input-integrity policy: FPGA_CONTRACT_CHECK automatically enables the F32 src1 snapshot/verify guard; FPGA_INPUT_INTEGRITY_CHECK=1 is implied for this qualification run");
+    }
 
     if (!configure_ddr_mapping_policy()) {
         fpga_fatal("DDR cache/mapping policy is invalid; refusing FPGA initialization");
@@ -5591,16 +5835,25 @@ int fpga_init(void) {
         fpga_fatal("FPGA_FORCE_PACKED_Q8 is not permitted in the production host; the bitstream must advertise packed-Q8 capability");
     }
     const bool bitstream_id_compatible = g_bitstream_id == FPGA_EXPECTED_BITSTREAM_ID;
-    if (!bitstream_id_compatible) {
-        LOGPROOF("bitstream identity is legacy/unknown got=0x%08x expected=0x%08x; raw CPU-scale compatibility path remains disabled for primary generation, and PL-scale/pipeline opt-ins are prohibited",
-                 g_bitstream_id, FPGA_EXPECTED_BITSTREAM_ID);
+    const bool stream_protocol_compatible =
+        g_stream_protocol_version == FPGA_REQUIRED_STREAM_PROTOCOL_VERSION;
+    const bool raw_fpga_compatible = bitstream_id_compatible && stream_protocol_compatible;
+    const bool legacy_raw_diagnostic_override =
+        env_flag_enabled("FPGA_ALLOW_UNVERIFIED_LEGACY_RAW");
+    if (!raw_fpga_compatible) {
+        LOGPROOF("raw FPGA ABI is incompatible bitstream_id=0x%08x expected_id=0x%08x id_ok=%d stream_protocol=0x%08x required_protocol=%u protocol_ok=%d; primary raw GEMV is CPU-quarantined and PL-scale/pipeline opt-ins are prohibited",
+                 g_bitstream_id, FPGA_EXPECTED_BITSTREAM_ID, bitstream_id_compatible ? 1 : 0,
+                 g_stream_protocol_version, FPGA_REQUIRED_STREAM_PROTOCOL_VERSION,
+                 stream_protocol_compatible ? 1 : 0);
     }
     g_legacy_raw_cpu_bypass =
-        !bitstream_id_compatible &&
+        !raw_fpga_compatible &&
         g_contract_check_limit == 0 &&
-        !env_flag_enabled("FPGA_ALLOW_UNVERIFIED_LEGACY_RAW");
+        !legacy_raw_diagnostic_override;
     if (g_legacy_raw_cpu_bypass) {
-        LOGPROOF("v23 language-safety policy: legacy/unknown bitstream block GEMVs will use CPU; set FPGA_ALLOW_UNVERIFIED_LEGACY_RAW=1 only for a controlled raw-contract diagnostic run");
+        LOGPROOF("raw FPGA quarantine: block GEMVs will use CPU because the ID/protocol ABI gate failed; set FPGA_ALLOW_UNVERIFIED_LEGACY_RAW=1 only for a controlled raw-contract diagnostic run");
+    } else if (!raw_fpga_compatible && legacy_raw_diagnostic_override) {
+        LOGPROOF("DIAGNOSTIC OVERRIDE FPGA_ALLOW_UNVERIFIED_LEGACY_RAW=1 bypasses the raw ID/protocol quarantine; this is not production compatibility or board-success evidence");
     }
     if (g_runtime_max_rows > 0 && g_runtime_max_rows < g_vpu_max_rows) {
         g_vpu_max_rows = g_runtime_max_rows;
@@ -5629,7 +5882,7 @@ int fpga_init(void) {
     g_pingpong_scheduler_enabled =
         g_vpu_pingpong_supported &&
         g_vpu_descriptor_supported &&
-        bitstream_id_compatible &&
+        raw_fpga_compatible &&
         env_flag_enabled("FPGA_PIPELINE_ENABLE") &&
         !env_flag_enabled("FPGA_PIPELINE_DISABLE");
     if (env_flag_enabled("FPGA_PL_SCALE_ENABLE") && !g_spu_q8_scale_stream_supported) {
@@ -5639,13 +5892,20 @@ int fpga_init(void) {
     if (env_flag_enabled("FPGA_PIPELINE_ENABLE") && !g_pingpong_scheduler_enabled) {
         fpga_fatal("FPGA_PIPELINE_ENABLE requested but ping-pong descriptor capability is unavailable caps=0x%08x", caps);
     }
+    LOGPROOF("raw FPGA compatibility gate id_ok=%d protocol_ok=%d raw_compatible=%d legacy_diagnostic_override=%d route=%s",
+             bitstream_id_compatible ? 1 : 0,
+             stream_protocol_compatible ? 1 : 0,
+             raw_fpga_compatible ? 1 : 0,
+             legacy_raw_diagnostic_override ? 1 : 0,
+             g_legacy_raw_cpu_bypass ? "cpu_quarantine" :
+             (g_contract_check_limit > 0 ? "contract_diagnostic" : "raw_fpga"));
     vpu_select_banks(0, 0);
 
     const char * mapping_policy =
         g_allow_devmem_fallback ? "diagnostic_all_resources" :
         (g_allow_vpu_devmem_compat ? "uio_dma_ddr+vpu_devmem_compat" : "uio_required");
 
-    LOGPROOF("ready version=%s path=%s rows=%d host_row_limit=%d col_beats=%d cols=%d packed_q8=%d max_group_blocks=%d result_words=%d zdma_max_transfer_bytes=%zu pingpong_cap=%d descriptor_cap=%d scheduler=%d scheduler_policy=opt_in pl_scale=%d pl_scale_policy=opt_in stream_protocol=0x%08x bitstream_id=0x%08x spu_silu=%d spu_rms=%d spu_rope=%d spu_softmax=%d weight_cache=%d activation_cache=%d vocab_cpu_bypass=%d legacy_raw_cpu_bypass=%d vocab_min_n=%lld contract_check=%d source_audit_only=%d contract_abort=%d contract_forensics=%d contract_deep_staging=%d contract_cpu_shadow_dst=%d contract_raw_propagation_diagnostic=%d raw_retry=%d raw_repair=%d raw_accum_fused=%d result_clear=%d strict_coherency=%d clock_mhz=%.3f profile_log=1 dma_detail=%d ip_detail=%d detail_every=%d flush_every=%d",
+    LOGPROOF("ready version=%s path=%s rows=%d host_row_limit=%d col_beats=%d cols=%d packed_q8=%d max_group_blocks=%d result_words=%d zdma_max_transfer_bytes=%zu pingpong_cap=%d descriptor_cap=%d scheduler=%d scheduler_policy=opt_in pl_scale=%d pl_scale_policy=opt_in stream_protocol=0x%08x bitstream_id=0x%08x spu_silu=%d spu_rms=%d spu_rope=%d spu_softmax=%d weight_cache=%d activation_cache=%d input_integrity_check=%d vocab_cpu_bypass=%d legacy_raw_cpu_bypass=%d vocab_min_n=%lld contract_check=%d source_audit_only=%d contract_abort=%d contract_forensics=%d contract_deep_staging=%d contract_cpu_shadow_dst=%d contract_raw_propagation_diagnostic=%d raw_retry=%d raw_repair=%d raw_accum_fused=%d result_clear=%d strict_coherency=%d clock_mhz=%.3f profile_log=1 dma_detail=%d ip_detail=%d detail_every=%d flush_every=%d",
          FPGA_HOST_TRACE_VERSION,
          path ? path : "dma(default)",
          g_vpu_max_rows,
@@ -5665,6 +5925,7 @@ int fpga_init(void) {
          g_spu_softmax_supported ? 1 : 0,
          g_weight_cache_enabled ? 1 : 0,
          g_activation_cache_enabled ? 1 : 0,
+         g_activation_input_integrity_check ? 1 : 0,
          g_vocab_projection_cpu_bypass ? 1 : 0,
          g_legacy_raw_cpu_bypass ? 1 : 0,
          (long long) g_vocab_projection_min_n,
@@ -5689,6 +5950,9 @@ int fpga_init(void) {
              g_dma_trace_enabled ? 1 : 0,
              FPGA_DMA_TRACE_DEPTH,
              g_contract_check_limit);
+    if (g_activation_input_integrity_check) {
+        LOGPROOF("FPGA_INPUT_INTEGRITY_CHECK=1: each raw FPGA matmul snapshots its logical F32 src1 before launch and verifies it after dst ownership returns; this is a qualification guard for M>1 graph layouts, not a CPU fallback or numerical replacement");
+    }
     LOGPROOF("ZDMA byte-counter policy clear=before_every_transfer current=0x%08x error_mask=0x%08x; BYTE_CNT_OVRFL is fatal and produces a bounded DMA trace",
              g_dma ? g_dma->ZDMA_CH_TOTAL_BYTE : 0U,
              ZDMA_ISR_ERROR_MASK);
@@ -5779,6 +6043,15 @@ void fpga_cleanup(void) {
              dma_is_mapped() ? 1 : 0,
              g_weight_cache.size());
 
+    // No local source establishes a safe software abort/reset sequence for an
+    // in-flight ZDMA descriptor.  Therefore cleanup must observe the
+    // documented hardware-cleared CTRL2.EN state before invalidating DDR
+    // metadata or unmapping any participant in the transfer.
+    if (dma_is_mapped() && !zdma_wait_channel_disabled("cleanup", "before_unmap")) {
+        pthread_mutex_unlock(&g_mutex);
+        fpga_fatal("ZDMA EN remained set during cleanup; descriptors, DDR/VPU/DMA mappings, and /dev/mem fd were intentionally left owned by the process. No undocumented reset/abort write was issued");
+    }
+
     if (ddr_is_mapped()) {
         for (fpga_weight_cache_entry_t & entry : g_weight_cache) {
             if (entry.valid && ddr_range_fits(entry.header_off, sizeof(fpga_weight_cache_header_t))) {
@@ -5844,7 +6117,7 @@ void fpga_cleanup(void) {
              q8_unavailable_cpu,
              q8_coverage_complete ? "complete" : "incomplete",
              fpga_block_gemv_mode);
-    LOGPROOF("cleanup complete fpga_calls=%lld vpu_runs=%lld rejects=%lld attention_cpu_bypass=%lld vocab_projection_cpu_bypass=%lld legacy_raw_cpu_bypass=%lld elapsed_s=%.3f pingpong_cap=%d descriptor_cap=%d scheduler=%d activation_cache_enabled=%d activation_cache_hits=%lld misses=%lld weight_cache_builds=%lld hits=%lld misses=%lld bytes=%lld cache_lookup_ms=%.3f cache_crc_ms=%.3f weight_pack_ms=%.3f activation_scale_fp16_overflows=%lld contract_checks=%lld raw_mismatches=%lld raw_repairs=%lld value_mismatches=%lld contract_cpu_shadow_dst_values=%lld staging_restages=%lld q8_source_audit_checks=%lld q8_source_audit_failures=%lld",
+    LOGPROOF("cleanup complete fpga_calls=%lld vpu_runs=%lld rejects=%lld attention_cpu_bypass=%lld vocab_projection_cpu_bypass=%lld legacy_raw_cpu_bypass=%lld elapsed_s=%.3f pingpong_cap=%d descriptor_cap=%d scheduler=%d activation_cache_enabled=%d activation_cache_hits=%lld misses=%lld weight_cache_builds=%lld hits=%lld misses=%lld bytes=%lld cache_lookup_ms=%.3f cache_crc_ms=%.3f weight_pack_ms=%.3f activation_scale_fp16_overflows=%lld input_integrity_checks=%lld input_integrity_failures=%lld contract_checks=%lld contract_limit_cpu_bypass=%lld raw_mismatches=%lld raw_repairs=%lld value_mismatches=%lld contract_cpu_shadow_dst_values=%lld staging_restages=%lld q8_source_audit_checks=%lld q8_source_audit_failures=%lld",
          g_fpga_count,
          g_fpga_vpu_runs,
          g_reject_count,
@@ -5866,7 +6139,10 @@ void fpga_cleanup(void) {
          (double) g_weight_cache_crc_us / 1000.0,
          (double) g_weight_pack_us / 1000.0,
          g_activation_scale_fp16_overflows,
+         g_activation_input_integrity_checks,
+         g_activation_input_integrity_failures,
          g_contract_checks_done,
+         g_contract_limit_cpu_bypass_count,
          g_contract_raw_mismatches,
          g_contract_raw_repairs,
          g_contract_value_mismatches,
@@ -6035,6 +6311,30 @@ extern "C" int fpga_try_matmul_extended(
         }
     }
 
+    // `FPGA_CONTRACT_CHECK=N` used to stop only the comparison loop. The host
+    // still launched later raw VPU jobs, but returned CPU shadow for their
+    // destinations. That is neither a complete hardware qualification nor a
+    // CPU baseline, and it obscures the first source of a later non-finite
+    // activation. Make N a strict qualification boundary: the first N eligible
+    // GEMVs execute, stage, and validate on FPGA; all later eligible GEMVs use
+    // the upstream CPU kernel without being counted as FPGA unavailability or
+    // a production fallback.
+    if (q8_f32_f32_candidate && g_contract_cpu_shadow_dst &&
+        g_contract_check_limit > 0 &&
+        g_contract_checks_done >= (long long) g_contract_check_limit) {
+        if (ith == 0) {
+            pthread_mutex_lock(&g_mutex);
+            g_contract_limit_cpu_bypass_count++;
+            if (!g_contract_limit_cpu_bypass_logged) {
+                LOGPROOF("C0 qualification boundary reached checked=%lld limit=%d; subsequent eligible Q8 GEMVs use the native CPU kernel without ZDMA/VPU launch. This is an explicit bounded-C0 policy, not FPGA unavailability or a production fallback.",
+                         g_contract_checks_done, g_contract_check_limit);
+                g_contract_limit_cpu_bypass_logged = true;
+            }
+            pthread_mutex_unlock(&g_mutex);
+        }
+        return FPGA_MATMUL_NOT_HANDLED;
+    }
+
     if (should_bypass_vocab_projection_to_cpu(tensor_name, probe_k, probe_n, probe_m)) {
         if (ith == 0) {
             if (q8_f32_f32_candidate) {
@@ -6133,6 +6433,18 @@ extern "C" int fpga_try_matmul_extended(
     const int max_group_blocks = packed_q8_group_blocks_for_rows(first_tile_rows, (int) q8_blocks);
     const long long estimated_runs = estimate_vpu_runs(k, n, m);
     fpga_stage_totals_t totals = {};
+    const bool verify_activation_input = g_activation_input_integrity_check;
+    if (verify_activation_input) {
+        if (!fpga_capture_activation_input_snapshot(
+                src1, k, m, g_scratch.activation_input_snapshot)) {
+            LOGE("FPGA_INPUT_INTEGRITY_INTERNAL_ERROR tensor=%s layer=%d reason=snapshot_capture_failed K=%lld M=%lld",
+                 tensor_name, effective_layer_id, (long long) k, (long long) m);
+            pthread_mutex_unlock(&g_mutex);
+            fpga_fatal("FPGA activation-input integrity snapshot failed tensor=%s layer=%d; refusing CPU fallback",
+                       tensor_name, effective_layer_id);
+        }
+        g_activation_input_integrity_checks++;
+    }
 
     const long long t0 = now_us();
     if (should_log_detail_run(g_fpga_count)) {
@@ -6151,7 +6463,14 @@ extern "C" int fpga_try_matmul_extended(
                  estimated_runs);
     }
 
-    const bool hw_ok = fpga_hw_q8_0_matmul_dma_to_ip(src0, src1, dst, &totals, tensor_name, effective_layer_id);
+    bool hw_ok = fpga_hw_q8_0_matmul_dma_to_ip(src0, src1, dst, &totals, tensor_name, effective_layer_id);
+    if (hw_ok && verify_activation_input &&
+        !fpga_verify_activation_input_snapshot(
+            src1, dst, k, m, g_scratch.activation_input_snapshot,
+            tensor_name, effective_layer_id)) {
+        g_activation_input_integrity_failures++;
+        hw_ok = false;
+    }
     const long long t1 = now_us();
     if (!hw_ok) {
         const bool source_validation_failed = g_contract_source_validation_failed;
