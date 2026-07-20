@@ -27,7 +27,7 @@
 #include <vector>
 
 #define FPGA_LOG_FILE "/tmp/fpga_debug.log"
-#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v55-spu-scale-sequential-contract"
+#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v52-c0-bounded-integrity"
 
 #define MY_IP_BASE_ADDRESS 0x00000000A0000000LL
 #define REG_BASE_PHYS      0x00000000A0000000LL
@@ -576,12 +576,6 @@ static int                 g_profile_every = FPGA_DEFAULT_PROFILE_EVERY;
 static int                 g_ip_status_every = FPGA_DEFAULT_STATUS_EVERY;
 static int                 g_detail_every = FPGA_DEFAULT_DETAIL_EVERY;
 static int                 g_contract_check_limit = 0;
-// P2 has its own bounded contract.  It proves the VPU->SPU path before a
-// scaled result is permitted to own a live GGML destination.  This must not
-// be combined with C0: C0 proves raw VPU arithmetic while this contract proves
-// fixed-point scale/accumulate and SPU output ownership.
-static int                 g_spu_scale_contract_check_limit = 0;
-static double              g_spu_scale_contract_atol = 2.0e-3;
 static int                 g_contract_raw_retry_limit = 1;
 static int                 g_runtime_max_rows = VPU_SAFE_RUNTIME_ROWS;
 static int64_t             g_vocab_projection_min_n = 65536;
@@ -604,14 +598,6 @@ static long long           g_contract_staging_restage_count = 0;
 // turn a later CPU-side failure into misleading C0 evidence.
 static long long           g_contract_limit_cpu_bypass_count = 0;
 static bool                g_contract_limit_cpu_bypass_logged = false;
-static long long           g_spu_scale_contract_checks_done = 0;
-static long long           g_spu_scale_contract_limit_cpu_bypass_count = 0;
-static bool                g_spu_scale_contract_limit_cpu_bypass_logged = false;
-static long long           g_spu_scale_contract_tile_checks = 0;
-static long long           g_spu_scale_contract_raw_mismatches = 0;
-static long long           g_spu_scale_contract_value_mismatches = 0;
-static long long           g_spu_scale_contract_cpu_shadow_dst_values = 0;
-static bool                g_spu_scale_contract_cpu_shadow_dst = false;
 static long long           g_q8_source_audit_checks = 0;
 static long long           g_q8_source_audit_failures = 0;
 static long long           g_activation_input_integrity_checks = 0;
@@ -3779,14 +3765,7 @@ static bool fpga_contract_check_output_values(
         const std::vector<block_q8_0_t> & act_blocks_all,
         const void * weight_data_base,
         const char * tensor_name,
-        int layer_id,
-        bool cpu_shadow_dst,
-        double atol,
-        double rtol,
-        bool abort_on_mismatch,
-        const char * contract_tag,
-        long long * mismatch_total,
-        long long * shadow_value_total) {
+        int layer_id) {
     const int64_t k = src0->ne[0];
     const int64_t n = src0->ne[1];
     const int64_t m = dst->ne[1];
@@ -3796,9 +3775,9 @@ static bool fpga_contract_check_output_values(
     double max_abs = 0.0;
     double max_rel = 0.0;
     const size_t value_count = (size_t) n * (size_t) m;
+    const bool cpu_shadow_dst = g_contract_cpu_shadow_dst;
     if (cpu_shadow_dst && g_scratch.contract_actual.size() != value_count) {
-        LOGE("%s_CPU_SHADOW_LAYOUT tensor=%s layer=%d actual_values=%zu expected_values=%zu",
-             contract_tag,
+        LOGE("CONTRACT_CPU_SHADOW_LAYOUT tensor=%s layer=%d actual_values=%zu expected_values=%zu",
              tensor_name ? tensor_name : "?",
              layer_id,
              g_scratch.contract_actual.size(),
@@ -3821,8 +3800,7 @@ static bool fpga_contract_check_output_values(
 
             if (!std::isfinite(got) || !std::isfinite(expected)) {
                 if (bad < 4) {
-                    LOGE("%s_NONFINITE tensor=%s layer=%d row=%lld col=%lld got=%.9g expected=%.9g; matching NaN/Inf is a correctness failure",
-                         contract_tag,
+                    LOGE("CONTRACT_VALUE_NONFINITE tensor=%s layer=%d row=%lld col=%lld got=%.9g expected=%.9g; matching NaN/Inf is a correctness failure",
                          tensor_name ? tensor_name : "?",
                          layer_id,
                          (long long) row,
@@ -3841,10 +3819,9 @@ static bool fpga_contract_check_output_values(
             const double rel_err = abs_err / (std::fabs(expected) + 1.0e-12);
             max_abs = std::max(max_abs, abs_err);
             max_rel = std::max(max_rel, rel_err);
-            if (abs_err > atol && rel_err > rtol) {
+            if (abs_err > g_contract_atol && rel_err > g_contract_rtol) {
                 if (bad < 4) {
-                    LOGE("%s_MISMATCH tensor=%s layer=%d row=%lld col=%lld got=%.9g expected=%.9g abs=%.9g rel=%.9g",
-                         contract_tag,
+                    LOGE("CONTRACT_VALUE_MISMATCH tensor=%s layer=%d row=%lld col=%lld got=%.9g expected=%.9g abs=%.9g rel=%.9g",
                          tensor_name ? tensor_name : "?",
                          layer_id,
                          (long long) row,
@@ -3860,11 +3837,8 @@ static bool fpga_contract_check_output_values(
     }
 
     if (bad > 0) {
-        if (mismatch_total) {
-            *mismatch_total += bad;
-        }
-        LOGE("%s_SUMMARY tensor=%s layer=%d checked=%lld bad=%lld nonfinite=%lld max_abs=%.9g max_rel=%.9g atol=%.9g rtol=%.9g action=%s",
-             contract_tag,
+        g_contract_value_mismatches += bad;
+        LOGE("CONTRACT_VALUE_SUMMARY tensor=%s layer=%d checked=%lld bad=%lld nonfinite=%lld max_abs=%.9g max_rel=%.9g atol=%.9g rtol=%.9g action=%s",
              tensor_name ? tensor_name : "?",
              layer_id,
              (long long) (n * m),
@@ -3872,14 +3846,13 @@ static bool fpga_contract_check_output_values(
              nonfinite,
              max_abs,
              max_rel,
-             atol,
-             rtol,
-             abort_on_mismatch ? "abort" : "log_only");
-        return !abort_on_mismatch;
+             g_contract_atol,
+             g_contract_rtol,
+             g_contract_check_abort ? "abort" : "log_only");
+        return !g_contract_check_abort;
     }
 
-    LOGI("%s_PASS tensor=%s layer=%d checked=%lld nonfinite=0 max_abs=%.9g max_rel=%.9g reference=ggml_vec_dot_q8_0_q8_0",
-         contract_tag,
+    LOGI("CONTRACT_VALUE_PASS tensor=%s layer=%d checked=%lld nonfinite=0 max_abs=%.9g max_rel=%.9g reference=ggml_vec_dot_q8_0_q8_0",
          tensor_name ? tensor_name : "?",
          layer_id,
          (long long) (n * m),
@@ -3890,11 +3863,8 @@ static bool fpga_contract_check_output_values(
         // into its upstream threaded kernel.  Do not write dst here: doing so
         // would race that kernel and would replace its output with a second
         // implementation during a contract run.
-        if (shadow_value_total) {
-            *shadow_value_total += (long long) value_count;
-        }
-        LOGI("%s_CPU_SHADOW_DST tensor=%s layer=%d values=%zu hardware_result=validated native_ggml_dst=deferred purpose=contract_isolation_not_cpu_fallback",
-             contract_tag,
+        g_contract_cpu_shadow_dst_values += (long long) value_count;
+        LOGI("CONTRACT_CPU_SHADOW_DST tensor=%s layer=%d values=%zu hardware_result=validated native_ggml_dst=deferred purpose=contract_isolation_not_cpu_fallback",
              tensor_name ? tensor_name : "?",
              layer_id,
              value_count);
