@@ -1216,6 +1216,13 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 #ifdef USE_FPGA
 static int              g_fpga_initialized = 0;
 static pthread_once_t   g_fpga_once        = PTHREAD_ONCE_INIT;
+// A MUL_MAT node is entered by every GGML worker.  The FPGA host is a
+// single-owner operation, so thread 0 publishes one decision before any
+// optional fast path or native conversion can return.  Every worker consumes
+// that same decision before either returning an FPGA-owned destination or
+// entering the native kernel.  Do not let workers infer the C0 limit from
+// mutable host counters independently.
+static _Atomic int      g_fpga_mul_mat_route = FPGA_MATMUL_NOT_HANDLED;
 static void do_fpga_init(void) {
     if (fpga_init() == 0) {
         g_fpga_initialized = 1;
@@ -1269,17 +1276,29 @@ void ggml_compute_forward_mul_mat(
     // MY_IP/ZDMA/DDR and runs self-tests, which would invalidate the audit's
     // file-versus-process-memory isolation.
     const int fpga_source_audit_only = fpga_source_audit_only_requested();
-    if (!fpga_source_audit_only) {
+    if (ith == 0 && !fpga_source_audit_only) {
         pthread_once(&g_fpga_once, do_fpga_init);  // thread-safe
     }
+    ggml_barrier(params->threadpool);
+    const bool fpga_mul_mat_enabled = g_fpga_initialized || fpga_source_audit_only;
+    if (fpga_mul_mat_enabled) {
+        // The optional Llamafile path below may return before native F32->Q8
+        // conversion.  Select the route first, as the original hook did, but
+        // make thread 0 the only host caller and publish its result before any
+        // worker may take a different path for this MUL_MAT node.
+        if (ith == 0) {
+            const int layer_id = extract_layer_id_from_name(src0->name);
+            const int fpga_route = fpga_try_matmul_extended(
+                    src0, src1, dst, 0,
+                    layer_id,
+                    get_current_seq_pos(),
+                    0); // is_attention = 0
+            atomic_store_explicit(&g_fpga_mul_mat_route, fpga_route, memory_order_release);
+        }
+        ggml_barrier(params->threadpool);
 
-   if (g_fpga_initialized || fpga_source_audit_only) {
-        int layer_id = extract_layer_id_from_name(src0->name);
-        const int fpga_route = fpga_try_matmul_extended(
-                src0, src1, dst, ith,
-                layer_id,  // Which layer
-                get_current_seq_pos(),
-                0);       // is_attention = 0
+        const int fpga_route = atomic_load_explicit(
+                &g_fpga_mul_mat_route, memory_order_acquire);
         if (fpga_route == FPGA_MATMUL_FPGA_DST) {
             return;
         }

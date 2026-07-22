@@ -16,14 +16,18 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
-// C0 deliberately executes raw model GEMVs through ZDMA/VPU.  Validate the
+// C0 and P2 deliberately execute model GEMVs through ZDMA/VPU. Validate the
 // active GGUF during model loading first, so a malformed Q8 scale cannot waste
-// a long board run or be misdiagnosed as a transfer/IP failure.  This remains
-// opt-in at the runtime level: it is activated only by the existing C0 or
-// host-only source-audit environment modes.
+// a long board run or be misdiagnosed as a transfer/IP failure. This remains
+// opt-in at the runtime level: raw C0, P2 PL-scale, and source-audit modes.
 static bool llama_fpga_source_validation_required() {
     const char * const contract = std::getenv("FPGA_CONTRACT_CHECK");
     if (contract && std::strtol(contract, nullptr, 0) > 0) {
+        return true;
+    }
+
+    const char * const pl_scale_contract = std::getenv("FPGA_PL_SCALE_CONTRACT_CHECK");
+    if (pl_scale_contract && std::strtol(pl_scale_contract, nullptr, 0) > 0) {
         return true;
     }
 
@@ -502,7 +506,7 @@ llama_model_loader::llama_model_loader(
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p) {
     if (!check_tensors && llama_fpga_source_validation_required()) {
         check_tensors = true;
-        LLAMA_LOG_INFO("%s: enabling tensor validation for FPGA C0/source-audit before accelerator execution\n", __func__);
+        LLAMA_LOG_INFO("%s: enabling tensor validation for FPGA C0/P2/source-audit before accelerator execution\n", __func__);
     }
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
@@ -1184,10 +1188,10 @@ bool llama_model_loader::load_all_data(
     if (fpga_source_validation_required && size_done >= size_data) {
         // Reaching this point proves that all async ggml_validate_row_data()
         // futures completed, final progress was accepted, and the model load
-        // was not cancelled.  Tell the deferred C0 host that mapping
+        // was not cancelled. Tell the deferred qualification host that mapping
         // MY_IP/ZDMA is now safe for this process.
         fpga_mark_model_tensor_validation_passed();
-        LLAMA_LOG_INFO("%s: FPGA C0/source-audit tensor-validation handshake complete\n", __func__);
+        LLAMA_LOG_INFO("%s: FPGA C0/P2/source-audit tensor-validation handshake complete\n", __func__);
     }
 #endif
 

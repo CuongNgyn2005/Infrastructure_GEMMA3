@@ -27,7 +27,7 @@
 #include <vector>
 
 #define FPGA_LOG_FILE "/tmp/fpga_debug.log"
-#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v52-c0-bounded-integrity"
+#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v58-p2-tile-bounded-dma-trace"
 
 #define MY_IP_BASE_ADDRESS 0x00000000A0000000LL
 #define REG_BASE_PHYS      0x00000000A0000000LL
@@ -41,6 +41,43 @@
 
 static int g_log_flush_every = 256;
 static int g_log_pending_lines = 0;
+// P2 has a separate MY_IP/SPU ABI and its initialization must be observable
+// on the terminal even when the file log is unavailable or buffered.
+static bool g_p2_init_requested = false;
+// P2 contract qualification is deliberately tile-bounded.  The first
+// hardware tile has now completed on the owner board; the next tile is the
+// unproven boundary, so it must never be reached accidentally by a
+// one-matrix contract command.
+static int  g_p2_tile_limit = 0;
+static bool g_p2_allow_multitile = false;
+static bool g_p2_tile_contract_boundary_reached = false;
+static long long g_p2_tile_q16_checks = 0;
+static long long g_p2_matrix_contract_checks = 0;
+static bool g_p2_tile_trace_enabled = false;
+static uint32_t g_p2_trace_job_id = 0;
+static uint32_t g_p2_trace_tile_id = 0;
+static int      g_p2_trace_bank = -1;
+static unsigned long long g_p2_dma_transfer_sequence = 0;
+static std::string g_p2_trace_dma_tag;
+// Outside bounded P2 qualification, only the first model ACT transfer emits
+// the exhaustive terminal trace.  Qualification enables all-transfer trace
+// so the last retained terminal line identifies the exact unsafe boundary.
+static bool g_p2_first_act_dma_trace_active = false;
+static bool g_p2_first_act_dma_trace_done = false;
+
+static void fpga_p2_init_breadcrumb(const char * fmt, ...) {
+    if (!g_p2_init_requested) {
+        return;
+    }
+
+    fprintf(stderr, "[FPGA][P2_INIT] version=%s ", FPGA_HOST_TRACE_VERSION);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
 
 static FILE * fpga_log_fp(void) {
     static FILE * fp = nullptr;
@@ -57,6 +94,36 @@ static FILE * fpga_log_fp(void) {
         fflush(fp);
     }
     return fp;
+}
+
+static void fpga_p2_dma_breadcrumb(const char * fmt, ...) {
+    FILE * fp = fpga_log_fp();
+    fprintf(fp, "[FPGA][INFO] P2_ACT_DMA_TRACE ");
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(fp, fmt, ap);
+    va_end(ap);
+    if (g_p2_trace_job_id != 0U) {
+        fprintf(fp, " ctx_job=%u ctx_tile=%u ctx_bank=%d ctx_tag=%s ctx_dma_seq=%llu",
+                g_p2_trace_job_id, g_p2_trace_tile_id, g_p2_trace_bank,
+                g_p2_trace_dma_tag.empty() ? "none" : g_p2_trace_dma_tag.c_str(),
+                g_p2_dma_transfer_sequence);
+    }
+    fprintf(fp, "\n");
+    fflush(fp);
+
+    fprintf(stderr, "[FPGA][P2_ACT_DMA] ");
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    if (g_p2_trace_job_id != 0U) {
+        fprintf(stderr, " ctx_job=%u ctx_tile=%u ctx_bank=%d ctx_tag=%s ctx_dma_seq=%llu",
+                g_p2_trace_job_id, g_p2_trace_tile_id, g_p2_trace_bank,
+                g_p2_trace_dma_tag.empty() ? "none" : g_p2_trace_dma_tag.c_str(),
+                g_p2_dma_transfer_sequence);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
 }
 
 static unsigned long long fpga_ptr_addr(const volatile void * ptr) {
@@ -98,6 +165,7 @@ static void fpga_log_line(bool enabled, const char * tag, bool force_flush, cons
 
 static constexpr uint64_t VPU_BASE_PHYS      = MY_IP_BASE_ADDRESS;
 static constexpr size_t   DDR_DEV_MEM_MMAP   = 0x80000000;
+static constexpr double   P2_PL_SCALE_VALUE_ATOL = 0.002;
 
 static constexpr uint32_t REG_CTRL           = 0x00000000;
 static constexpr uint32_t REG_STATUS         = 0x00000010;
@@ -111,6 +179,10 @@ static constexpr uint32_t REG_PROGRESS       = 0x00000080;
 static constexpr uint32_t REG_CAPS           = 0x00000090;
 static constexpr uint32_t REG_STREAM_PROTOCOL_VERSION = 0x000000F4;
 static constexpr uint32_t REG_BITSTREAM_ID   = 0x000000F8;
+// FPGA_PL_SCALE_ENABLE is a distinct P2 ABI.  Do not infer it from the raw
+// VPU1/protocol1 identity: previous raw-compatible images did not guarantee
+// the SPU_PARAM/SPU_OUT packing or stream-finality contract.
+static constexpr uint32_t REG_P2_STREAM_ABI  = 0x000000FC;
 static constexpr uint32_t REG_BANK           = 0x00000100;
 static constexpr uint32_t REG_JOB_ID         = 0x00000110;
 static constexpr uint32_t REG_BANK_STAT      = 0x00000120;
@@ -131,6 +203,8 @@ static constexpr uint32_t REG_SPU_STREAM_OUT   = 0x000001D4;
 static constexpr uint32_t REG_SPU_STREAM_ERROR = 0x000001D8;
 static constexpr uint32_t REG_SPU_STREAM_LAST_JOB = 0x000001E8;
 static constexpr uint32_t REG_SPU_STREAM_LAST_BANK = 0x000001EC;
+static constexpr uint32_t REG_SPU_STREAM_STATUS = 0x000001F8;
+static constexpr uint32_t REG_SPU_CTRL       = 0x000000A0;
 
 static constexpr uint32_t CTRL_START         = 0x00000001;
 static constexpr uint32_t CTRL_CLEAR_DONE    = 0x00000002;
@@ -196,6 +270,14 @@ static constexpr uint32_t SPU_CAP_ROPE                   = 0x00000010;
 static constexpr uint32_t SPU_CAP_SOFTMAX                = 0x00000020;
 static constexpr uint32_t FPGA_REQUIRED_STREAM_PROTOCOL_VERSION = 1;
 static constexpr uint32_t FPGA_EXPECTED_BITSTREAM_ID = 0x56505531U; // "VPU1"
+// "P2", ABI v1.  It binds the following layout: SPU_PARAM=0x00380000
+// contains four {weight_scale_fp16,act_scale_fp16} entries per 128-bit word;
+// SPU_OUT=0x00340000 stores {q16.16_accum,row_id} per 128-bit row.
+static constexpr uint32_t FPGA_REQUIRED_P2_STREAM_ABI = 0x50320001U;
+static constexpr uint32_t SPU_STREAM_STATUS_QUIESCENT = 0x00000010U;
+static constexpr uint32_t SPU_CTRL_SOFT_RESET = 0x00000004U;
+static constexpr uint32_t P2_REQUIRED_SPU_WORD_CAPACITY =
+    (VPU_DEFAULT_ROWS * VPU_PACKED_Q8_MAX_BLOCKS + 3U) / 4U;
 
 static constexpr long long FPGA_DEFAULT_DMA_TIMEOUT_US = 5000000LL;
 static constexpr long long FPGA_DEFAULT_IP_TIMEOUT_US  = 5000000LL;
@@ -443,6 +525,20 @@ static volatile uint8_t *  g_vpu           = nullptr;
 static uint8_t *           g_ddr           = nullptr;
 static void *              g_dma_map_base  = nullptr;
 static void *              g_vpu_map_base  = nullptr;
+enum class fpga_mapping_kind : uint8_t {
+    UNKNOWN = 0,
+    UIO_PHYSICAL,
+    DEVMEM_PHYSICAL,
+};
+
+static const char * fpga_mapping_kind_name(fpga_mapping_kind kind) {
+    switch (kind) {
+        case fpga_mapping_kind::UIO_PHYSICAL:    return "uio_physical";
+        case fpga_mapping_kind::DEVMEM_PHYSICAL: return "devmem_physical";
+        default:                                 return "unknown";
+    }
+}
+
 static void *              g_ddr_map_base  = nullptr;
 static size_t              g_dma_map_size  = 0;
 static size_t              g_vpu_map_size  = 0;
@@ -452,6 +548,10 @@ static size_t              g_ddr_requested_map_size = DDR_REQUIRED_BYTES;
 static std::string         g_dma_map_source;
 static std::string         g_vpu_map_source;
 static std::string         g_ddr_map_source;
+// This is set by the mapper that created g_ddr, not inferred later from a
+// display string or the O_SYNC open flag.  P2's no-msync policy is legal only
+// for the bounded physical UIO mapping it has admitted.
+static fpga_mapping_kind   g_ddr_mapping_kind = fpga_mapping_kind::UNKNOWN;
 static pthread_mutex_t     g_mutex         = PTHREAD_MUTEX_INITIALIZER;
 static fpga_scratch_t      g_scratch;
 static std::vector<fpga_weight_cache_entry_t> g_weight_cache;
@@ -492,6 +592,9 @@ static int                 g_packed_q8_result_words = VPU_DEFAULT_ROWS;
 static bool                g_vpu_pingpong_supported = false;
 static bool                g_vpu_descriptor_supported = false;
 static bool                g_spu_q8_scale_stream_supported = false;
+static uint32_t            g_p2_stream_abi_signature = 0;
+static uint32_t            g_spu_stream_status = 0;
+static uint32_t            g_spu_word_capacity = 0;
 static bool                g_spu_silu_supported = false;
 static bool                g_spu_rmsnorm_supported = false;
 static bool                g_spu_rope_supported = false;
@@ -576,6 +679,9 @@ static int                 g_profile_every = FPGA_DEFAULT_PROFILE_EVERY;
 static int                 g_ip_status_every = FPGA_DEFAULT_STATUS_EVERY;
 static int                 g_detail_every = FPGA_DEFAULT_DETAIL_EVERY;
 static int                 g_contract_check_limit = 0;
+// P2 is deliberately independent from raw C0: it validates the canonical
+// VPU->SPU scale/accumulate ABI and never consumes the raw RESULT window.
+static int                 g_pl_scale_contract_check_limit = 0;
 static int                 g_contract_raw_retry_limit = 1;
 static int                 g_runtime_max_rows = VPU_SAFE_RUNTIME_ROWS;
 static int64_t             g_vocab_projection_min_n = 65536;
@@ -587,6 +693,11 @@ static double              g_fpga_clock_mhz = 0.0;
 static double              g_contract_atol = 1.0e-3;
 static double              g_contract_rtol = 1.0e-4;
 static long long           g_contract_checks_done = 0;
+static long long           g_pl_scale_contract_checks_done = 0;
+static long long           g_pl_scale_jobs = 0;
+static long long           g_pl_scale_banks = 0;
+static long long           g_pl_scale_stream_drops = 0;
+static long long           g_pl_scale_stream_errors = 0;
 static long long           g_contract_raw_mismatches = 0;
 static long long           g_contract_raw_repairs = 0;
 static long long           g_contract_value_mismatches = 0;
@@ -762,6 +873,7 @@ static void fpga_fatal(const char * fmt, ...) {
     va_end(ap);
     fprintf(stderr, "\n");
     fflush(stderr);
+    fpga_p2_init_breadcrumb("phase=failure reason=fpga_fatal");
     abort();
 }
 
@@ -779,14 +891,21 @@ static inline void mmio_fence(void) {
 
 extern "C" int fpga_source_audit_only_requested(void) {
     // ggml-cpu calls this before pthread_once(fpga_init), so it must not map
-    // MY_IP, ZDMA, or DDR high.
-    return env_flag_enabled("FPGA_SOURCE_AUDIT_ONLY") ? 1 : 0;
+    // MY_IP, ZDMA, or DDR high. A requested qualification takes precedence:
+    // the existing contract gate must defer initialization until validation,
+    // where fpga_init() rejects the mutually exclusive environment settings.
+    const bool qualification_requested =
+        env_int_value("FPGA_CONTRACT_CHECK", 0, 0, 1000000) > 0 ||
+        env_int_value("FPGA_PL_SCALE_CONTRACT_CHECK", 0, 0, 1000000) > 0;
+    return env_flag_enabled("FPGA_SOURCE_AUDIT_ONLY") && !qualification_requested ? 1 : 0;
 }
 
 extern "C" int fpga_contract_check_requested(void) {
-    // This query is called before fpga_init() by llama-cli.  It must not
-    // access MMIO, map memory, or change any persistent host state.
-    return env_int_value("FPGA_CONTRACT_CHECK", 0, 0, 1000000) > 0 ? 1 : 0;
+    // This query is called before fpga_init() by llama-cli. It deliberately
+    // covers both raw C0 and P2 because the existing frontend uses this
+    // board-free gate to defer initialization until loader validation passes.
+    return (env_int_value("FPGA_CONTRACT_CHECK", 0, 0, 1000000) > 0 ||
+            env_int_value("FPGA_PL_SCALE_CONTRACT_CHECK", 0, 0, 1000000) > 0) ? 1 : 0;
 }
 
 extern "C" void fpga_mark_model_tensor_validation_passed(void) {
@@ -865,6 +984,140 @@ static void vpu_write_tile_descriptor(const fpga_tile_job_t & job,
     vpu_wr32(REG_GROUP_BLOCKS, (uint32_t) job.group_blocks);
     vpu_wr32(REG_TOKEN_ID, (uint32_t) g_current_seq_pos);
     vpu_wr32(REG_DESC_FLAGS, flags);
+}
+
+struct fpga_p2_descriptor_words_t {
+    uint32_t bank;
+    uint32_t bank_stat;
+    uint32_t job_id;
+    uint32_t slot_state;
+    uint32_t tensor_id;
+    uint32_t row0;
+    uint32_t k_block0;
+    uint32_t group_blocks;
+    uint32_t token_id;
+    uint32_t desc_flags;
+};
+
+static void fpga_p2_descriptor_commit_breadcrumb_before(
+        const fpga_tile_job_t & job,
+        const fpga_p2_descriptor_words_t & expected) {
+    if (!g_p2_init_requested || job.tile_id != 0U) {
+        return;
+    }
+
+    FILE * fp = fpga_log_fp();
+    fprintf(fp, "[FPGA][INFO] P2_DESCRIPTOR_COMMIT edge=before job=%u bank=%d tile=%u expected bank_bits=0x%08x bank_stat_bits=0x%08x job_id=0x%08x slot_state=0x%08x tensor_id=0x%08x row0=0x%08x k_block0=0x%08x group_blocks=0x%08x token_id=0x%08x desc_flags=0x%08x actual=pending match=pending\n",
+            job.job_id, job.bank, job.tile_id,
+            expected.bank, expected.bank_stat, expected.job_id,
+            expected.slot_state, expected.tensor_id, expected.row0,
+            expected.k_block0, expected.group_blocks, expected.token_id,
+            expected.desc_flags);
+    fflush(fp);
+
+    fprintf(stderr, "[FPGA][P2_DESCRIPTOR] edge=before job=%u bank=%d tile=%u expected bank_bits=0x%08x bank_stat_bits=0x%08x job_id=0x%08x slot_state=0x%08x tensor_id=0x%08x row0=0x%08x k_block0=0x%08x group_blocks=0x%08x token_id=0x%08x desc_flags=0x%08x actual=pending match=pending\n",
+            job.job_id, job.bank, job.tile_id,
+            expected.bank, expected.bank_stat, expected.job_id,
+            expected.slot_state, expected.tensor_id, expected.row0,
+            expected.k_block0, expected.group_blocks, expected.token_id,
+            expected.desc_flags);
+    fflush(stderr);
+}
+
+static void fpga_p2_descriptor_commit_breadcrumb_after(
+        const fpga_tile_job_t & job,
+        const fpga_p2_descriptor_words_t & expected,
+        const fpga_p2_descriptor_words_t & actual,
+        bool match) {
+    if (!g_p2_init_requested || job.tile_id != 0U) {
+        return;
+    }
+
+    FILE * fp = fpga_log_fp();
+    fprintf(fp, "[FPGA][INFO] P2_DESCRIPTOR_COMMIT edge=after job=%u bank=%d tile=%u expected bank_bits=0x%08x bank_stat_bits=0x%08x job_id=0x%08x slot_state=0x%08x tensor_id=0x%08x row0=0x%08x k_block0=0x%08x group_blocks=0x%08x token_id=0x%08x desc_flags=0x%08x actual bank=0x%08x bank_stat=0x%08x job_id=0x%08x slot_state=0x%08x tensor_id=0x%08x row0=0x%08x k_block0=0x%08x group_blocks=0x%08x token_id=0x%08x desc_flags=0x%08x match=%d\n",
+            job.job_id, job.bank, job.tile_id,
+            expected.bank, expected.bank_stat, expected.job_id,
+            expected.slot_state, expected.tensor_id, expected.row0,
+            expected.k_block0, expected.group_blocks, expected.token_id,
+            expected.desc_flags, actual.bank, actual.bank_stat,
+            actual.job_id, actual.slot_state, actual.tensor_id, actual.row0,
+            actual.k_block0, actual.group_blocks, actual.token_id,
+            actual.desc_flags, match ? 1 : 0);
+    fflush(fp);
+
+    fprintf(stderr, "[FPGA][P2_DESCRIPTOR] edge=after job=%u bank=%d tile=%u expected bank_bits=0x%08x bank_stat_bits=0x%08x job_id=0x%08x slot_state=0x%08x tensor_id=0x%08x row0=0x%08x k_block0=0x%08x group_blocks=0x%08x token_id=0x%08x desc_flags=0x%08x actual bank=0x%08x bank_stat=0x%08x job_id=0x%08x slot_state=0x%08x tensor_id=0x%08x row0=0x%08x k_block0=0x%08x group_blocks=0x%08x token_id=0x%08x desc_flags=0x%08x match=%d\n",
+            job.job_id, job.bank, job.tile_id,
+            expected.bank, expected.bank_stat, expected.job_id,
+            expected.slot_state, expected.tensor_id, expected.row0,
+            expected.k_block0, expected.group_blocks, expected.token_id,
+            expected.desc_flags, actual.bank, actual.bank_stat,
+            actual.job_id, actual.slot_state, actual.tensor_id, actual.row0,
+            actual.k_block0, actual.group_blocks, actual.token_id,
+            actual.desc_flags, match ? 1 : 0);
+    fflush(stderr);
+}
+
+static bool fpga_commit_p2_dma_filling_descriptor(const fpga_tile_job_t & job) {
+    if (!g_p2_init_requested) {
+        return true;
+    }
+
+    const uint32_t bank = (uint32_t) (job.bank & 1);
+    const uint32_t expected_bank = bank | (bank << 1);
+    const fpga_p2_descriptor_words_t expected = {
+        expected_bank,
+        expected_bank,
+        job.job_id,
+        fpga_slot_state_word(job.bank, FPGA_SLOT_DMA_FILLING, FPGA_SLOT_FREE),
+        job.tensor_id,
+        (uint32_t) job.row0,
+        (uint32_t) job.k_block0,
+        (uint32_t) job.group_blocks,
+        (uint32_t) g_current_seq_pos,
+        0x00000101U,
+    };
+    fpga_p2_descriptor_commit_breadcrumb_before(job, expected);
+
+    // Commit all posted MY_IP descriptor/bank writes before reading back the
+    // exact final DMA_FILLING state that owns the upcoming ACT transfer.
+    mmio_fence();
+    const fpga_p2_descriptor_words_t actual = {
+        vpu_rd32(REG_BANK),
+        vpu_rd32(REG_BANK_STAT),
+        vpu_rd32(REG_JOB_ID),
+        vpu_rd32(REG_SLOT_STATE),
+        vpu_rd32(REG_TENSOR_ID),
+        vpu_rd32(REG_ROW0),
+        vpu_rd32(REG_K_BLOCK0),
+        vpu_rd32(REG_GROUP_BLOCKS),
+        vpu_rd32(REG_TOKEN_ID),
+        vpu_rd32(REG_DESC_FLAGS),
+    };
+    const bool match =
+        (actual.bank & 0x3U) == expected.bank &&
+        (actual.bank_stat & 0x3U) == expected.bank_stat &&
+        actual.job_id == expected.job_id &&
+        actual.slot_state == expected.slot_state &&
+        actual.tensor_id == expected.tensor_id &&
+        actual.row0 == expected.row0 &&
+        actual.k_block0 == expected.k_block0 &&
+        actual.group_blocks == expected.group_blocks &&
+        actual.token_id == expected.token_id &&
+        actual.desc_flags == expected.desc_flags;
+    fpga_p2_descriptor_commit_breadcrumb_after(job, expected, actual, match);
+    if (!match) {
+        LOGE("P2 descriptor commit mismatch job=%u bank=%d tile=%u expected bank_bits=0x%08x bank_stat_bits=0x%08x job_id=0x%08x slot_state=0x%08x tensor_id=0x%08x row0=0x%08x k_block0=0x%08x group_blocks=0x%08x token_id=0x%08x desc_flags=0x%08x actual bank=0x%08x bank_stat=0x%08x job_id=0x%08x slot_state=0x%08x tensor_id=0x%08x row0=0x%08x k_block0=0x%08x group_blocks=0x%08x token_id=0x%08x desc_flags=0x%08x action=abort_before_act_dma no_retry=1 no_reset=1 no_fallback=1",
+             job.job_id, job.bank, job.tile_id,
+             expected.bank, expected.bank_stat, expected.job_id,
+             expected.slot_state, expected.tensor_id, expected.row0,
+             expected.k_block0, expected.group_blocks, expected.token_id,
+             expected.desc_flags, actual.bank, actual.bank_stat,
+             actual.job_id, actual.slot_state, actual.tensor_id, actual.row0,
+             actual.k_block0, actual.group_blocks, actual.token_id,
+             actual.desc_flags);
+        return false;
+    }
+    return true;
 }
 
 static bool vpu_verify_done_job(const fpga_tile_job_t & job, uint32_t status) {
@@ -1351,7 +1604,8 @@ static bool map_uio_region(
         void ** map_base,
         size_t * map_size,
         size_t * advertised_size,
-        std::string * source) {
+        std::string * source,
+        fpga_mapping_kind * mapping_kind) {
     std::string dev_path;
     std::string resolved_name;
     size_t uio_size = 0;
@@ -1424,6 +1678,9 @@ static bool map_uio_region(
     if (advertised_size) {
         *advertised_size = uio_size;
     }
+    if (mapping_kind) {
+        *mapping_kind = fpga_mapping_kind::UIO_PHYSICAL;
+    }
     *source = dev_path + "(" + resolved_name + ",O_SYNC)";
     LOGINIT("mapped %s via UIO expected_name=%s resolved_name=%s dev=%s phys=0x%llx virt=%p mapped_size=0x%zx advertised_size=0x%zx",
             tag, uio_name, resolved_name.c_str(), dev_path.c_str(),
@@ -1461,7 +1718,8 @@ static bool map_devmem_region(
         const char * tag,
         void ** map_base,
         size_t * map_size,
-        std::string * source) {
+        std::string * source,
+        fpga_mapping_kind * mapping_kind) {
     if (!ensure_mem_fd()) {
         return false;
     }
@@ -1474,6 +1732,9 @@ static bool map_devmem_region(
     *map_base = ptr;
     *map_size = bytes;
     *source = "/dev/mem(O_SYNC)";
+    if (mapping_kind) {
+        *mapping_kind = fpga_mapping_kind::DEVMEM_PHYSICAL;
+    }
     LOGINIT("mapped %s via /dev/mem phys=0x%llx virt=%p size=0x%zx",
             tag, (unsigned long long) phys, ptr, bytes);
     return true;
@@ -1492,9 +1753,10 @@ static bool map_region_prefer_uio(
         void ** map_base,
         size_t * map_size,
         size_t * advertised_size,
-        std::string * source) {
+        std::string * source,
+        fpga_mapping_kind * mapping_kind) {
     if (map_uio_region(uio_name, env_name, phys, required_size, tag, requested_map_size,
-                       map_base, map_size, advertised_size, source)) {
+                       map_base, map_size, advertised_size, source, mapping_kind)) {
         return true;
     }
     if (!allow_devmem_fallback) {
@@ -1511,7 +1773,8 @@ static bool map_region_prefer_uio(
              tag);
     }
     const size_t actual_map_size = requested_map_size == 0 ? devmem_size : requested_map_size;
-    const bool ok = map_devmem_region(phys, actual_map_size, tag, map_base, map_size, source);
+    const bool ok = map_devmem_region(phys, actual_map_size, tag, map_base, map_size, source,
+                                      mapping_kind);
     if (ok && advertised_size) {
         *advertised_size = actual_map_size;
     }
@@ -1519,35 +1782,51 @@ static bool map_region_prefer_uio(
 }
 
 static bool map_registers_dma_ddr(void) {
+    fpga_p2_init_breadcrumb("phase=mapping_zdma begin policy=uio_only");
     if (!map_region_prefer_uio("dma-controller", "FPGA_DMA_UIO", DMA_BASE_PHYS, DMA_MMAP_SIZE,
                                sizeof(dma_ctrl), "ZDMA", 0,
                                g_allow_devmem_fallback, "uio_required", &g_dma_map_base,
-                               &g_dma_map_size, nullptr, &g_dma_map_source)) {
+                               &g_dma_map_size, nullptr, &g_dma_map_source, nullptr)) {
         return false;
     }
     g_dma = (volatile dma_ctrl *) g_dma_map_base;
+    fpga_p2_init_breadcrumb("phase=mapping_zdma pass source=%s size=0x%zx",
+                            g_dma_map_source.c_str(), g_dma_map_size);
 
     // A MY_IP UIO resource can advertise the entire Vivado segment.  This
     // driver uses only the established 4 MiB register/local-memory ABI, so
     // never turn an advertised UIO size into a larger process mapping.
+    fpga_p2_init_breadcrumb("phase=mapping_my_ip begin required_phys=0x%llx required_offset=0 required_size=0x%zx policy=uio_only",
+                            (unsigned long long) REG_BASE_PHYS,
+                            VPU_DEVMEM_COMPAT_MMAP);
     if (!map_region_prefer_uio("MY_IP", "FPGA_VPU_UIO", REG_BASE_PHYS, VPU_DEVMEM_COMPAT_MMAP,
                                VPU_DEVMEM_COMPAT_MMAP, "MY_IP/VPU", VPU_DEVMEM_COMPAT_MMAP,
                                g_allow_devmem_fallback || g_allow_vpu_devmem_compat,
                                g_allow_devmem_fallback ? "diagnostic_all_resources" : "vpu_devmem_compat",
                                &g_vpu_map_base,
-                               &g_vpu_map_size, nullptr, &g_vpu_map_source)) {
+                               &g_vpu_map_size, nullptr, &g_vpu_map_source, nullptr)) {
         return false;
     }
     g_vpu = (volatile uint8_t *) g_vpu_map_base;
+    fpga_p2_init_breadcrumb("phase=mapping_my_ip pass source=%s phys=0x%llx offset=0 size=0x%zx",
+                            g_vpu_map_source.c_str(),
+                            (unsigned long long) REG_BASE_PHYS,
+                            g_vpu_map_size);
 
+    fpga_p2_init_breadcrumb("phase=mapping_ddr begin policy=uio_only required_size=0x%zx",
+                            DDR_REQUIRED_BYTES);
+    g_ddr_mapping_kind = fpga_mapping_kind::UNKNOWN;
     if (!map_region_prefer_uio("ddr_high", "FPGA_DDR_UIO", DDR_BASE_PHYS, DDR_DEV_MEM_MMAP,
                                DDR_REQUIRED_BYTES, "ddr_high", g_ddr_requested_map_size,
                                g_allow_devmem_fallback, "uio_required",
                                &g_ddr_map_base, &g_ddr_map_size, &g_ddr_advertised_size,
-                               &g_ddr_map_source)) {
+                               &g_ddr_map_source, &g_ddr_mapping_kind)) {
         return false;
     }
     g_ddr = (uint8_t *) g_ddr_map_base;
+    fpga_p2_init_breadcrumb("phase=mapping_ddr pass source=%s map_kind=%s size=0x%zx",
+                            g_ddr_map_source.c_str(),
+                            fpga_mapping_kind_name(g_ddr_mapping_kind), g_ddr_map_size);
     return true;
 }
 
@@ -1699,6 +1978,82 @@ static bool msync_ddr_range(uint32_t off, size_t bytes, bool invalidate, const c
     return true;
 }
 
+// Defined with the staging helpers below.  P2 uses this exact bounded
+// first/last-word readback after CPU writes to a physical UIO DDR aperture.
+static void fpga_ddr_staging_readback_commit(uint32_t off, size_t bytes);
+
+static bool p2_uio_ddr_mapping_active(void) {
+    return g_p2_init_requested &&
+           g_ddr_mapping_kind == fpga_mapping_kind::UIO_PHYSICAL;
+}
+
+static bool p2_msync_or_stress_requested(void) {
+    return g_strict_coherency || g_run_coherency_stress ||
+           env_flag_enabled("FPGA_STRICT_MSYNC") ||
+           env_flag_enabled("FPGA_COHERENCY_STRESS");
+}
+
+static void fpga_p2_ddr_sync_breadcrumb(
+        const char * tag,
+        const char * direction,
+        uint32_t off,
+        size_t bytes,
+        const char * ordering) {
+    LOGPROOF("P2_DDR_SYNC tag=%s direction=%s offset=0x%08x bytes=%zu map_kind=%s action=no_msync ordering=%s",
+             tag ? tag : "?", direction, off, bytes,
+             fpga_mapping_kind_name(g_ddr_mapping_kind), ordering);
+    // Qualification is deliberately bounded.  Mirror each P2 physical-DDR
+    // handoff to stderr so a board lockup cannot hide the final ordering edge.
+    if (g_p2_first_act_dma_trace_active || g_pl_scale_contract_check_limit > 0) {
+        fpga_p2_dma_breadcrumb("step=ddr_sync tag=%s direction=%s offset=0x%08x bytes=%zu map_kind=%s action=no_msync ordering=%s",
+                               tag ? tag : "?", direction, off, bytes,
+                               fpga_mapping_kind_name(g_ddr_mapping_kind), ordering);
+    }
+}
+
+// `msync()` is a file-backed writeback primitive, not a DMA-coherency
+// primitive for the physical pages exposed by generic-uio.  The owner trace
+// proves this syscall can hang before the first ZDMA descriptor is touched.
+// P2 admits only the explicit UIO mapping class and uses a bounded volatile
+// readback plus DSB for CPU-to-device, or a DSB before CPU consumption after a
+// completed device-to-CPU transfer.  Raw v52/C0 continues through the legacy
+// msync path unchanged.
+static bool fpga_p2_ddr_sync(
+        uint32_t off,
+        size_t bytes,
+        bool device_to_cpu,
+        const char * tag) {
+    if (!g_p2_init_requested) {
+        return msync_ddr_range(off, bytes, device_to_cpu, tag);
+    }
+    if (!ddr_range_fits(off, bytes)) {
+        LOGE("P2 DDR sync range overflow tag=%s off=0x%08x bytes=%zu mapped_size=0x%zx",
+             tag ? tag : "?", off, bytes, g_ddr_map_size);
+        return false;
+    }
+    if (!p2_uio_ddr_mapping_active()) {
+        LOGE("P2 DDR sync requires an explicit physical UIO ddr_high mapping tag=%s map_kind=%s; refusing before data-plane transfer",
+             tag ? tag : "?", fpga_mapping_kind_name(g_ddr_mapping_kind));
+        return false;
+    }
+    if (p2_msync_or_stress_requested()) {
+        LOGE("P2 rejects FPGA_STRICT_COHERENCY/FPGA_STRICT_MSYNC/FPGA_COHERENCY_STRESS for physical UIO ddr_high tag=%s; no msync syscall or data-plane transfer was issued",
+             tag ? tag : "?");
+        return false;
+    }
+
+    if (device_to_cpu) {
+        mmio_fence();
+        fpga_p2_ddr_sync_breadcrumb(tag, "device_to_cpu", off, bytes,
+                                    "dsb_before_cpu_read");
+    } else {
+        fpga_ddr_staging_readback_commit(off, bytes);
+        fpga_p2_ddr_sync_breadcrumb(tag, "cpu_to_device", off, bytes,
+                                    "dsb_readback");
+    }
+    return true;
+}
+
 static bool phys_to_ddr_offset(uint64_t phys, size_t bytes, uint32_t * off) {
     if (!off || bytes == 0U || phys < DDR_BASE_PHYS) {
         return false;
@@ -1840,6 +2195,29 @@ static void zdma_clear_descriptors(void) {
     g_dma->ZDMA_CH_SRC_START_MSB  = 0;
     g_dma->ZDMA_CH_DST_START_LSB  = 0;
     g_dma->ZDMA_CH_DST_START_MSB  = 0;
+}
+
+// P2 must not take ownership of a channel left live by another owner/process.
+// This is intentionally read-only and must run before fpga_dma_init() writes
+// controller state, descriptors, W1C registers, or CTRL2.
+static bool p2_zdma_preinit_passive_gate(void) {
+    if (!dma_is_mapped()) {
+        LOGE("P2 pre-init ZDMA gate has no mapped channel");
+        return false;
+    }
+
+    const uint32_t ctrl2 = g_dma->ZDMA_CH_CTRL2;
+    const uint32_t status = g_dma->ZDMA_CH_STATUS;
+    const uint32_t isr = g_dma->ZDMA_CH_ISR;
+    const uint32_t total = g_dma->ZDMA_CH_TOTAL_BYTE;
+    LOGPROOF("P2_ZDMA_PREINIT passive=1 ctrl2=0x%08x status=0x%08x isr=0x%08x total_bytes=0x%08x en=%d action=%s",
+             ctrl2, status, isr, total, (ctrl2 & ZDMA_CTRL2_EN) != 0U ? 1 : 0,
+             (ctrl2 & ZDMA_CTRL2_EN) != 0U ? "fail_closed_no_write" : "init_permitted");
+    fpga_p2_init_breadcrumb("phase=zdma_preinit ctrl2=0x%08x status=0x%08x isr=0x%08x total_bytes=0x%08x en=%d action=%s",
+                            ctrl2, status, isr, total,
+                            (ctrl2 & ZDMA_CTRL2_EN) != 0U ? 1 : 0,
+                            (ctrl2 & ZDMA_CTRL2_EN) != 0U ? "fail_closed_no_write" : "init_permitted");
+    return (ctrl2 & ZDMA_CTRL2_EN) == 0U;
 }
 
 static bool fpga_dma_init(void) {
@@ -2134,6 +2512,60 @@ static void fpga_dma_trace_dump(
          failed_transfer_tag ? failed_transfer_tag : "none");
 }
 
+// P2 uses descriptor/bank ownership as part of its ABI.  Read back exactly
+// the descriptor words just committed; a mismatch is a controller/mapping
+// contract failure, not something a CPU route may conceal.
+static bool p2_zdma_verify_descriptor_commit(
+        uint64_t src_phys,
+        uint64_t dst_phys,
+        size_t bytes,
+        uint32_t pre_status,
+        uint32_t pre_isr,
+        uint32_t pre_ctrl2,
+        uint32_t pre_total,
+        bool first_act_detail) {
+    mmio_fence();
+    const uint32_t src0 = g_dma->ZDMA_CH_SRC_DSCR_WORD0;
+    const uint32_t src1 = g_dma->ZDMA_CH_SRC_DSCR_WORD1;
+    const uint32_t src2 = g_dma->ZDMA_CH_SRC_DSCR_WORD2;
+    const uint32_t src3 = g_dma->ZDMA_CH_SRC_DSCR_WORD3;
+    const uint32_t dst0 = g_dma->ZDMA_CH_DST_DSCR_WORD0;
+    const uint32_t dst1 = g_dma->ZDMA_CH_DST_DSCR_WORD1;
+    const uint32_t dst2 = g_dma->ZDMA_CH_DST_DSCR_WORD2;
+    const uint32_t dst3 = g_dma->ZDMA_CH_DST_DSCR_WORD3;
+    const uint32_t bank_stat = vpu_is_mapped() ? vpu_rd32(REG_BANK_STAT) : 0xFFFFFFFFU;
+    const bool matches =
+        src0 == (uint32_t) src_phys &&
+        src1 == (uint32_t) (src_phys >> 32) &&
+        src2 == (uint32_t) bytes &&
+        src3 == 0U &&
+        dst0 == (uint32_t) dst_phys &&
+        dst1 == (uint32_t) (dst_phys >> 32) &&
+        dst2 == (uint32_t) bytes &&
+        dst3 == 0U;
+    if (first_act_detail) {
+        fpga_p2_dma_breadcrumb("step=descriptor_commit src=0x%llx dst=0x%llx bytes=%zu pre_status=0x%08x pre_isr=0x%08x pre_ctrl2=0x%08x pre_total=0x%08x src_desc=[0x%08x,0x%08x,0x%08x,0x%08x] dst_desc=[0x%08x,0x%08x,0x%08x,0x%08x] bank_stat=0x%08x match=%d",
+                                 (unsigned long long) src_phys,
+                                 (unsigned long long) dst_phys,
+                                 bytes,
+                                 pre_status, pre_isr, pre_ctrl2, pre_total,
+                                 src0, src1, src2, src3,
+                                 dst0, dst1, dst2, dst3,
+                                 bank_stat, matches ? 1 : 0);
+    }
+    if (!matches) {
+        LOGE("P2 ZDMA descriptor readback mismatch src=0x%llx dst=0x%llx bytes=%zu src_desc=[0x%08x,0x%08x,0x%08x,0x%08x] dst_desc=[0x%08x,0x%08x,0x%08x,0x%08x] bank_stat=0x%08x",
+             (unsigned long long) src_phys,
+             (unsigned long long) dst_phys,
+             bytes,
+             src0, src1, src2, src3,
+             dst0, dst1, dst2, dst3,
+             bank_stat);
+        return false;
+    }
+    return true;
+}
+
 static bool fpga_dma_copy_one(uint64_t src_phys, uint64_t dst_phys, size_t bytes, const char * tag) {
     if (!dma_is_mapped()) {
         LOGE("ZDMA is not mapped for tag=%s", tag ? tag : "?");
@@ -2144,23 +2576,87 @@ static bool fpga_dma_copy_one(uint64_t src_phys, uint64_t dst_phys, size_t bytes
         return false;
     }
 
+    const bool p2_descriptor_commit = g_p2_init_requested;
+    // A qualification must show every transfer edge, including each split
+    // WEIGHT descriptor.  Outside qualification the existing first-ACT trace
+    // remains the only detailed P2 path.
+    const bool p2_transfer_detail = g_p2_init_requested &&
+        (g_p2_tile_trace_enabled ||
+         (g_p2_first_act_dma_trace_active && tag != nullptr && strcmp(tag, "ACT") == 0));
+    if (p2_transfer_detail) {
+        ++g_p2_dma_transfer_sequence;
+        g_p2_trace_dma_tag = tag ? tag : "?";
+        fpga_p2_dma_breadcrumb("step=entry src=0x%llx dst=0x%llx bytes=%zu",
+                               (unsigned long long) src_phys,
+                               (unsigned long long) dst_phys,
+                               bytes);
+        fpga_p2_dma_breadcrumb("step=channel_disabled_gate edge=before ctrl2=0x%08x status=0x%08x isr=0x%08x total_bytes=0x%08x",
+                               g_dma->ZDMA_CH_CTRL2,
+                               g_dma->ZDMA_CH_STATUS,
+                               g_dma->ZDMA_CH_ISR,
+                               g_dma->ZDMA_CH_TOTAL_BYTE);
+    }
+
     // Never rewrite descriptors until the preceding transfer's hardware EN
     // bit is clear.  STATUS is retained for diagnostics only; it is not a
     // sufficient ownership/completion gate.
     if (!zdma_wait_channel_disabled(tag, "before_descriptor")) {
+        if (p2_transfer_detail) {
+            fpga_p2_dma_breadcrumb("step=channel_disabled_gate edge=fail ctrl2=0x%08x status=0x%08x isr=0x%08x total_bytes=0x%08x",
+                                   g_dma->ZDMA_CH_CTRL2,
+                                   g_dma->ZDMA_CH_STATUS,
+                                   g_dma->ZDMA_CH_ISR,
+                                   g_dma->ZDMA_CH_TOTAL_BYTE);
+        }
         return false;
     }
+    if (p2_transfer_detail) {
+        fpga_p2_dma_breadcrumb("step=channel_disabled_gate edge=after ctrl2=0x%08x status=0x%08x isr=0x%08x total_bytes=0x%08x",
+                               g_dma->ZDMA_CH_CTRL2,
+                               g_dma->ZDMA_CH_STATUS,
+                               g_dma->ZDMA_CH_ISR,
+                               g_dma->ZDMA_CH_TOTAL_BYTE);
+    }
     const uint32_t total_bytes_before_clear = zdma_total_byte_clear();
+    if (p2_transfer_detail) {
+        fpga_p2_dma_breadcrumb("step=total_clear w1c_value=0x%08x total_bytes_after=0x%08x",
+                               total_bytes_before_clear,
+                               g_dma->ZDMA_CH_TOTAL_BYTE);
+    }
 
     uint32_t src_ddr_off = 0;
     if (phys_to_ddr_offset(src_phys, bytes, &src_ddr_off)) {
-        if (!msync_ddr_range(src_ddr_off, bytes, false, tag)) {
+        if (p2_transfer_detail) {
+            fpga_p2_dma_breadcrumb("step=source_sync edge=before tag=%s direction=cpu_to_device offset=0x%08x bytes=%zu map_kind=%s action=no_msync ordering=dsb_readback",
+                                   tag ? tag : "?", src_ddr_off, bytes,
+                                   fpga_mapping_kind_name(g_ddr_mapping_kind));
+        }
+        if (!fpga_p2_ddr_sync(src_ddr_off, bytes, false, tag)) {
+            if (p2_transfer_detail) {
+                fpga_p2_dma_breadcrumb("step=source_sync edge=fail tag=%s direction=cpu_to_device offset=0x%08x bytes=%zu map_kind=%s action=no_msync ordering=dsb_readback",
+                                       tag ? tag : "?", src_ddr_off, bytes,
+                                       fpga_mapping_kind_name(g_ddr_mapping_kind));
+            }
             return false;
+        }
+        if (p2_transfer_detail) {
+            fpga_p2_dma_breadcrumb("step=source_sync edge=after tag=%s direction=cpu_to_device offset=0x%08x bytes=%zu map_kind=%s action=no_msync ordering=dsb_readback",
+                                   tag ? tag : "?", src_ddr_off, bytes,
+                                   fpga_mapping_kind_name(g_ddr_mapping_kind));
         }
     }
 
+    const uint32_t isr_before_clear = p2_transfer_detail ? g_dma->ZDMA_CH_ISR : 0U;
     if (!zdma_clear_isr_for_new_transfer(tag)) {
+        if (p2_transfer_detail) {
+            fpga_p2_dma_breadcrumb("step=isr_w1c_ack edge=fail isr_before=0x%08x write_mask=0x%08x isr_after=0x%08x",
+                                   isr_before_clear, ZDMA_ISR_CLEAR_ALL, g_dma->ZDMA_CH_ISR);
+        }
         return false;
+    }
+    if (p2_transfer_detail) {
+        fpga_p2_dma_breadcrumb("step=isr_w1c_ack isr_before=0x%08x write_mask=0x%08x isr_after=0x%08x",
+                               isr_before_clear, ZDMA_ISR_CLEAR_ALL, g_dma->ZDMA_CH_ISR);
     }
     zdma_set_addr(&g_dma->ZDMA_CH_SRC_DSCR_WORD0, &g_dma->ZDMA_CH_SRC_DSCR_WORD1, src_phys);
     g_dma->ZDMA_CH_SRC_DSCR_WORD2 = (U32) bytes;
@@ -2173,15 +2669,19 @@ static bool fpga_dma_copy_one(uint64_t src_phys, uint64_t dst_phys, size_t bytes
     g_dma->ZDMA_CH_DST_DSCR_WORD3 = 0U;
     mmio_fence();
 
-    uint32_t pre_status = 0;
-    uint32_t pre_isr = 0;
-    uint32_t pre_ctrl2 = 0;
+    uint32_t pre_status = g_dma_trace_enabled || p2_descriptor_commit ? g_dma->ZDMA_CH_STATUS : 0U;
+    uint32_t pre_isr = g_dma_trace_enabled || p2_descriptor_commit ? g_dma->ZDMA_CH_ISR : 0U;
+    uint32_t pre_ctrl2 = g_dma_trace_enabled || p2_descriptor_commit ? g_dma->ZDMA_CH_CTRL2 : 0U;
     uint32_t pre_vpu_status = 0;
     uint32_t pre_vpu_progress = 0;
+    if (p2_descriptor_commit &&
+        !p2_zdma_verify_descriptor_commit(src_phys, dst_phys, bytes,
+                                           pre_status, pre_isr, pre_ctrl2,
+                                           total_bytes_before_clear,
+                                           p2_transfer_detail)) {
+        return false;
+    }
     if (g_dma_trace_enabled) {
-        pre_status = g_dma->ZDMA_CH_STATUS;
-        pre_isr = g_dma->ZDMA_CH_ISR;
-        pre_ctrl2 = g_dma->ZDMA_CH_CTRL2;
         if (vpu_is_mapped()) {
             pre_vpu_status = vpu_rd32(REG_STATUS);
             pre_vpu_progress = vpu_rd32(REG_PROGRESS);
@@ -2189,14 +2689,29 @@ static bool fpga_dma_copy_one(uint64_t src_phys, uint64_t dst_phys, size_t bytes
     }
 
     const long long t0 = now_us();
+    if (p2_transfer_detail) {
+        fpga_p2_dma_breadcrumb("step=ctrl2_start edge=before ctrl2=0x%08x",
+                               g_dma->ZDMA_CH_CTRL2);
+    }
     g_dma->ZDMA_CH_CTRL2 = ZDMA_CTRL2_START;
     mmio_fence();
+    if (p2_transfer_detail) {
+        fpga_p2_dma_breadcrumb("step=ctrl2_start edge=after_write_fence ctrl2=0x%08x",
+                               g_dma->ZDMA_CH_CTRL2);
+    }
 
     zdma_completion_info_t completion = {};
     if (!zdma_wait_transfer_complete(tag, &completion)) {
         const uint32_t total_bytes_after_transfer = g_dma->ZDMA_CH_TOTAL_BYTE;
         const uint32_t post_vpu_status = vpu_is_mapped() ? vpu_rd32(REG_STATUS) : 0U;
         const uint32_t post_vpu_progress = vpu_is_mapped() ? vpu_rd32(REG_PROGRESS) : 0U;
+        if (p2_transfer_detail) {
+            fpga_p2_dma_breadcrumb("step=completion edge=fail status=0x%08x isr=0x%08x ctrl2=0x%08x total_bytes=0x%08x bank_stat=0x%08x polls=%lld saw_enabled=%d",
+                                   completion.status, completion.isr, completion.ctrl2,
+                                   total_bytes_after_transfer,
+                                   vpu_is_mapped() ? vpu_rd32(REG_BANK_STAT) : 0xFFFFFFFFU,
+                                   completion.polls, completion.saw_enabled ? 1 : 0);
+        }
         fpga_dma_trace_record(tag, src_phys, dst_phys, bytes, pre_status, pre_isr,
                               pre_ctrl2, total_bytes_before_clear,
                               pre_vpu_status, pre_vpu_progress, total_bytes_after_transfer,
@@ -2215,6 +2730,13 @@ static bool fpga_dma_copy_one(uint64_t src_phys, uint64_t dst_phys, size_t bytes
     const uint32_t total_bytes_after_transfer = g_dma->ZDMA_CH_TOTAL_BYTE;
     const uint32_t post_vpu_status = vpu_is_mapped() ? vpu_rd32(REG_STATUS) : 0U;
     const uint32_t post_vpu_progress = vpu_is_mapped() ? vpu_rd32(REG_PROGRESS) : 0U;
+    if (p2_transfer_detail) {
+        fpga_p2_dma_breadcrumb("step=completion edge=pass status=0x%08x isr=0x%08x ctrl2=0x%08x total_bytes=0x%08x bank_stat=0x%08x polls=%lld saw_enabled=%d",
+                               completion.status, completion.isr, completion.ctrl2,
+                               total_bytes_after_transfer,
+                               vpu_is_mapped() ? vpu_rd32(REG_BANK_STAT) : 0xFFFFFFFFU,
+                               completion.polls, completion.saw_enabled ? 1 : 0);
+    }
     fpga_dma_trace_record(tag, src_phys, dst_phys, bytes, pre_status, pre_isr,
                           pre_ctrl2, total_bytes_before_clear,
                           pre_vpu_status, pre_vpu_progress, total_bytes_after_transfer,
@@ -2225,7 +2747,7 @@ static bool fpga_dma_copy_one(uint64_t src_phys, uint64_t dst_phys, size_t bytes
     const uint32_t isr = completion.isr;
     uint32_t dst_ddr_off = 0;
     if (phys_to_ddr_offset(dst_phys, bytes, &dst_ddr_off)) {
-        if (!msync_ddr_range(dst_ddr_off, bytes, true, tag)) {
+        if (!fpga_p2_ddr_sync(dst_ddr_off, bytes, true, tag)) {
             return false;
         }
     }
@@ -2423,6 +2945,40 @@ static bool wait_vpu_done(uint32_t * final_status) {
     }
 }
 
+// The VPU DONE bit means its final raw token was accepted by the SPU FIFO; it
+// does not mean that the SPU has completed its scale lookup, Q16 accumulation,
+// or SPU_OUT write.  P2 must prove this ownership boundary before reusing the
+// shared SPU_PARAM/SPU_OUT windows.
+static bool wait_spu_stream_quiescent(const char * context, bool require_zero_counters) {
+    const long long t0 = now_us();
+    long long polls = 0;
+    while (true) {
+        const uint32_t status = vpu_rd32(REG_SPU_STREAM_STATUS);
+        const uint32_t count = vpu_rd32(REG_SPU_STREAM_COUNT);
+        const uint32_t done = vpu_rd32(REG_SPU_STREAM_DONE);
+        const uint32_t out = vpu_rd32(REG_SPU_STREAM_OUT);
+        const uint32_t drop = vpu_rd32(REG_SPU_STREAM_DROP);
+        const uint32_t error = vpu_rd32(REG_SPU_STREAM_ERROR);
+        const bool counters_zero = count == 0U && done == 0U && out == 0U &&
+                                   drop == 0U && error == 0U;
+        if ((status & SPU_STREAM_STATUS_QUIESCENT) != 0U &&
+            (!require_zero_counters || counters_zero)) {
+            g_spu_stream_status = status;
+            return true;
+        }
+        if (now_us() - t0 > g_ip_timeout_us) {
+            LOGE("SPU stream quiescence timeout context=%s status=0x%08x count=%u done=%u out=%u drop=%u error=%u require_zero=%d",
+                 context ? context : "?", status, count, done, out, drop, error,
+                 require_zero_counters ? 1 : 0);
+            return false;
+        }
+        polls++;
+        if ((polls & 0x3FF) == 0) {
+            sched_yield();
+        }
+    }
+}
+
 static bool wait_spu_stream_outputs(const fpga_tile_job_t & job) {
     const uint32_t target_out = job.spu_stream_out_before + (uint32_t) job.rows;
     const uint32_t expected_raw = job.spu_stream_count_before +
@@ -2461,10 +3017,16 @@ static bool wait_spu_stream_outputs(const fpga_tile_job_t & job) {
             return false;
         }
         if (out_count >= target_out) {
-            if (count != expected_raw || done_count != expected_done) {
-                LOGE("SPU stream completion_mismatch job=%u bank=%d expected_raw=%u count=%u expected_done=%u done=%u expected_out=%u out=%u",
+            const uint32_t last_job = vpu_rd32(REG_SPU_STREAM_LAST_JOB);
+            const uint32_t last_bank = vpu_rd32(REG_SPU_STREAM_LAST_BANK);
+            if (count != expected_raw || done_count != expected_done ||
+                last_job != job.job_id || (last_bank & 1U) != (uint32_t) (job.bank & 1)) {
+                LOGE("SPU stream completion_mismatch job=%u bank=%d expected_raw=%u count=%u expected_done=%u done=%u expected_out=%u out=%u last_job=%u last_bank=%u",
                      job.job_id, job.bank, expected_raw, count, expected_done, done_count,
-                     target_out, out_count);
+                     target_out, out_count, last_job, last_bank);
+                return false;
+            }
+            if (!wait_spu_stream_quiescent("stream completion", false)) {
                 return false;
             }
             return true;
@@ -3872,6 +4434,66 @@ static bool fpga_contract_check_output_values(
     return true;
 }
 
+static bool fpga_wait_selftest_spu_stream(
+        int rows,
+        int col_beats,
+        uint32_t job_id,
+        uint32_t count_before,
+        uint32_t done_before,
+        uint32_t out_before,
+        uint32_t drop_before,
+        uint32_t error_before,
+        const char * tensor_name) {
+    if ((col_beats % VPU_BLOCK_BEATS) != 0) {
+        LOGE("P2 self-test stream cannot derive Q8 block count tensor=%s col_beats=%d block_beats=%d",
+             tensor_name ? tensor_name : "?", col_beats, VPU_BLOCK_BEATS);
+        return false;
+    }
+
+    fpga_tile_job_t stream_job = {};
+    stream_job.bank = 0;
+    stream_job.job_id = job_id;
+    stream_job.rows = rows;
+    stream_job.group_blocks = col_beats / VPU_BLOCK_BEATS;
+    stream_job.spu_stream_count_before = count_before;
+    stream_job.spu_stream_done_before = done_before;
+    stream_job.spu_stream_out_before = out_before;
+    stream_job.spu_stream_drop_before = drop_before;
+    stream_job.spu_stream_error_before = error_before;
+    if (!wait_spu_stream_outputs(stream_job)) {
+        LOGE("P2 self-test stream finality failed tensor=%s job=%u rows=%d blocks=%d",
+             tensor_name ? tensor_name : "?", job_id, rows, stream_job.group_blocks);
+        return false;
+    }
+    return wait_spu_stream_quiescent("self-test stream finality", false);
+}
+
+static bool fpga_prime_p2_stream_selftest_scales(void) {
+    const size_t bytes = (size_t) P2_REQUIRED_SPU_WORD_CAPACITY * 16U;
+    if (!range_fits(SPU_PARAM_BASE, bytes, SPU_PARAM_BASE, SPU_PARAM_END) ||
+        !ddr_range_fits(SPU_PARAM_BASE, bytes)) {
+        LOGE("P2 self-test scale-table range is invalid bytes=%zu capacity_words=%u",
+             bytes, P2_REQUIRED_SPU_WORD_CAPACITY);
+        return false;
+    }
+    // Raw compatibility self-tests have no GGML Q8 scale table.  P2 must not
+    // let them consume uninitialized SPU_PARAM contents while it drains their
+    // mandatory stream tail, so give every implemented entry an explicit
+    // FP16 zero/zero scale pair before the tests begin.
+    ddr_zero_range32(SPU_PARAM_BASE, bytes);
+    return fpga_dma_write_to_ip(SPU_PARAM_BASE, bytes, "P2_SELFTEST_PARAM_ZERO");
+}
+
+static bool fpga_reset_p2_stream_after_selftests(void) {
+    // Do not reset before all raw self-test stream entries are drained: the
+    // reset intentionally clears ownership/counters but leaves BRAM payload
+    // intact.  P2 will subsequently overwrite only the rows/scale words it
+    // owns for its first tile.
+    vpu_wr32(REG_SPU_CTRL, SPU_CTRL_SOFT_RESET);
+    mmio_fence();
+    return wait_spu_stream_quiescent("post-selftest soft reset", true);
+}
+
 static bool run_vpu_window_transfer(
         int rows,
         int col_beats,
@@ -3886,6 +4508,23 @@ static bool run_vpu_window_transfer(
         int64_t m,
         uint32_t tile_id,
         fpga_stage_totals_t * totals) {
+    const bool p2_stream_fence_required = g_spu_q8_scale_stream_supported;
+    uint32_t selftest_job_id = 0U;
+    uint32_t stream_count_before = 0U;
+    uint32_t stream_done_before = 0U;
+    uint32_t stream_out_before = 0U;
+    uint32_t stream_drop_before = 0U;
+    uint32_t stream_error_before = 0U;
+    if (p2_stream_fence_required) {
+        // The raw VPU self-tests also emit VPU->SPU entries.  Snapshot before
+        // start so no residual FIFO/accumulator work can cross into P2.
+        selftest_job_id = vpu_rd32(REG_JOB_ID);
+        stream_count_before = vpu_rd32(REG_SPU_STREAM_COUNT);
+        stream_done_before = vpu_rd32(REG_SPU_STREAM_DONE);
+        stream_out_before = vpu_rd32(REG_SPU_STREAM_OUT);
+        stream_drop_before = vpu_rd32(REG_SPU_STREAM_DROP);
+        stream_error_before = vpu_rd32(REG_SPU_STREAM_ERROR);
+    }
     vpu_select_banks(0, 0);
     vpu_wr32(REG_CTRL, CTRL_CLEAR_DONE);
     configure_vpu(rows, col_beats, mode);
@@ -3921,6 +4560,14 @@ static bool run_vpu_window_transfer(
         return false;
     }
     const long long ip1 = now_us();
+
+    if (p2_stream_fence_required &&
+        !fpga_wait_selftest_spu_stream(rows, col_beats, selftest_job_id,
+                                       stream_count_before, stream_done_before,
+                                       stream_out_before, stream_drop_before,
+                                       stream_error_before, tensor_name)) {
+        return false;
+    }
 
     const long long dma_result0 = now_us();
     vpu_select_banks(0, 0);
@@ -4533,9 +5180,27 @@ static fpga_weight_cache_entry_t * get_weight_cache_entry(
     return build_weight_cache_entry(src0, totals);
 }
 
+static void p2_trace_first_tile(const fpga_tile_job_t & job, const char * stage, const char * edge);
+
+static void p2_trace_set_job_context(const fpga_tile_job_t & job) {
+    g_p2_trace_job_id = job.job_id;
+    g_p2_trace_tile_id = job.tile_id;
+    g_p2_trace_bank = job.bank;
+}
+
+static bool p2_trace_this_tile(const fpga_tile_job_t & job) {
+    // Preserve the low-noise primary-path behavior.  Qualification and the
+    // explicit boundary diagnostic are the only modes allowed to trace every
+    // tile/transfer; this makes a board stop diagnosable without turning a
+    // normal PL-scale run into a terminal flood.
+    return g_p2_init_requested &&
+           (job.tile_id == 0U || g_p2_tile_trace_enabled);
+}
+
 static bool fpga_prepare_q8_tile_job(
         fpga_tile_job_t & job,
         const struct ggml_tensor * src0,
+        const void * weight_data_base,
         const block_q8_0_t * act_group,
         int64_t row0,
         int rows,
@@ -4621,7 +5286,15 @@ static bool fpga_prepare_q8_tile_job(
     job.src0 = src0;
     job.weight_cache = weight_cache;
 
+    if (g_p2_init_requested) {
+        p2_trace_set_job_context(job);
+    }
+
     const long long prep0 = now_us();
+    // This marker must precede the first model descriptor/control MMIO after
+    // P2 initialization returns.  Job identity is complete here, but no tile
+    // descriptor, bank, control, or VPU configuration write has occurred.
+    p2_trace_first_tile(job, "CONTROL_DESCRIPTOR", "before");
     vpu_write_tile_descriptor(job, FPGA_SLOT_CPU_PACKING, FPGA_SLOT_FREE, 0x00000001U);
 
     if (weight_cache && weight_tile_index < weight_cache->tiles.size()) {
@@ -4640,7 +5313,8 @@ static bool fpga_prepare_q8_tile_job(
     if (!job.weight_cache_hit) {
         for (int row = 0; row < rows; ++row) {
             for (int gb = 0; gb < group_blocks; ++gb) {
-                const block_q8_0_t * wb = weight_block(src0, row0 + row, k_block0 + gb);
+                const block_q8_0_t * wb = weight_block_from_base(
+                    src0, weight_data_base, row0 + row, k_block0 + gb);
                 for (int beat = 0; beat < VPU_BLOCK_BEATS; ++beat) {
                     const uint32_t word_index = (uint32_t) row * (uint32_t) group_beats +
                                                 (uint32_t) gb * (uint32_t) VPU_BLOCK_BEATS +
@@ -4657,7 +5331,8 @@ static bool fpga_prepare_q8_tile_job(
             const uint32_t linear = (uint32_t) row * (uint32_t) group_blocks + (uint32_t) gb;
             const uint32_t word = linear / (uint32_t) VPU_RESULT_PACK_LANES;
             const uint32_t lane = linear % (uint32_t) VPU_RESULT_PACK_LANES;
-            const block_q8_0_t * wb = weight_block(src0, row0 + row, k_block0 + gb);
+            const block_q8_0_t * wb = weight_block_from_base(
+                src0, weight_data_base, row0 + row, k_block0 + gb);
             const uint32_t packed_scale =
                 (uint32_t) act_group[gb].d |
                 ((uint32_t) wb->d << 16);
@@ -4686,6 +5361,20 @@ static bool fpga_prepare_q8_tile_job(
     return true;
 }
 
+static void p2_trace_first_tile(const fpga_tile_job_t & job, const char * stage, const char * edge) {
+    if (!p2_trace_this_tile(job)) {
+        return;
+    }
+    LOGPROOF("P2_TILE_TRACE stage=%s edge=%s job=%u bank=%d tile=%u",
+             stage, edge, job.job_id, job.bank, job.tile_id);
+    // A board crash can discard /tmp/fpga_debug.log.  Mirror the first P2
+    // transaction boundaries to stderr so the owner retains the last MMIO/DMA
+    // edge in the terminal capture as well.
+    fprintf(stderr, "[FPGA][P2] stage=%s edge=%s job=%u bank=%d tile=%u\n",
+            stage, edge, job.job_id, job.bank, job.tile_id);
+    fflush(stderr);
+}
+
 static bool fpga_submit_q8_tile_job(
         fpga_tile_job_t & job,
         fpga_stage_totals_t * totals,
@@ -4695,10 +5384,17 @@ static bool fpga_submit_q8_tile_job(
         int64_t n,
         int64_t m,
         int attempt) {
+    if (g_p2_init_requested) {
+        p2_trace_set_job_context(job);
+    }
     vpu_select_banks(job.bank, job.bank);
     vpu_wr32(REG_CTRL, CTRL_CLEAR_DONE);
     configure_vpu(job.rows, job.group_beats, VPU_MODE_PACKED_Q8);
     vpu_write_tile_descriptor(job, FPGA_SLOT_DMA_FILLING, FPGA_SLOT_FREE, 0x00000101U);
+    if (g_p2_init_requested && !fpga_commit_p2_dma_filling_descriptor(job)) {
+        return false;
+    }
+    p2_trace_first_tile(job, "CONTROL_DESCRIPTOR", "after");
 
     long long result_clear0 = 0;
     long long result_clear1 = 0;
@@ -4714,13 +5410,51 @@ static bool fpga_submit_q8_tile_job(
     }
 
     const long long dma_act0 = now_us();
+    p2_trace_first_tile(job, "ACT_DMA", "before");
+    const bool first_p2_act_detail =
+        g_p2_init_requested && job.tile_id == 0U && !g_p2_first_act_dma_trace_done;
+    if (first_p2_act_detail) {
+        fpga_p2_dma_breadcrumb("step=bank_select edge=before expected_bank=%d reg_bank=0x%08x bank_stat=0x%08x",
+                               job.bank & 1,
+                               vpu_rd32(REG_BANK),
+                               vpu_rd32(REG_BANK_STAT));
+    }
     vpu_select_banks(job.bank, job.bank);
-    if (!fpga_dma_write_to_ip(ACT_BASE, job.act_bytes, "ACT")) {
+    if (first_p2_act_detail) {
+        // The P2 gate requires ping-pong/descriptor capability, so this
+        // readback proves the bank-select write reached the mapped MY_IP
+        // aperture before the first ZDMA descriptor is touched. BANK_STAT is
+        // diagnostic only because its write/read-bank bit contract is not
+        // part of the host ABI.
+        const uint32_t expected_bank = (uint32_t) (job.bank & 1) |
+            ((uint32_t) (job.bank & 1) << 1);
+        const uint32_t bank_readback = vpu_rd32(REG_BANK);
+        const uint32_t bank_stat = vpu_rd32(REG_BANK_STAT);
+        const bool bank_matches = (bank_readback & 0x3U) == expected_bank;
+        fpga_p2_dma_breadcrumb("step=bank_select edge=after expected_bank=0x%08x reg_bank=0x%08x bank_stat=0x%08x match=%d",
+                               expected_bank, bank_readback, bank_stat,
+                               bank_matches ? 1 : 0);
+        if (!bank_matches) {
+            g_p2_first_act_dma_trace_done = true;
+            LOGE("P2 bank-select readback mismatch job=%u bank=%d expected_reg_bank=0x%08x actual_reg_bank=0x%08x bank_stat=0x%08x; refusing ACT DMA",
+                 job.job_id, job.bank & 1, expected_bank, bank_readback, bank_stat);
+            return false;
+        }
+        g_p2_first_act_dma_trace_active = true;
+    }
+    const bool act_dma_ok = fpga_dma_write_to_ip(ACT_BASE, job.act_bytes, "ACT");
+    if (first_p2_act_detail) {
+        g_p2_first_act_dma_trace_active = false;
+        g_p2_first_act_dma_trace_done = true;
+    }
+    if (!act_dma_ok) {
         return false;
     }
+    p2_trace_first_tile(job, "ACT_DMA", "after");
     const long long dma_act1 = now_us();
 
     const long long dma_weight0 = now_us();
+    p2_trace_first_tile(job, "WEIGHT_DMA", "before");
     vpu_select_banks(job.bank, job.bank);
     if (!fpga_dma_copy(DDR_BASE_PHYS + (uint64_t) job.weight_src_off,
                        LMM_BASE_PHYS + (uint64_t) WEIGHT_BASE,
@@ -4728,12 +5462,21 @@ static bool fpga_submit_q8_tile_job(
                        "WEIGHT")) {
         return false;
     }
+    p2_trace_first_tile(job, "WEIGHT_DMA", "after");
     const long long dma_weight1 = now_us();
 
     const long long dma_scale0 = now_us();
+    // A completed prior tile must release SPU ownership before this shared
+    // parameter window can be overwritten.
+    if (g_spu_q8_scale_stream_supported &&
+        !wait_spu_stream_quiescent("before SPU_PARAM DMA", false)) {
+        return false;
+    }
+    p2_trace_first_tile(job, "SPU_PARAM_DMA", "before");
     if (!fpga_dma_write_to_ip(SPU_PARAM_BASE, job.scale_bytes, "SPU_SCALE")) {
         return false;
     }
+    p2_trace_first_tile(job, "SPU_PARAM_DMA", "after");
     const long long dma_scale1 = now_us();
 
     job.dma_act_us = dma_act1 - dma_act0;
@@ -4759,8 +5502,10 @@ static bool fpga_submit_q8_tile_job(
     vpu_write_tile_descriptor(job, FPGA_SLOT_COMPUTING, FPGA_SLOT_FREE, 0x00000101U);
     mmio_fence();
     job.ip_start_us = now_us();
+    p2_trace_first_tile(job, "VPU_LAUNCH", "before");
     vpu_wr32(REG_CTRL, CTRL_START);
     mmio_fence();
+    p2_trace_first_tile(job, "VPU_LAUNCH", "after");
 
     if (g_ip_timing_enabled && should_log_detail_run(job.tile_id)) {
         LOGIP("submit tensor=%s layer=%d shape=K%lldxN%lldxM%lld tile=%u job=%u bank=%d attempt=%d rows=%d col_beats=%d mode=0x%x result_clear_ms=%.3f act_dma_ms=%.3f weight_dma_ms=%.3f scale_dma_ms=%.3f weight_cache=%d",
@@ -4795,6 +5540,7 @@ static bool fpga_wait_and_drain_q8_tile_job(
         int64_t m,
         int attempt) {
     uint32_t vpu_status = 0;
+    p2_trace_first_tile(job, "VPU_DONE_WAIT", "before");
     if (!wait_vpu_done(&vpu_status)) {
         LOGE("VPU failed tensor=%s layer=%d shape=K%lld_N%lld_M%lld tile=%u job=%u bank=%d attempt=%d status=0x%08x progress=0x%08x",
              tensor_name ? tensor_name : "?",
@@ -4811,21 +5557,28 @@ static bool fpga_wait_and_drain_q8_tile_job(
         return false;
     }
     const long long ip1 = now_us();
+    p2_trace_first_tile(job, "VPU_DONE_WAIT", "after");
     job.vpu_status = vpu_status;
     job.ip_compute_us = ip1 - job.ip_start_us;
     if (!vpu_verify_done_job(job, vpu_status)) {
         return false;
     }
+    p2_trace_first_tile(job, "SPU_FINALITY_WAIT", "before");
     if (!wait_spu_stream_outputs(job)) {
+        g_pl_scale_stream_drops += (long long) (vpu_rd32(REG_SPU_STREAM_DROP) - job.spu_stream_drop_before);
+        g_pl_scale_stream_errors += (long long) (vpu_rd32(REG_SPU_STREAM_ERROR) - job.spu_stream_error_before);
         return false;
     }
+    p2_trace_first_tile(job, "SPU_FINALITY_WAIT", "after");
 
     vpu_write_tile_descriptor(job, FPGA_SLOT_FREE, FPGA_SLOT_DMA_DRAINING, 0x00000101U);
     vpu_select_banks(job.bank, job.bank);
     const long long dma_result0 = now_us();
+    p2_trace_first_tile(job, "SPU_OUT_DMA", "before");
     if (!fpga_dma_read_from_ip(SPU_OUT_BASE, job.spu_result_bytes, "SPU_OUT")) {
         return false;
     }
+    p2_trace_first_tile(job, "SPU_OUT_DMA", "after");
     const long long dma_result1 = now_us();
     job.dma_result_us = dma_result1 - dma_result0;
     vpu_write_tile_descriptor(job, FPGA_SLOT_FREE, FPGA_SLOT_HOST_CONSUMING, 0x00000101U);
@@ -4925,7 +5678,208 @@ static bool fpga_accumulate_pl_scaled_q8_tile_job(
     if (totals) {
         totals->host_result_us += result1 - result0;
     }
+    p2_trace_first_tile(job, "DESCRIPTOR_FREE", "before");
     vpu_write_tile_descriptor(job, FPGA_SLOT_FREE, FPGA_SLOT_FREE, 0x00000000U);
+    p2_trace_first_tile(job, "DESCRIPTOR_FREE", "after");
+    return true;
+}
+
+// The P2 contract is a tile-level transport/numerical qualification, not a
+// complete matrix result.  Retire the descriptor with a DSB and exact FREE/FREE
+// readback before returning CPU-shadow control to GGML.  This makes it
+// impossible for the default command to enter the known-unproven second tile.
+static bool fpga_p2_complete_tile_contract_boundary(
+        const fpga_tile_job_t & job,
+        const char * tensor_name,
+        int layer_id) {
+    if (g_pl_scale_contract_check_limit <= 0 ||
+        (long long) job.tile_id + 1LL < (long long) g_p2_tile_limit) {
+        return true;
+    }
+
+    p2_trace_first_tile(job, "TILE_BOUNDARY", "before_free_readback");
+    // Do not merely infer retirement from VPU/SPU completion.  A second
+    // descriptor must never be admitted until ZDMA has dropped EN and the
+    // stream controller has returned to its quiescent state.
+    if (!zdma_wait_channel_disabled("p2_tile_boundary", "after_tile")) {
+        LOGE("P2_TILE_BOUNDARY_FAIL tensor=%s layer=%d job=%u tile=%u reason=zdma_channel_still_enabled; refusing another tile",
+             tensor_name ? tensor_name : "?", layer_id, job.job_id, job.tile_id);
+        return false;
+    }
+    if (!wait_spu_stream_quiescent("P2 tile boundary", false)) {
+        LOGE("P2_TILE_BOUNDARY_FAIL tensor=%s layer=%d job=%u tile=%u reason=spu_stream_not_quiescent; refusing another tile",
+             tensor_name ? tensor_name : "?", layer_id, job.job_id, job.tile_id);
+        return false;
+    }
+    mmio_fence();
+    const uint32_t zdma_ctrl2 = g_dma->ZDMA_CH_CTRL2;
+    const uint32_t slot_state = vpu_rd32(REG_SLOT_STATE);
+    const uint32_t desc_flags = vpu_rd32(REG_DESC_FLAGS);
+    const uint32_t bank = vpu_rd32(REG_BANK);
+    const uint32_t bank_stat = vpu_rd32(REG_BANK_STAT);
+    const uint32_t active_job = vpu_rd32(REG_ACTIVE_JOB);
+    const uint32_t done_job = vpu_rd32(REG_DONE_JOB);
+    const uint32_t stream_status = vpu_rd32(REG_SPU_STREAM_STATUS);
+    const bool descriptor_released =
+        slot_state == fpga_slot_state_word(job.bank, FPGA_SLOT_FREE, FPGA_SLOT_FREE) &&
+        desc_flags == 0U;
+    if (!descriptor_released) {
+        LOGE("P2_TILE_BOUNDARY_FAIL tensor=%s layer=%d job=%u tile=%u bank=%d slot_state=0x%08x desc_flags=0x%08x expected_slot_state=0x%08x expected_desc_flags=0; refusing another tile",
+             tensor_name ? tensor_name : "?", layer_id, job.job_id, job.tile_id,
+             job.bank, slot_state, desc_flags,
+             fpga_slot_state_word(job.bank, FPGA_SLOT_FREE, FPGA_SLOT_FREE));
+        return false;
+    }
+
+    g_p2_tile_contract_boundary_reached = true;
+    FILE * fp = fpga_log_fp();
+    fprintf(fp, "[FPGA][INFO] P2_TILE_BOUNDARY status=pass tensor=%s layer=%d job=%u tile=%u bank=%d tile_limit=%d p2_tile_q16_checks=%lld p2_matrix_contract_checks=%lld matrix_value_contract=not_attempted zdma_ctrl2=0x%08x stream_status=0x%08x slot_state=0x%08x desc_flags=0x%08x reg_bank=0x%08x bank_stat=0x%08x active_job=0x%08x done_job=0x%08x action=cpu_shadow_current_matmul_then_cpu_native\n",
+            tensor_name ? tensor_name : "?", layer_id, job.job_id, job.tile_id,
+            job.bank, g_p2_tile_limit, g_p2_tile_q16_checks,
+            g_p2_matrix_contract_checks, zdma_ctrl2, stream_status,
+            slot_state, desc_flags, bank, bank_stat,
+            active_job, done_job);
+    fflush(fp);
+    fprintf(stderr, "[FPGA][P2_TILE_BOUNDARY] status=pass tensor=%s layer=%d job=%u tile=%u bank=%d tile_limit=%d p2_tile_q16_checks=%lld p2_matrix_contract_checks=%lld matrix_value_contract=not_attempted zdma_ctrl2=0x%08x stream_status=0x%08x slot_state=0x%08x desc_flags=0x%08x reg_bank=0x%08x bank_stat=0x%08x active_job=0x%08x done_job=0x%08x action=cpu_shadow_current_matmul_then_cpu_native\n",
+            tensor_name ? tensor_name : "?", layer_id, job.job_id, job.tile_id,
+            job.bank, g_p2_tile_limit, g_p2_tile_q16_checks,
+            g_p2_matrix_contract_checks, zdma_ctrl2, stream_status,
+            slot_state, desc_flags, bank, bank_stat,
+            active_job, done_job);
+    fflush(stderr);
+    p2_trace_first_tile(job, "TILE_BOUNDARY", "after_free_readback");
+    return true;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
+static bool fpga_spu_q16_contribution(
+        int32_t raw,
+        uint16_t act_scale,
+        uint16_t weight_scale,
+        int64_t * contribution_q16) {
+    if (!contribution_q16 || (act_scale & 0x8000U) != 0U ||
+        (weight_scale & 0x8000U) != 0U ||
+        (act_scale & 0x7c00U) == 0x7c00U ||
+        (weight_scale & 0x7c00U) == 0x7c00U) {
+        return false;
+    }
+    const auto fp16_to_q0_32 = [](uint16_t h) -> uint64_t {
+        const uint64_t exp = (h >> 10) & 0x1fU;
+        const uint64_t frac = h & 0x03ffU;
+        return exp == 0U ? (frac << 8) : ((0x400U | frac) << (exp + 7U));
+    };
+    const uint64_t act_q32 = fp16_to_q0_32(act_scale);
+    const uint64_t weight_q32 = fp16_to_q0_32(weight_scale);
+    const unsigned __int128 product_full =
+        (unsigned __int128) act_q32 * (unsigned __int128) weight_q32;
+    const uint64_t product_q32 = (product_full >> 96U) != 0U ? UINT64_MAX :
+        (uint64_t) (product_full >> 32U);
+    const __int128 contribution = ((__int128) raw * (__int128) product_q32) >> 16U;
+    *contribution_q16 = (int64_t) contribution;
+    return true;
+}
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
+static bool fpga_pl_scale_contract_verify_q16_tile(
+        const fpga_tile_job_t & job,
+        const void * weight_data_base,
+        const char * tensor_name,
+        int layer_id) {
+    long long checked = 0;
+    for (int row = 0; row < job.rows; ++row) {
+        uint64_t expected_bits = 0U;
+        for (int gb = 0; gb < job.group_blocks; ++gb) {
+            const block_q8_0_t * const weight = weight_block_from_base(
+                job.src0, weight_data_base, job.row0 + row, job.k_block0 + gb);
+            const block_q8_0_t & act = job.act_group[gb];
+            int64_t contribution = 0;
+            if (!fpga_spu_q16_contribution(q8_0_raw_dot(act.qs, weight->qs),
+                                            act.d, weight->d, &contribution)) {
+                LOGE("SPU_SCALE_CONTRACT_Q16_BAD_SCALE tensor=%s layer=%d job=%u bank=%d tile=%u row=%d block=%d act_d=0x%04x weight_d=0x%04x",
+                     tensor_name ? tensor_name : "?", layer_id, job.job_id, job.bank,
+                     job.tile_id, row, gb, act.d, weight->d);
+                return false;
+            }
+            expected_bits += (uint64_t) contribution;
+        }
+        uint16_t row_id = 0xffffU;
+        const int64_t actual = ddr_read_spu_q16_row(
+            SPU_OUT_BASE + (uint32_t) row * 16U, &row_id);
+        if (row_id != (uint16_t) row || (uint64_t) actual != expected_bits) {
+            LOGE("SPU_SCALE_CONTRACT_Q16_FAIL tensor=%s layer=%d job=%u bank=%d tile=%u row=%d got_row=%u got_q16=%lld expected_q16=%lld",
+                 tensor_name ? tensor_name : "?", layer_id, job.job_id, job.bank,
+                 job.tile_id, row, (unsigned) row_id, (long long) actual,
+                 (long long) (int64_t) expected_bits);
+            return false;
+        }
+        checked++;
+    }
+    LOGI("SPU_SCALE_CONTRACT_Q16_PASS tensor=%s layer=%d job=%u bank=%d tile=%u rows=%lld expected_raw=%u expected_out=%u",
+         tensor_name ? tensor_name : "?", layer_id, job.job_id, job.bank, job.tile_id,
+         checked, (unsigned) (job.rows * job.group_blocks), (unsigned) job.rows);
+    return true;
+}
+
+static bool fpga_pl_scale_contract_check_output_values(
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * dst,
+        const std::vector<block_q8_0_t> & act_blocks_all,
+        const void * weight_data_base,
+        const char * tensor_name,
+        int layer_id) {
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    const int64_t m = dst->ne[1];
+    const int64_t nb = k / VPU_QK8_0;
+    const size_t value_count = (size_t) n * (size_t) m;
+    if (g_scratch.contract_actual.size() != value_count) {
+        LOGE("SPU_SCALE_CONTRACT_VALUE_LAYOUT tensor=%s layer=%d actual_values=%zu expected_values=%zu",
+             tensor_name ? tensor_name : "?", layer_id,
+             g_scratch.contract_actual.size(), value_count);
+        return false;
+    }
+    long long bad = 0;
+    double max_abs = 0.0;
+    double max_rel = 0.0;
+    for (int64_t col = 0; col < m; ++col) {
+        for (int64_t row = 0; row < n; ++row) {
+            float ref = 0.0f;
+            ggml_vec_dot_q8_0_q8_0((int) k, &ref, 0,
+                                    weight_block_from_base(src0, weight_data_base, row, 0), 0,
+                                    &act_blocks_all[(size_t) col * (size_t) nb], 0, 1);
+            const double actual = (double) g_scratch.contract_actual[(size_t) col * (size_t) n + (size_t) row];
+            const double expected = (double) ref;
+            const double abs_err = std::fabs(actual - expected);
+            const double rel_err = abs_err / (std::fabs(expected) + 1.0e-12);
+            max_abs = std::max(max_abs, abs_err);
+            max_rel = std::max(max_rel, rel_err);
+            if (!std::isfinite(actual) || !std::isfinite(expected) ||
+                abs_err > P2_PL_SCALE_VALUE_ATOL) {
+                if (bad < 4) {
+                    LOGE("SPU_SCALE_CONTRACT_VALUE_FAIL tensor=%s layer=%d row=%lld col=%lld got=%.9g expected=%.9g abs=%.9g rel=%.9g",
+                         tensor_name ? tensor_name : "?", layer_id, (long long) row,
+                         (long long) col, actual, expected, abs_err, rel_err);
+                }
+                bad++;
+            }
+        }
+    }
+    if (bad != 0) {
+        g_contract_value_mismatches += bad;
+        LOGE("SPU_SCALE_CONTRACT_VALUE_SUMMARY tensor=%s layer=%d checked=%lld bad=%lld max_abs=%.9g max_rel=%.9g p2_abs_atol=%.9g rel=informational action=abort_no_partial_dst",
+             tensor_name ? tensor_name : "?", layer_id, (long long) value_count, bad,
+             max_abs, max_rel, P2_PL_SCALE_VALUE_ATOL);
+        return false;
+    }
+    g_contract_cpu_shadow_dst_values += (long long) value_count;
+    LOGI("SPU_SCALE_CONTRACT_VALUE_PASS tensor=%s layer=%d checked=%lld max_abs=%.9g max_rel=%.9g p2_abs_atol=%.9g rel=informational dst=native_cpu_shadow",
+         tensor_name ? tensor_name : "?", layer_id, (long long) value_count, max_abs, max_rel,
+         P2_PL_SCALE_VALUE_ATOL);
     return true;
 }
 
@@ -5387,7 +6341,7 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(
                              bank);
                 }
 
-                if (!fpga_prepare_q8_tile_job(prepared, src0, act_group, row0, rows, ib0, group_blocks,
+                if (!fpga_prepare_q8_tile_job(prepared, src0, src0->data, act_group, row0, rows, ib0, group_blocks,
                                              col, weight_tile_index, weight_cache, tile_id, bank, totals)) {
                     return false;
                 }
@@ -5444,6 +6398,105 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(
     return true;
 }
 
+static bool fpga_hw_q8_0_matmul_dma_to_ip_pl_scale_single_bank(
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * dst,
+        const std::vector<block_q8_0_t> & act_blocks_all,
+        const fpga_weight_cache_entry_t * weight_cache,
+        const void * weight_data_base,
+        fpga_stage_totals_t * totals,
+        const char * tensor_name,
+        int layer_id,
+        int64_t k,
+        int64_t n,
+        int64_t m,
+        int64_t nb,
+        bool pl_scale_contract_active,
+        std::vector<float> & accum) {
+    uint32_t tile_id = 0;
+    uint32_t weight_tile_index = 0;
+    if (pl_scale_contract_active) {
+        // v58 validates whole P2 tiles only.  A partial tile sequence is not
+        // a matrix value contract, so never allocate or later compare a
+        // fabricated partially-filled matrix result.
+        g_scratch.contract_actual.clear();
+    } else {
+        g_scratch.contract_actual.clear();
+    }
+
+    for (int64_t row0 = 0; row0 < n; row0 += g_vpu_max_rows) {
+        const int rows = (int) std::min<int64_t>(g_vpu_max_rows, n - row0);
+        accum.assign((size_t) m * (size_t) rows, 0.0f);
+        for (int64_t ib0 = 0; ib0 < nb;) {
+            const int group_blocks = packed_q8_group_blocks_for_rows(rows, (int) (nb - ib0));
+            for (int64_t col = 0; col < m; ++col) {
+                fpga_tile_job_t job = {};
+                const block_q8_0_t * const act_group =
+                    &act_blocks_all[(size_t) (col * nb + ib0)];
+                if (should_log_detail_run(tile_id)) {
+                    LOGSTAGE("P2_SINGLE_BANK_TILE tensor=%s layer=%d row0=%lld rows=%d k_block0=%lld group_blocks=%d tile=%u job_policy=one_outstanding bank=0 route=vpu_to_spu",
+                             tensor_name ? tensor_name : "?", layer_id, (long long) row0, rows,
+                             (long long) ib0, group_blocks, tile_id);
+                }
+                if (!fpga_prepare_q8_tile_job(job, src0, weight_data_base, act_group,
+                                             row0, rows, ib0, group_blocks, col,
+                                             weight_tile_index, weight_cache, tile_id, 0, totals) ||
+                    !fpga_submit_q8_tile_job(job, totals, tensor_name, layer_id,
+                                             k, n, m, 0) ||
+                    !fpga_wait_and_drain_q8_tile_job(job, totals, tensor_name, layer_id,
+                                                     k, n, m, 0)) {
+                    return false;
+                }
+                g_pl_scale_jobs++;
+                g_pl_scale_banks++;
+                if (pl_scale_contract_active &&
+                    !fpga_pl_scale_contract_verify_q16_tile(job, weight_data_base,
+                                                            tensor_name, layer_id)) {
+                    return false;
+                }
+                if (pl_scale_contract_active) {
+                    ++g_p2_tile_q16_checks;
+                }
+                if (!fpga_accumulate_pl_scaled_q8_tile_job(job, accum, totals)) {
+                    return false;
+                }
+                if (pl_scale_contract_active &&
+                    (long long) tile_id + 1LL >= (long long) g_p2_tile_limit) {
+                    if (!fpga_p2_complete_tile_contract_boundary(
+                            job, tensor_name, layer_id)) {
+                        return false;
+                    }
+                    // This is a successful *tile* contract.  The current
+                    // MUL_MAT remains CPU-shadowed and all later eligible
+                    // GEMVs are routed natively by fpga_try_matmul_extended.
+                    return true;
+                }
+                tile_id++;
+            }
+            ib0 += group_blocks;
+            weight_tile_index++;
+        }
+        const long long store0 = now_us();
+        for (int64_t col = 0; col < m; ++col) {
+            const float * const accum_col = &accum[(size_t) col * (size_t) rows];
+            for (int row = 0; row < rows; ++row) {
+                if (!pl_scale_contract_active) {
+                    store_dst_value(dst, row0 + row, col, accum_col[(size_t) row]);
+                }
+            }
+        }
+        if (totals) {
+            totals->host_accum_us += now_us() - store0;
+        }
+    }
+    if (pl_scale_contract_active) {
+        LOGE("P2 tile contract exhausted the matrix before reaching configured tile_limit=%d q16_checks=%lld; matrix_value_contract=not_attempted action=abort_no_partial_matrix_claim",
+             g_p2_tile_limit, g_p2_tile_q16_checks);
+        return false;
+    }
+    return true;
+}
+
 static bool fpga_hw_q8_0_matmul_dma_to_ip(
         const struct ggml_tensor * src0,
         const struct ggml_tensor * src1,
@@ -5465,11 +6518,14 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip(
     const bool contract_check_active =
         (g_contract_check_limit > 0) &&
         (g_contract_checks_done < (long long) g_contract_check_limit);
+    const bool pl_scale_contract_active =
+        (g_pl_scale_contract_check_limit > 0) &&
+        (g_pl_scale_contract_checks_done < (long long) g_pl_scale_contract_check_limit);
     const bool cpu_shadow_dst = g_contract_cpu_shadow_dst;
     g_contract_source_validation_failed = false;
     const size_t weight_tensor_bytes = ggml_nbytes(src0);
     const void * weight_data_base = src0->data;
-    if (contract_check_active) {
+    if (contract_check_active || pl_scale_contract_active) {
         // Capture the complete immutable tensor before the first tile.  A
         // per-tile snapshot alone can miss corruption caused by an earlier
         // launch when the damaged row is not consumed until a later tile.
@@ -5485,11 +6541,11 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip(
     } else {
         g_scratch.weight_tensor_snapshot.clear();
     }
+    // PL scale uses the canonical single-bank VPU->SPU ABI whenever it is
+    // explicitly enabled.  Ping-pong remains a separate scheduler opt-in;
+    // it must not decide whether raw RESULT or SPU_OUT is consumed.
     const bool use_pl_scale_path =
-        g_pingpong_scheduler_enabled &&
-        g_spu_q8_scale_stream_supported &&
-        !contract_check_active &&
-        !cpu_shadow_dst;
+        g_spu_q8_scale_stream_supported && !contract_check_active;
 
     const long long quant0 = now_us();
     if (!ensure_quantized_activation_matrix(src1, m, k, act_blocks_all, act_scales,
@@ -5508,9 +6564,20 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip(
     }
 
     if (use_pl_scale_path) {
-        return fpga_hw_q8_0_matmul_dma_to_ip_pipelined(
-            src0, dst, act_blocks_all, act_scales, weight_cache, totals,
-            tensor_name, layer_id, k, n, m, nb, accum);
+        if (g_pingpong_scheduler_enabled && !pl_scale_contract_active) {
+            return fpga_hw_q8_0_matmul_dma_to_ip_pipelined(
+                src0, dst, act_blocks_all, act_scales, weight_cache, totals,
+                tensor_name, layer_id, k, n, m, nb, accum);
+        }
+        const bool pl_ok = fpga_hw_q8_0_matmul_dma_to_ip_pl_scale_single_bank(
+            src0, dst, act_blocks_all, weight_cache, weight_data_base, totals,
+            tensor_name, layer_id, k, n, m, nb, pl_scale_contract_active, accum);
+        if (pl_ok && pl_scale_contract_active &&
+            !g_p2_tile_contract_boundary_reached) {
+            LOGE("P2 tile qualification returned without a terminal tile boundary; refusing to treat an incomplete matrix as a contract pass");
+            return false;
+        }
+        return pl_ok;
     }
 
     uint32_t tile_id = 0;
@@ -5620,9 +6687,27 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip(
 }
 
 int fpga_init(void) {
+    g_p2_init_requested =
+        env_flag_enabled("FPGA_PL_SCALE_ENABLE") &&
+        !env_flag_enabled("FPGA_PL_SCALE_DISABLE");
+    g_p2_first_act_dma_trace_active = false;
+    g_p2_first_act_dma_trace_done = false;
+    g_p2_tile_limit = 0;
+    g_p2_allow_multitile = false;
+    g_p2_tile_contract_boundary_reached = false;
+    g_p2_tile_q16_checks = 0;
+    g_p2_matrix_contract_checks = 0;
+    g_p2_tile_trace_enabled = false;
+    g_p2_trace_job_id = 0U;
+    g_p2_trace_tile_id = 0U;
+    g_p2_trace_bank = -1;
+    g_p2_dma_transfer_sequence = 0U;
+    g_p2_trace_dma_tag.clear();
     if (dma_is_mapped() && vpu_is_mapped() && ddr_is_mapped()) {
         return 0;
     }
+
+    fpga_p2_init_breadcrumb("phase=config_loader_gate begin pl_scale=1");
 
     const char * path = getenv("FPGA_PATH");
     if (path && strcmp(path, "dma") != 0 && strcmp(path, "auto") != 0 && strcmp(path, "zdma") != 0) {
@@ -5647,9 +6732,25 @@ int fpga_init(void) {
     g_allow_vpu_devmem_compat =
         !env_flag_enabled("FPGA_VPU_UIO_REQUIRED") &&
         !env_flag_disabled("FPGA_VPU_DEVMEM_COMPAT");
+    if (g_p2_init_requested) {
+        // P2 owns SPU_PARAM/SPU_OUT and must not use a compatibility MY_IP
+        // mapping.  This also rejects a diagnostic all-resource /dev/mem
+        // policy instead of permitting P2 to inherit it from raw v52.
+        g_allow_devmem_fallback = false;
+        g_allow_vpu_devmem_compat = false;
+        fpga_p2_init_breadcrumb("phase=config_loader_gate policy=p2_uio_only my_ip_phys=0x%llx my_ip_offset=0 my_ip_required_size=0x%zx",
+                                (unsigned long long) REG_BASE_PHYS,
+                                VPU_DEVMEM_COMPAT_MMAP);
+        if (g_weight_cache_enabled) {
+            fpga_fatal("P2 requires direct bounded uncached WEIGHT staging so each ACT/WEIGHT/SPU_PARAM handoff can use the physical-UIO DSB/readback contract; FPGA_WEIGHT_CACHE is not permitted");
+        }
+    }
     g_strict_coherency = env_flag_enabled("FPGA_STRICT_COHERENCY");
     g_coherency_platform_whitelisted = env_flag_enabled("FPGA_COHERENCY_PLATFORM_VERIFIED");
     g_run_coherency_stress = env_flag_enabled("FPGA_COHERENCY_STRESS") || g_strict_coherency;
+    if (g_p2_init_requested && p2_msync_or_stress_requested()) {
+        fpga_fatal("P2 physical-UIO DDR coherency uses bounded DSB/readback, not msync; FPGA_STRICT_COHERENCY, FPGA_STRICT_MSYNC, and FPGA_COHERENCY_STRESS are incompatible and are rejected before mapping or data-plane transfer");
+    }
     g_contract_check_abort = env_flag_enabled("FPGA_CONTRACT_ABORT");
     g_contract_forensic_replay = !env_flag_disabled("FPGA_CONTRACT_FORENSIC_REPLAY");
     g_clear_result_before_run = env_flag_enabled("FPGA_CLEAR_RESULT");
@@ -5667,24 +6768,66 @@ int fpga_init(void) {
     if (g_vocab_projection_cpu_bypass) {
         LOGPROOF("v23 correctness policy: vocabulary projection remains on CPU; set FPGA_ACCELERATE_VOCAB=1 only after the deployed bitstream reports protocol=1/id=0x56505531 and logits A/B passes");
     }
-    LOGPROOF("v50 numerical policy: C0 validates every immutable Q8_0 weight scale before the first VPU launch, uses ggml quantize_row_q8_0 plus stored FP16 scales, compares the hardware result against ggml_vec_dot_q8_0_q8_0, and rejects every NaN/Inf");
+    LOGPROOF("v58 numerical policy: raw C0 and P2 PL-scale qualification validate immutable Q8_0 sources before launch; P2 performs tile-only canonical SPU Q16 verification, then CPU-shadows and natively recomputes the complete current MUL_MAT; matrix F32 comparison is not attempted and P2 never consumes RESULT");
     LOGPROOF("v38 ZDMA policy: every descriptor is preceded by a W1C ISR clear that is read back until DMA_DONE and all error bits are zero. The completion loop therefore accepts only a newly generated DONE event. C0 keeps the same ACT/WEIGHT staging sequence as primary raw GEMV; staging_restages must remain zero before primary FPGA use.");
-    LOGPROOF("v44 C0 loader gate: FPGA_CONTRACT_CHECK requires a completed upstream GGUF tensor-validation handshake before this host maps MY_IP/ZDMA/DDRHIGH or launches a model VPU transfer.");
+    LOGPROOF("v53 loader gate: FPGA_CONTRACT_CHECK and FPGA_PL_SCALE_CONTRACT_CHECK require a completed upstream GGUF tensor-validation handshake before this host maps MY_IP/ZDMA/DDRHIGH or launches a model VPU transfer.");
     g_log_flush_every = env_int_value("FPGA_LOG_FLUSH_EVERY", 256, 1, 1000000);
     g_profile_every = env_int_value("FPGA_PROFILE_EVERY", FPGA_DEFAULT_PROFILE_EVERY, 0, 1000000);
     g_ip_status_every = env_int_value("FPGA_IP_STATUS_EVERY", FPGA_DEFAULT_STATUS_EVERY, 0, 1000000);
     g_detail_every = env_int_value("FPGA_DETAIL_EVERY", FPGA_DEFAULT_DETAIL_EVERY, 0, 1000000);
     g_contract_check_limit = env_int_value("FPGA_CONTRACT_CHECK", 0, 0, 1000000);
+    g_pl_scale_contract_check_limit = env_int_value(
+        "FPGA_PL_SCALE_CONTRACT_CHECK", 0, 0, 1000000);
+    if (g_pl_scale_contract_check_limit > 1) {
+        fpga_fatal("FPGA_PL_SCALE_CONTRACT_CHECK=%d is unsupported by v58 tile qualification; set it to 1 and select the exact hardware scope with FPGA_P2_TILE_LIMIT",
+                   g_pl_scale_contract_check_limit);
+    }
+    g_p2_allow_multitile = env_flag_enabled("FPGA_P2_ALLOW_MULTITILE");
+    if (g_pl_scale_contract_check_limit > 0) {
+        g_p2_tile_limit = env_int_value("FPGA_P2_TILE_LIMIT", 1, 1, 1000000);
+        // The prior owner trace completed tile 0 and stopped during tile 1.
+        // Refuse to cross that known-unproven boundary unless the owner
+        // explicitly asks for it with both variables set.
+        if (g_p2_tile_limit > 1 && !g_p2_allow_multitile) {
+            fpga_fatal("P2 contract tile limit=%d requires FPGA_P2_ALLOW_MULTITILE=1; default qualification is exactly one fully retired tile",
+                       g_p2_tile_limit);
+        }
+        g_p2_tile_trace_enabled = true;
+        LOGPROOF("P2 tile qualification policy tile_limit=%d allow_multitile=%d matrix_value_contract=not_attempted; after the final verified tile, native GGML computes the complete current MUL_MAT and all later eligible GEMVs",
+                 g_p2_tile_limit, g_p2_allow_multitile ? 1 : 0);
+    } else {
+        g_p2_tile_trace_enabled = env_flag_enabled("FPGA_P2_BOUNDARY_DIAGNOSTICS");
+    }
     g_q8_source_audit_only = env_flag_enabled("FPGA_SOURCE_AUDIT_ONLY");
-    if (g_q8_source_audit_only && g_contract_check_limit > 0) {
-        fpga_fatal("FPGA_SOURCE_AUDIT_ONLY and FPGA_CONTRACT_CHECK cannot be enabled together; source audit must not launch model GEMVs through ZDMA/VPU");
+    if (g_contract_check_limit > 0 && g_pl_scale_contract_check_limit > 0) {
+        fpga_fatal("FPGA_CONTRACT_CHECK and FPGA_PL_SCALE_CONTRACT_CHECK are mutually exclusive; raw RESULT C0 and P2 SPU_OUT qualification have different result contracts");
     }
-    if (g_contract_check_limit > 0 && !fpga_model_tensor_validation_passed()) {
-        fpga_fatal("C0 loader-validation handshake is missing; no board MMIO was mapped. Rebuild and deploy the coupled frontend files ggml/src/ggml-cpu/fpga_host.{cpp,h}, src/llama-model-loader.cpp, and tools/main/main.cpp from the same source tree, then rerun C0. Do not copy only fpga_host.cpp");
+    if (g_q8_source_audit_only &&
+        (g_contract_check_limit > 0 || g_pl_scale_contract_check_limit > 0)) {
+        fpga_fatal("FPGA_SOURCE_AUDIT_ONLY cannot coexist with FPGA_CONTRACT_CHECK or FPGA_PL_SCALE_CONTRACT_CHECK; audit must not launch model GEMVs through ZDMA/VPU");
     }
-    if (g_contract_check_limit > 0) {
-        LOGPROOF("C0 loader-validation handshake=pass; full GGUF tensor validation completed before FPGA initialization");
+    if ((g_contract_check_limit > 0 || g_pl_scale_contract_check_limit > 0) &&
+        !fpga_model_tensor_validation_passed()) {
+        fpga_fatal("qualification loader-validation handshake is missing; no board MMIO was mapped. Rebuild and deploy the coupled frontend files ggml/src/ggml-cpu/fpga_host.{cpp,h} and src/llama-model-loader.cpp from the same source tree, then rerun the requested qualification");
     }
+    if (g_contract_check_limit > 0 || g_pl_scale_contract_check_limit > 0) {
+        LOGPROOF("qualification loader-validation handshake=pass; full GGUF tensor validation completed before FPGA initialization raw_c0=%d p2_pl_scale=%d",
+                 g_contract_check_limit, g_pl_scale_contract_check_limit);
+    }
+    if (g_pl_scale_contract_check_limit > 0) {
+        if (!env_flag_enabled("FPGA_PL_SCALE_ENABLE") || env_flag_enabled("FPGA_PL_SCALE_DISABLE")) {
+            fpga_fatal("P2 requires FPGA_PL_SCALE_ENABLE=1 and rejects FPGA_PL_SCALE_DISABLE");
+        }
+        if (env_flag_enabled("FPGA_PIPELINE_ENABLE")) {
+            fpga_fatal("P2 requires single-bank execution; FPGA_PIPELINE_ENABLE is not permitted during FPGA_PL_SCALE_CONTRACT_CHECK");
+        }
+        if (g_weight_cache_enabled) {
+            fpga_fatal("P2 requires direct bounded weight staging; FPGA_WEIGHT_CACHE is not permitted during FPGA_PL_SCALE_CONTRACT_CHECK");
+        }
+    }
+    fpga_p2_init_breadcrumb("phase=config_loader_gate pass p2_contract_limit=%d loader_validation=%s",
+                            g_pl_scale_contract_check_limit,
+                            g_pl_scale_contract_check_limit > 0 ? "pass" : "not_required");
     g_contract_deep_staging =
         g_contract_check_limit > 0 && !env_flag_disabled("FPGA_CONTRACT_DEEP_STAGING");
     // C0/C1 validates hardware first, but must not overwrite dst while the
@@ -5694,13 +6837,18 @@ int fpga_init(void) {
     g_contract_raw_propagation_diagnostic =
         g_contract_check_limit > 0 &&
         env_flag_enabled("FPGA_CONTRACT_RAW_PROPAGATION_DIAGNOSTIC");
+    if (g_pl_scale_contract_check_limit > 0 &&
+        env_flag_enabled("FPGA_CONTRACT_RAW_PROPAGATION_DIAGNOSTIC")) {
+        fpga_fatal("P2 never propagates raw RESULT; FPGA_CONTRACT_RAW_PROPAGATION_DIAGNOSTIC is incompatible with FPGA_PL_SCALE_CONTRACT_CHECK");
+    }
     const char * const legacy_canonical_override = getenv("FPGA_CONTRACT_CANONICAL_DST");
     g_contract_legacy_canonical_override_ignored =
         g_contract_check_limit > 0 &&
         legacy_canonical_override != nullptr &&
         env_flag_disabled("FPGA_CONTRACT_CANONICAL_DST");
     g_contract_cpu_shadow_dst =
-        g_contract_check_limit > 0 && !g_contract_raw_propagation_diagnostic;
+        (g_contract_check_limit > 0 || g_pl_scale_contract_check_limit > 0) &&
+        !g_contract_raw_propagation_diagnostic;
     if (g_contract_cpu_shadow_dst) {
         LOGPROOF("v50 C0/C1 shadow policy: every eligible GEMV still runs on ZDMA/VPU and is raw/value checked, but its result is retained privately while upstream GGML writes dst. This avoids a contract-mode dst race and is not a CPU fallback. Use FPGA_CONTRACT_RAW_PROPAGATION_DIAGNOSTIC=1 only for raw-F32 propagation.");
         if (g_contract_legacy_canonical_override_ignored) {
@@ -5709,7 +6857,8 @@ int fpga_init(void) {
     } else if (g_contract_check_limit > 0) {
         LOGPROOF("v49 forensic policy: FPGA_CONTRACT_RAW_PROPAGATION_DIAGNOSTIC=1; accepted raw-F32 FPGA results will propagate into CPU attention/KV. This mode diagnoses end-to-end sensitivity and is not a C0/C1 pass.");
     }
-    g_dma_trace_enabled = env_flag_enabled("FPGA_DMA_AUDIT") || g_contract_check_limit > 0;
+    g_dma_trace_enabled = env_flag_enabled("FPGA_DMA_AUDIT") ||
+        g_contract_check_limit > 0 || g_pl_scale_contract_check_limit > 0;
     memset(g_dma_trace, 0, sizeof(g_dma_trace));
     g_dma_trace_sequence = 0;
     g_contract_raw_retry_limit = env_int_value("FPGA_CONTRACT_RAW_RETRY", 1, 0, 8);
@@ -5745,23 +6894,37 @@ int fpga_init(void) {
     g_abort_on_cpu_fallback = !env_flag_disabled("FPGA_ABORT_ON_CPU_FALLBACK");
     g_activation_input_integrity_check =
         env_flag_enabled("FPGA_INPUT_INTEGRITY_CHECK");
-    if (g_contract_check_limit > 0 && !g_activation_input_integrity_check) {
+    if ((g_contract_check_limit > 0 || g_pl_scale_contract_check_limit > 0) &&
+        !g_activation_input_integrity_check) {
         // C0 deliberately exercises M>1 layouts. It must always prove that
         // the host/VPU path leaves each live F32 source activation intact.
         g_activation_input_integrity_check = true;
-        LOGPROOF("C0 input-integrity policy: FPGA_CONTRACT_CHECK automatically enables the F32 src1 snapshot/verify guard; FPGA_INPUT_INTEGRITY_CHECK=1 is implied for this qualification run");
+        LOGPROOF("qualification input-integrity policy: raw C0/P2 automatically enable the F32 src1 snapshot/verify guard; FPGA_INPUT_INTEGRITY_CHECK=1 is implied for this qualification run");
     }
 
+    fpga_p2_init_breadcrumb("phase=mapping begin");
     if (!configure_ddr_mapping_policy()) {
         fpga_fatal("DDR cache/mapping policy is invalid; refusing FPGA initialization");
     }
     if (!map_registers_dma_ddr()) {
         fpga_fatal("ZDMA DDR-to-IP FPGA init failed; refusing CPU fallback");
     }
+    if (g_p2_init_requested &&
+        g_ddr_mapping_kind != fpga_mapping_kind::UIO_PHYSICAL) {
+        fpga_fatal("P2 requires the verified physical UIO ddr_high mapping; map_kind=%s. No ZDMA initialization or data-plane transfer was issued",
+                   fpga_mapping_kind_name(g_ddr_mapping_kind));
+    }
+    fpga_p2_init_breadcrumb("phase=mapping pass my_ip_source=%s my_ip_size=0x%zx",
+                            g_vpu_map_source.c_str(), g_vpu_map_size);
     configure_weight_cache();
+    fpga_p2_init_breadcrumb("phase=zdma_init begin");
+    if (g_p2_init_requested && !p2_zdma_preinit_passive_gate()) {
+        fpga_fatal("P2 pre-init ZDMA ownership gate failed; CTRL2.EN was set or passive registers were unavailable. No ZDMA initialization write was issued");
+    }
     if (!fpga_dma_init()) {
         fpga_fatal("ZDMA init failed; refusing CPU fallback");
     }
+    fpga_p2_init_breadcrumb("phase=zdma_init pass");
     if (g_run_coherency_stress && !fpga_ddr_coherency_stress_test()) {
         fpga_fatal("DDR coherency stress test failed; refusing FPGA execution");
     }
@@ -5770,11 +6933,19 @@ int fpga_init(void) {
     g_cleanup_done = false;
     g_scratch.activation_cache_valid = false;
 
+    fpga_p2_init_breadcrumb("phase=identity_reads begin");
     const uint32_t limits = vpu_rd32(REG_LIMITS);
     const uint32_t caps = vpu_rd32(REG_CAPS);
     const uint32_t spu_caps = vpu_rd32(REG_SPU_CAPS);
     g_stream_protocol_version = vpu_rd32(REG_STREAM_PROTOCOL_VERSION);
     g_bitstream_id = vpu_rd32(REG_BITSTREAM_ID);
+    g_p2_stream_abi_signature = vpu_rd32(REG_P2_STREAM_ABI);
+    g_spu_stream_status = vpu_rd32(REG_SPU_STREAM_STATUS);
+    g_spu_word_capacity = (spu_caps >> 16) & 0xFFFFU;
+    fpga_p2_init_breadcrumb("phase=identity_reads pass limits=0x%08x caps=0x%08x spu_caps=0x%08x protocol=0x%08x bitstream_id=0x%08x p2_abi=0x%08x stream_status=0x%08x",
+                            limits, caps, spu_caps, g_stream_protocol_version,
+                            g_bitstream_id, g_p2_stream_abi_signature,
+                            g_spu_stream_status);
     const int limit_rows  = (int) (limits & 0xFFFFU);
     const int limit_beats = (int) ((limits >> 16) & 0xFFFFU);
     if (limit_rows > 0 && limit_rows <= VPU_DEFAULT_ROWS) {
@@ -5834,6 +7005,25 @@ int fpga_init(void) {
     g_vpu_pingpong_supported = caps_valid && ((caps & VPU_CAP_PINGPONG_BANKS) != 0U);
     g_vpu_descriptor_supported = caps_valid && ((caps & VPU_CAP_JOB_DESCRIPTOR) != 0U);
     const bool spu_caps_valid = spu_caps != 0U && spu_caps != 0xFFFFFFFFU;
+    const bool pl_scale_requested = g_p2_init_requested;
+    const bool p2_abi_compatible =
+        g_p2_stream_abi_signature == FPGA_REQUIRED_P2_STREAM_ABI;
+    const bool spu_stream_quiescent =
+        (g_spu_stream_status & SPU_STREAM_STATUS_QUIESCENT) != 0U;
+    const bool spu_word_capacity_compatible =
+        g_spu_word_capacity >= P2_REQUIRED_SPU_WORD_CAPACITY;
+    // This admission is intentionally P2-only.  Raw/C0 remains compatible
+    // with deployed VPU1/protocol1 images that predate SPU_PARAM/SPU_OUT v1.
+    const bool p2_admission_compatible =
+        p2_abi_compatible && spu_stream_quiescent && spu_word_capacity_compatible;
+    if (pl_scale_requested) {
+        LOGPROOF("P2 admission abi=0x%08x required=0x%08x abi_ok=%d stream_status=0x%08x quiescent=%d spu_word_capacity=%u required_words=%u capacity_ok=%d layout=param128x4_fp16pairs,out128_q16row",
+                 g_p2_stream_abi_signature, FPGA_REQUIRED_P2_STREAM_ABI,
+                 p2_abi_compatible ? 1 : 0, g_spu_stream_status,
+                 spu_stream_quiescent ? 1 : 0, g_spu_word_capacity,
+                 P2_REQUIRED_SPU_WORD_CAPACITY,
+                 spu_word_capacity_compatible ? 1 : 0);
+    }
     g_spu_silu_supported = spu_caps_valid && ((spu_caps & SPU_CAP_SILU_MUL) != 0U);
     g_spu_rmsnorm_supported = spu_caps_valid && ((spu_caps & SPU_CAP_RMSNORM) != 0U);
     g_spu_rope_supported = spu_caps_valid && ((spu_caps & SPU_CAP_ROPE) != 0U);
@@ -5841,24 +7031,34 @@ int fpga_init(void) {
     g_spu_q8_scale_stream_supported =
         caps_valid &&
         spu_caps_valid &&
+        g_vpu_pingpong_supported &&
+        g_vpu_descriptor_supported &&
         bitstream_id_compatible &&
         (g_stream_protocol_version == FPGA_REQUIRED_STREAM_PROTOCOL_VERSION) &&
         ((caps & VPU_CAP_SPU_RAW_STREAM) != 0U) &&
         ((caps & VPU_CAP_SPU_Q8_SCALE_STREAM) != 0U) &&
         ((spu_caps & SPU_CAP_VPU_RAW_STREAM) != 0U) &&
         ((spu_caps & SPU_CAP_VPU_Q8_SCALE_STREAM) != 0U) &&
-        env_flag_enabled("FPGA_PL_SCALE_ENABLE") &&
-        !env_flag_enabled("FPGA_PL_SCALE_DISABLE");
+        p2_admission_compatible &&
+        pl_scale_requested;
     g_pingpong_scheduler_enabled =
         g_vpu_pingpong_supported &&
         g_vpu_descriptor_supported &&
         raw_fpga_compatible &&
         env_flag_enabled("FPGA_PIPELINE_ENABLE") &&
         !env_flag_enabled("FPGA_PIPELINE_DISABLE");
-    if (env_flag_enabled("FPGA_PL_SCALE_ENABLE") && !g_spu_q8_scale_stream_supported) {
-        fpga_fatal("FPGA_PL_SCALE_ENABLE requested but stream capability/protocol is not compatible: caps=0x%08x spu_caps=0x%08x protocol=0x%08x required=%u",
-                   caps, spu_caps, g_stream_protocol_version, FPGA_REQUIRED_STREAM_PROTOCOL_VERSION);
+    if (pl_scale_requested && !g_spu_q8_scale_stream_supported) {
+        fpga_fatal("FPGA_PL_SCALE_ENABLE requested but P2 admission or stream/descriptors/protocol are incompatible: caps=0x%08x spu_caps=0x%08x protocol=0x%08x required_protocol=%u p2_abi=0x%08x required_p2_abi=0x%08x stream_status=0x%08x required_quiescent=0x%08x spu_words=%u required_words=%u",
+                   caps, spu_caps, g_stream_protocol_version, FPGA_REQUIRED_STREAM_PROTOCOL_VERSION,
+                   g_p2_stream_abi_signature, FPGA_REQUIRED_P2_STREAM_ABI,
+                   g_spu_stream_status, SPU_STREAM_STATUS_QUIESCENT,
+                   g_spu_word_capacity, P2_REQUIRED_SPU_WORD_CAPACITY);
     }
+    fpga_p2_init_breadcrumb("phase=admission pass p2_abi_ok=%d quiescent=%d capacity_ok=%d stream_supported=%d",
+                            p2_abi_compatible ? 1 : 0,
+                            spu_stream_quiescent ? 1 : 0,
+                            spu_word_capacity_compatible ? 1 : 0,
+                            g_spu_q8_scale_stream_supported ? 1 : 0);
     if (env_flag_enabled("FPGA_PIPELINE_ENABLE") && !g_pingpong_scheduler_enabled) {
         fpga_fatal("FPGA_PIPELINE_ENABLE requested but ping-pong descriptor capability is unavailable caps=0x%08x", caps);
     }
@@ -5868,8 +7068,25 @@ int fpga_init(void) {
              raw_fpga_compatible ? 1 : 0,
              legacy_raw_diagnostic_override ? 1 : 0,
              g_legacy_raw_cpu_bypass ? "cpu_quarantine" :
-             (g_contract_check_limit > 0 ? "contract_diagnostic" : "raw_fpga"));
-    vpu_select_banks(0, 0);
+             (g_pl_scale_contract_check_limit > 0 ? "p2_pl_scale_contract" :
+              (g_contract_check_limit > 0 ? "contract_diagnostic" : "raw_fpga")));
+    LOGPROOF("P2_SINGLE_BANK_CONFIG enabled=%d contract_limit=%d pipeline_enabled=%d scheduler=%d route=%s identity protocol=0x%08x bitstream_id=0x%08x p2_abi=0x%08x stream_status=0x%08x spu_words=%u descriptor_cap=%d pingpong_cap=%d windows spu_param=0x%08x spu_out=0x%08x",
+             g_spu_q8_scale_stream_supported ? 1 : 0,
+             g_pl_scale_contract_check_limit,
+             env_flag_enabled("FPGA_PIPELINE_ENABLE") ? 1 : 0,
+             g_pingpong_scheduler_enabled ? 1 : 0,
+             g_pl_scale_contract_check_limit > 0 ? "p2_single_bank_cpu_shadow" :
+             (g_spu_q8_scale_stream_supported ? "single_bank_production" : "disabled"),
+             g_stream_protocol_version, g_bitstream_id, g_p2_stream_abi_signature,
+             g_spu_stream_status, g_spu_word_capacity,
+             g_vpu_descriptor_supported ? 1 : 0, g_vpu_pingpong_supported ? 1 : 0,
+             SPU_PARAM_BASE, SPU_OUT_BASE);
+    if (!g_p2_init_requested) {
+        // Preserve the established raw-v52 initialization write.  P2 init is
+        // passive after admission; its first model tile selects its bank
+        // inside the force-flushed CONTROL_DESCRIPTOR trace boundary.
+        vpu_select_banks(0, 0);
+    }
 
     const char * mapping_policy =
         g_allow_devmem_fallback ? "diagnostic_all_resources" :
@@ -5916,10 +7133,11 @@ int fpga_init(void) {
          g_ip_timing_enabled ? 1 : 0,
          g_detail_every,
          g_log_flush_every);
-    LOGPROOF("ZDMA trace policy enabled=%d depth=%zu trigger=raw_mismatch_or_transfer_failure contract_check=%d explicit_env=FPGA_DMA_AUDIT",
+    LOGPROOF("ZDMA trace policy enabled=%d depth=%zu trigger=qualification_mismatch_or_transfer_failure raw_contract_check=%d p2_contract_check=%d explicit_env=FPGA_DMA_AUDIT",
              g_dma_trace_enabled ? 1 : 0,
              FPGA_DMA_TRACE_DEPTH,
-             g_contract_check_limit);
+             g_contract_check_limit,
+             g_pl_scale_contract_check_limit);
     if (g_activation_input_integrity_check) {
         LOGPROOF("FPGA_INPUT_INTEGRITY_CHECK=1: each raw FPGA matmul snapshots its logical F32 src1 before launch and verifies it after dst ownership returns; this is a qualification guard for M>1 graph layouts, not a CPU fallback or numerical replacement");
     }
@@ -5966,11 +7184,12 @@ int fpga_init(void) {
             (unsigned long long) LMM_BASE_PHYS,
             (unsigned long long) DMA_BASE_PHYS,
             (unsigned long long) DDR_BASE_PHYS);
-    LOGPROOF("mappings policy=%s dma=%s virt=0x%llx size=0x%zx vpu=%s virt=0x%llx size=0x%zx ddr=%s virt=0x%llx mapped_size=0x%zx advertised_size=0x%zx",
+    LOGPROOF("mappings policy=%s dma=%s virt=0x%llx size=0x%zx vpu=%s virt=0x%llx size=0x%zx ddr=%s ddr_map_kind=%s virt=0x%llx mapped_size=0x%zx advertised_size=0x%zx",
             mapping_policy,
             g_dma_map_source.c_str(), fpga_ptr_addr(g_dma), g_dma_map_size,
             g_vpu_map_source.c_str(), fpga_ptr_addr(g_vpu), g_vpu_map_size,
-            g_ddr_map_source.c_str(), fpga_ptr_addr(g_ddr), g_ddr_map_size,
+            g_ddr_map_source.c_str(), fpga_mapping_kind_name(g_ddr_mapping_kind),
+            fpga_ptr_addr(g_ddr), g_ddr_map_size,
             g_ddr_advertised_size);
     LOGINIT("VPU windows act=0x%08x weight=0x%08x result=0x%08x spu_out=0x%08x spu_param=0x%08x data_movement=ZDMA_bulk_copy no_axi_stream_main=1",
             ACT_BASE, WEIGHT_BASE, RESULT_BASE, SPU_OUT_BASE, SPU_PARAM_BASE);
@@ -5978,25 +7197,35 @@ int fpga_init(void) {
     if (g_vpu_max_beats == 256) {
         LOGE("MAX_COL_BEATS=256 detected; DMA-to-IP path will run, but this large BRAM setting is still suspicious for timing/resource use");
     }
-    LOGPROOF("cache coherency source=%s strict=%d whitelist=%d stress=%d; msync barriers are issued before DDR-to-device and after device-to-DDR transfers",
-         g_ddr_map_source.c_str(), g_strict_coherency ? 1 : 0,
-         g_coherency_platform_whitelisted ? 1 : 0, g_run_coherency_stress ? 1 : 0);
+    LOGPROOF("cache coherency source=%s map_kind=%s strict=%d whitelist=%d stress=%d; P2 physical-UIO DDR uses no_msync with DSB/readback before device and DSB before CPU reads, while raw-v52/C0 retains its legacy msync path",
+         g_ddr_map_source.c_str(), fpga_mapping_kind_name(g_ddr_mapping_kind),
+         g_strict_coherency ? 1 : 0, g_coherency_platform_whitelisted ? 1 : 0,
+         g_run_coherency_stress ? 1 : 0);
     LOGINIT("fallback policy: FPGA_ABORT_ON_CPU_FALLBACK=%d default_no_cpu_matmul_fallback=1",
             g_abort_on_cpu_fallback ? 1 : 0);
 
     if (!g_packed_q8_supported) {
         fpga_fatal("REG_CAPS=0x%08x does not expose packed_q8 capability; refusing CPU fallback", caps);
     }
-    if (!fpga_dma_basic_self_test()) {
-        fpga_fatal("basic ZDMA-to-IP self-test failed; refusing CPU fallback");
-    }
-    if (!fpga_dma_packed_self_test()) {
-        fpga_fatal("packed Q8 ZDMA-to-IP self-test failed; refusing CPU fallback");
-    }
-    if (!fpga_dma_row_limit_self_test()) {
-        fpga_fatal("row-limit packed Q8 self-test failed; refusing CPU fallback");
+    if (g_p2_init_requested) {
+        // P2 initialization is deliberately passive after UIO, ZDMA, and
+        // identity admission.  The first bounded P2 tile supplies its exact
+        // scale table and owns all VPU-to-SPU stream traffic.
+        fpga_p2_init_breadcrumb("phase=data_plane_selftests skipped reason=p2_passive_init");
+    } else {
+        // Preserve the established v52 raw-GEMV validation sequence exactly.
+        if (!fpga_dma_basic_self_test()) {
+            fpga_fatal("basic ZDMA-to-IP self-test failed; refusing CPU fallback");
+        }
+        if (!fpga_dma_packed_self_test()) {
+            fpga_fatal("packed Q8 ZDMA-to-IP self-test failed; refusing CPU fallback");
+        }
+        if (!fpga_dma_row_limit_self_test()) {
+            fpga_fatal("row-limit packed Q8 self-test failed; refusing CPU fallback");
+        }
     }
 
+    fpga_p2_init_breadcrumb("phase=ready route=p2_single_bank init_data_plane=none");
     return 0;
 }
 
@@ -6087,7 +7316,7 @@ void fpga_cleanup(void) {
              q8_unavailable_cpu,
              q8_coverage_complete ? "complete" : "incomplete",
              fpga_block_gemv_mode);
-    LOGPROOF("cleanup complete fpga_calls=%lld vpu_runs=%lld rejects=%lld attention_cpu_bypass=%lld vocab_projection_cpu_bypass=%lld legacy_raw_cpu_bypass=%lld elapsed_s=%.3f pingpong_cap=%d descriptor_cap=%d scheduler=%d activation_cache_enabled=%d activation_cache_hits=%lld misses=%lld weight_cache_builds=%lld hits=%lld misses=%lld bytes=%lld cache_lookup_ms=%.3f cache_crc_ms=%.3f weight_pack_ms=%.3f activation_scale_fp16_overflows=%lld input_integrity_checks=%lld input_integrity_failures=%lld contract_checks=%lld contract_limit_cpu_bypass=%lld raw_mismatches=%lld raw_repairs=%lld value_mismatches=%lld contract_cpu_shadow_dst_values=%lld staging_restages=%lld q8_source_audit_checks=%lld q8_source_audit_failures=%lld",
+    LOGPROOF("cleanup complete fpga_calls=%lld vpu_runs=%lld rejects=%lld attention_cpu_bypass=%lld vocab_projection_cpu_bypass=%lld legacy_raw_cpu_bypass=%lld elapsed_s=%.3f pingpong_cap=%d descriptor_cap=%d scheduler=%d activation_cache_enabled=%d activation_cache_hits=%lld misses=%lld weight_cache_builds=%lld hits=%lld misses=%lld bytes=%lld cache_lookup_ms=%.3f cache_crc_ms=%.3f weight_pack_ms=%.3f activation_scale_fp16_overflows=%lld input_integrity_checks=%lld input_integrity_failures=%lld contract_checks=%lld contract_limit_cpu_bypass=%lld raw_mismatches=%lld raw_repairs=%lld value_mismatches=%lld contract_cpu_shadow_dst_values=%lld staging_restages=%lld q8_source_audit_checks=%lld q8_source_audit_failures=%lld p2_matrix_contract_checks=%lld p2_tile_q16_checks=%lld p2_tile_limit=%d p2_tile_boundary=%d matrix_value_contract=%s p2_jobs=%lld p2_banks=%lld p2_stream_drops=%lld p2_stream_errors=%lld",
          g_fpga_count,
          g_fpga_vpu_runs,
          g_reject_count,
@@ -6119,7 +7348,16 @@ void fpga_cleanup(void) {
          g_contract_cpu_shadow_dst_values,
          g_contract_staging_restage_count,
          g_q8_source_audit_checks,
-         g_q8_source_audit_failures);
+         g_q8_source_audit_failures,
+         g_p2_matrix_contract_checks,
+         g_p2_tile_q16_checks,
+         g_p2_tile_limit,
+         g_p2_tile_contract_boundary_reached ? 1 : 0,
+         g_pl_scale_contract_check_limit > 0 ? "not_attempted" : "not_applicable",
+         g_pl_scale_jobs,
+         g_pl_scale_banks,
+         g_pl_scale_stream_drops,
+         g_pl_scale_stream_errors);
     fflush(fpga_log_fp());
     pthread_mutex_unlock(&g_mutex);
 }
@@ -6224,8 +7462,9 @@ extern "C" int fpga_try_matmul_extended(
     // including the vocabulary projection, while leaving all work to CPU.
     const bool source_audit_only = fpga_source_audit_only_requested() != 0;
     if (source_audit_only) {
-        if (env_int_value("FPGA_CONTRACT_CHECK", 0, 0, 1000000) > 0) {
-            fpga_fatal("FPGA_SOURCE_AUDIT_ONLY and FPGA_CONTRACT_CHECK cannot be enabled together; source audit must not launch model GEMVs through ZDMA/VPU");
+        if (env_int_value("FPGA_CONTRACT_CHECK", 0, 0, 1000000) > 0 ||
+            env_int_value("FPGA_PL_SCALE_CONTRACT_CHECK", 0, 0, 1000000) > 0) {
+            fpga_fatal("FPGA_SOURCE_AUDIT_ONLY cannot coexist with FPGA_CONTRACT_CHECK or FPGA_PL_SCALE_CONTRACT_CHECK; source audit must not launch model GEMVs through ZDMA/VPU");
         }
         if (ith != 0) {
             return 0;
@@ -6281,6 +7520,9 @@ extern "C" int fpga_try_matmul_extended(
         }
     }
 
+    // A qualification limit must stop all board launches once it is reached.
+    // This applies to both raw C0 and P2; later eligible GEMVs remain native
+    // CPU work and are not an FPGA-unavailability fallback.
     // `FPGA_CONTRACT_CHECK=N` used to stop only the comparison loop. The host
     // still launched later raw VPU jobs, but returned CPU shadow for their
     // destinations. That is neither a complete hardware qualification nor a
@@ -6289,16 +7531,34 @@ extern "C" int fpga_try_matmul_extended(
     // GEMVs execute, stage, and validate on FPGA; all later eligible GEMVs use
     // the upstream CPU kernel without being counted as FPGA unavailability or
     // a production fallback.
-    if (q8_f32_f32_candidate && g_contract_cpu_shadow_dst &&
+    const bool raw_contract_boundary =
         g_contract_check_limit > 0 &&
-        g_contract_checks_done >= (long long) g_contract_check_limit) {
+        g_contract_checks_done >= (long long) g_contract_check_limit;
+    const bool p2_contract_boundary =
+        g_pl_scale_contract_check_limit > 0 &&
+        (g_p2_tile_contract_boundary_reached ||
+         g_pl_scale_contract_checks_done >= (long long) g_pl_scale_contract_check_limit);
+    if (q8_f32_f32_candidate && g_contract_cpu_shadow_dst &&
+        (raw_contract_boundary || p2_contract_boundary)) {
         if (ith == 0) {
             pthread_mutex_lock(&g_mutex);
             g_contract_limit_cpu_bypass_count++;
             if (!g_contract_limit_cpu_bypass_logged) {
-                LOGPROOF("C0 qualification boundary reached checked=%lld limit=%d; subsequent eligible Q8 GEMVs use the native CPU kernel without ZDMA/VPU launch. This is an explicit bounded-C0 policy, not FPGA unavailability or a production fallback.",
-                         g_contract_checks_done, g_contract_check_limit);
+                LOGPROOF("qualification boundary route=cpu_native mode=%s checked=%lld limit=%d p2_tile_q16_checks=%lld p2_matrix_contract_checks=%lld matrix_value_contract=%s hw_completed=%lld input_integrity_failures=%lld contract_limit_cpu_bypass=%lld; subsequent eligible Q8 GEMVs use the native CPU kernel without ZDMA/VPU launch. This is an explicit bounded qualification policy, not FPGA unavailability or a production fallback.",
+                         p2_contract_boundary ? "p2_spu_scale" : "raw_c0",
+                         p2_contract_boundary ? g_p2_tile_q16_checks : g_contract_checks_done,
+                         p2_contract_boundary ? g_p2_tile_limit : g_contract_check_limit,
+                         g_p2_tile_q16_checks,
+                         g_p2_matrix_contract_checks,
+                         p2_contract_boundary ? "not_attempted" : "n/a",
+                         g_fpga_count,
+                         g_activation_input_integrity_failures,
+                         g_contract_limit_cpu_bypass_count);
                 g_contract_limit_cpu_bypass_logged = true;
+                // C0 runs are often terminated at the first anomaly.  Make
+                // the one-time transition evidence durable immediately rather
+                // than relying on normal cleanup after the CPU continuation.
+                fflush(fpga_log_fp());
             }
             pthread_mutex_unlock(&g_mutex);
         }
@@ -6451,6 +7711,14 @@ extern "C" int fpga_try_matmul_extended(
         }
         fpga_fatal("ZDMA-to-IP/VPU matmul failed tensor=%s layer=%d shape=K%lld_N%lld_M%lld; refusing CPU fallback",
                    tensor_name, effective_layer_id, (long long) k, (long long) n, (long long) m);
+    }
+
+    if (g_p2_tile_contract_boundary_reached) {
+        // A P2 tile contract deliberately does not own a complete dst matrix.
+        // The GGML kernel must compute the current MUL_MAT natively, while the
+        // boundary above keeps every following eligible GEMV off the board.
+        pthread_mutex_unlock(&g_mutex);
+        return FPGA_MATMUL_CONTRACT_CPU_SHADOW;
     }
 
     g_fpga_count++;
