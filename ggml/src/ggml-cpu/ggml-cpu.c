@@ -1228,7 +1228,7 @@ static void do_fpga_init(void) {
         g_fpga_initialized = 1;
         fprintf(stderr, "[FPGA] Kernel ready!\n");
     } else {
-        fprintf(stderr, "[FPGA] init FAILED, fallback to CPU\n");
+        fprintf(stderr, "[FPGA] init FAILED; FPGA execution is unavailable and the configured fail-closed policy applies\n");
     }
 }
 #endif

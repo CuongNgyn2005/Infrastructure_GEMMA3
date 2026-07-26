@@ -29,7 +29,7 @@
 #include <vector>
 
 #define FPGA_LOG_FILE           "/tmp/fpga_debug.log"
-#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v61-p2-terminal-quiet"
+#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v62-p2-default-low-ddr"
 
 #define MY_IP_BASE_ADDRESS 0x00000000A0000000LL
 #define REG_BASE_PHYS      0x00000000A0000000LL
@@ -1131,7 +1131,9 @@ static bool fpga_write_post_spu_descriptor(const fpga_tile_job_t & job,
 
 static void fpga_p2_descriptor_commit_breadcrumb_before(const fpga_tile_job_t &            job,
                                                         const fpga_p2_descriptor_words_t & expected) {
-    if (!g_p2_init_requested || job.tile_id != 0U) {
+    const bool emit_success = g_p2_boundary_diagnostics_enabled || g_p2_terminal_trace_enabled ||
+                              g_p2_tile_trace_enabled || g_pl_scale_contract_check_limit > 0;
+    if (!g_p2_init_requested || job.tile_id != 0U || !emit_success) {
         return;
     }
 
@@ -1161,7 +1163,9 @@ static void fpga_p2_descriptor_commit_breadcrumb_after(const fpga_tile_job_t &  
                                                        const fpga_p2_descriptor_words_t & expected,
                                                        const fpga_p2_descriptor_words_t & actual,
                                                        bool                               match) {
-    if (!g_p2_init_requested || job.tile_id != 0U) {
+    const bool emit_success = g_p2_boundary_diagnostics_enabled || g_p2_terminal_trace_enabled ||
+                              g_p2_tile_trace_enabled || g_pl_scale_contract_check_limit > 0;
+    if (!g_p2_init_requested || job.tile_id != 0U || !emit_success) {
         return;
     }
 
@@ -1765,6 +1769,7 @@ static bool find_uio_device_from_ref(const char *  ref,
 static bool map_uio_region(const char *        uio_name,
                            const char *        env_name,
                            uint64_t            phys,
+                           size_t              advertised_min_size,
                            size_t              required_size,
                            const char *        tag,
                            size_t              requested_map_size,
@@ -1795,8 +1800,17 @@ static bool map_uio_region(const char *        uio_name,
             resolved_name = uio_name;
         }
     }
-    if (uio_size < required_size) {
-        LOGE("UIO %s for %s is too small: size=0x%zx required=0x%zx", dev_path.c_str(), tag, uio_size, required_size);
+    // The low-DDR overlay is a distinct production resource.  Do not accept
+    // an address-only alias for it: the post-overlay command must resolve the
+    // named fpga_ddr_low UIO node, never the retired ddr_high resource.
+    if (strcmp(uio_name, "fpga_ddr_low") == 0 && resolved_name != uio_name) {
+        LOGE("UIO %s for %s resolved_name=%s; require exact resource name=%s", dev_path.c_str(), tag,
+             resolved_name.c_str(), uio_name);
+        return false;
+    }
+    if (uio_size < advertised_min_size) {
+        LOGE("UIO %s for %s is too small: advertised=0x%zx required_advertised=0x%zx", dev_path.c_str(), tag,
+             uio_size, advertised_min_size);
         return false;
     }
 
@@ -1907,6 +1921,7 @@ static bool map_region_prefer_uio(const char *        uio_name,
                                   const char *        env_name,
                                   uint64_t            phys,
                                   size_t              devmem_size,
+                                  size_t              advertised_min_size,
                                   size_t              required_size,
                                   const char *        tag,
                                   size_t              requested_map_size,
@@ -1917,7 +1932,7 @@ static bool map_region_prefer_uio(const char *        uio_name,
                                   size_t *            advertised_size,
                                   std::string *       source,
                                   fpga_mapping_kind * mapping_kind) {
-    if (map_uio_region(uio_name, env_name, phys, required_size, tag, requested_map_size, map_base, map_size,
+    if (map_uio_region(uio_name, env_name, phys, advertised_min_size, required_size, tag, requested_map_size, map_base, map_size,
                        advertised_size, source, mapping_kind)) {
         return true;
     }
@@ -1949,7 +1964,7 @@ static bool map_region_prefer_uio(const char *        uio_name,
 
 static bool map_registers_dma_ddr(void) {
     fpga_p2_init_breadcrumb("phase=mapping_zdma begin policy=uio_only");
-    if (!map_region_prefer_uio("dma-controller", "FPGA_DMA_UIO", DMA_BASE_PHYS, DMA_MMAP_SIZE, sizeof(dma_ctrl), "ZDMA",
+    if (!map_region_prefer_uio("dma-controller", "FPGA_DMA_UIO", DMA_BASE_PHYS, DMA_MMAP_SIZE, sizeof(dma_ctrl), sizeof(dma_ctrl), "ZDMA",
                                0, g_allow_devmem_fallback, "uio_required", &g_dma_map_base, &g_dma_map_size, nullptr,
                                &g_dma_map_source, nullptr)) {
         return false;
@@ -1963,7 +1978,7 @@ static bool map_registers_dma_ddr(void) {
     fpga_p2_init_breadcrumb(
         "phase=mapping_my_ip begin required_phys=0x%llx required_offset=0 required_size=0x%zx policy=uio_only",
         (unsigned long long) REG_BASE_PHYS, VPU_DEVMEM_COMPAT_MMAP);
-    if (!map_region_prefer_uio("MY_IP", "FPGA_VPU_UIO", REG_BASE_PHYS, VPU_DEVMEM_COMPAT_MMAP, VPU_DEVMEM_COMPAT_MMAP,
+    if (!map_region_prefer_uio("MY_IP", "FPGA_VPU_UIO", REG_BASE_PHYS, VPU_DEVMEM_COMPAT_MMAP, VPU_DEVMEM_COMPAT_MMAP, VPU_DEVMEM_COMPAT_MMAP,
                                "MY_IP/VPU", VPU_DEVMEM_COMPAT_MMAP,
                                g_allow_devmem_fallback || g_allow_vpu_devmem_compat,
                                g_allow_devmem_fallback ? "diagnostic_all_resources" : "vpu_devmem_compat",
@@ -1982,8 +1997,8 @@ static bool map_registers_dma_ddr(void) {
         return false;
     }
     g_ddr_mapping_kind = fpga_mapping_kind::UNKNOWN;
-    if (!map_region_prefer_uio("ddr_high", "FPGA_DDR_UIO", DDR_BASE_PHYS, DDR_REGION_SIZE, DDR_REQUIRED_BYTES,
-                               "ddr_high", g_ddr_requested_map_size, g_allow_devmem_fallback, "uio_required",
+    if (!map_region_prefer_uio("fpga_ddr_low", "FPGA_DDR_UIO", DDR_BASE_PHYS, DDR_REGION_SIZE, DDR_REGION_SIZE, DDR_REQUIRED_BYTES,
+                               "fpga_ddr_low", g_ddr_requested_map_size, g_allow_devmem_fallback, "uio_required",
                                &g_ddr_map_base, &g_ddr_map_size, &g_ddr_advertised_size, &g_ddr_map_source,
                                &g_ddr_mapping_kind)) {
         return false;
@@ -1997,7 +2012,7 @@ static bool map_registers_dma_ddr(void) {
 static bool configure_ddr_mapping_policy(void) {
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
-        LOGE("cannot determine page size for ddr_high mapping");
+        LOGE("cannot determine page size for fpga_ddr_low mapping");
         return false;
     }
 
@@ -2022,7 +2037,7 @@ static bool configure_ddr_mapping_policy(void) {
         LOGE(
             "refusing unconfirmed large weight cache: FPGA_WEIGHT_CACHE_MB=%lld exceeds default_max_mb=%lld; "
             "requested_phys=[0x%llx,0x%llx). No DDR mapping or cache write was performed. Run the read-only "
-            "ddr_high/reserved-memory preflight and graduated cache tests first; FPGA_WEIGHT_CACHE_LARGE_CONFIRMED is "
+            "fpga_ddr_low/reserved-memory preflight and graduated cache tests first; FPGA_WEIGHT_CACHE_LARGE_CONFIRMED is "
             "an operator acknowledgement, not a safety check",
             cache_mb, WEIGHT_CACHE_DEFAULT_MAX_MB, (unsigned long long) cache_start, (unsigned long long) cache_end);
         return false;
@@ -2055,7 +2070,7 @@ static void configure_weight_cache(void) {
     }
     if (!ddr_is_mapped() || g_ddr_map_size <= WEIGHT_CACHE_BASE) {
         g_weight_cache_enabled = false;
-        LOGE("weight tile cache disabled: ddr_high size=0x%zx is too small for base=0x%08x", g_ddr_map_size,
+        LOGE("weight tile cache disabled: fpga_ddr_low size=0x%zx is too small for base=0x%08x", g_ddr_map_size,
              WEIGHT_CACHE_BASE);
         return;
     }
@@ -2098,7 +2113,7 @@ static bool msync_ddr_range(uint32_t off, size_t bytes, bool invalidate, const c
     const size_t    len           = align_up_size((size_t) (end - aligned_begin), (size_t) page);
     const int       flags         = MS_SYNC | (invalidate ? MS_INVALIDATE : 0);
     mmio_fence();
-    // A UIO ddr_high mapping on this board reports EINVAL for msync.  Keep
+    // A UIO fpga_ddr_low mapping on this board reports EINVAL for msync.  Keep
     // v16's conservative per-tile attempt for ordinary ACT/WEIGHT/RESULT DMA
     // ranges, but do not repeat that unsupported call for one large cache
     // payload (potentially 1.1 GiB) during warm-up.
@@ -2114,7 +2129,7 @@ static bool msync_ddr_range(uint32_t off, size_t bytes, bool invalidate, const c
             (saved_errno == EINVAL || saved_errno == ENODEV)) {
             if (!g_ddr_msync_unsupported_logged) {
                 LOGI(
-                    "msync unsupported for ddr_high source=%s errno=%d (%s); generic-uio physical maps are normally "
+                    "msync unsupported for fpga_ddr_low source=%s errno=%d (%s); generic-uio physical maps are normally "
                     "non-cached, but cacheability is kernel-owned. Continuing with ordered volatile DDR accesses; this "
                     "message alone does not prove a cache fault.",
                     g_ddr_map_source.c_str(), saved_errno, strerror(saved_errno));
@@ -2127,14 +2142,14 @@ static bool msync_ddr_range(uint32_t off, size_t bytes, bool invalidate, const c
         if ((saved_errno == EINVAL || saved_errno == ENODEV) && g_strict_coherency &&
             g_coherency_platform_whitelisted) {
             LOGI(
-                "strict coherency whitelist accepts unsupported msync for ddr_high source=%s; CPU barriers remain "
+                "strict coherency whitelist accepts unsupported msync for fpga_ddr_low source=%s; CPU barriers remain "
                 "enabled",
                 g_ddr_map_source.c_str());
             mmio_fence();
             return true;
         }
         LOGE(
-            "msync ddr_high tag=%s off=0x%08x bytes=%zu invalidate=%d errno=%d (%s) source=%s aligned=0x%llx len=0x%zx "
+            "msync fpga_ddr_low tag=%s off=0x%08x bytes=%zu invalidate=%d errno=%d (%s) source=%s aligned=0x%llx len=0x%zx "
             "flags=0x%x",
             tag, off, bytes, invalidate ? 1 : 0, saved_errno, strerror(saved_errno), g_ddr_map_source.c_str(),
             (unsigned long long) aligned_begin, len, flags);
@@ -2162,10 +2177,16 @@ static void fpga_p2_ddr_sync_breadcrumb(const char * tag,
                                         uint32_t     off,
                                         size_t       bytes,
                                         const char * ordering) {
-    LOGPROOF("P2_DDR_SYNC tag=%s direction=%s offset=0x%08x bytes=%zu map_kind=%s action=no_msync ordering=%s",
-             tag ? tag : "?", direction, off, bytes, fpga_mapping_kind_name(g_ddr_mapping_kind), ordering);
-    // Qualification is deliberately bounded.  Mirror each P2 physical-DDR
-    // handoff to stderr so a board lockup cannot hide the final ordering edge.
+    // DSB/readback remains mandatory for every P2 handoff.  Routine success
+    // records are bounded so primary latency logging cannot be flooded.
+    const bool emit_success = g_p2_boundary_diagnostics_enabled || g_p2_first_act_dma_trace_active ||
+                              g_pl_scale_contract_check_limit > 0;
+    if (emit_success) {
+        LOGPROOF("P2_DDR_SYNC tag=%s direction=%s offset=0x%08x bytes=%zu map_kind=%s action=no_msync ordering=%s",
+                 tag ? tag : "?", direction, off, bytes, fpga_mapping_kind_name(g_ddr_mapping_kind), ordering);
+    }
+    // Qualification is deliberately bounded.  Mirror its handoffs to stderr
+    // so a board lockup cannot hide the final ordering edge.
     if (g_p2_first_act_dma_trace_active || g_pl_scale_contract_check_limit > 0) {
         fpga_p2_dma_breadcrumb(
             "step=ddr_sync tag=%s direction=%s offset=0x%08x bytes=%zu map_kind=%s action=no_msync ordering=%s",
@@ -2191,14 +2212,14 @@ static bool fpga_p2_ddr_sync(uint32_t off, size_t bytes, bool device_to_cpu, con
     }
     if (!p2_uio_ddr_mapping_active()) {
         LOGE(
-            "P2 DDR sync requires an explicit physical UIO ddr_high mapping tag=%s map_kind=%s; refusing before "
+            "P2 DDR sync requires an explicit physical UIO fpga_ddr_low mapping tag=%s map_kind=%s; refusing before "
             "data-plane transfer",
             tag ? tag : "?", fpga_mapping_kind_name(g_ddr_mapping_kind));
         return false;
     }
     if (p2_msync_or_stress_requested()) {
         LOGE(
-            "P2 rejects FPGA_STRICT_COHERENCY/FPGA_STRICT_MSYNC/FPGA_COHERENCY_STRESS for physical UIO ddr_high "
+            "P2 rejects FPGA_STRICT_COHERENCY/FPGA_STRICT_MSYNC/FPGA_COHERENCY_STRESS for physical UIO fpga_ddr_low "
             "tag=%s; no msync syscall or data-plane transfer was issued",
             tag ? tag : "?");
         return false;
@@ -3833,7 +3854,7 @@ static void fpga_stage_q8_group_payload(const block_q8_0_t * weight_snapshot,
     mmio_fence();
 }
 
-// ddr_high is exposed through UIO/O_SYNC, but this board reports EINVAL for
+// fpga_ddr_low is exposed through UIO/O_SYNC, but this board reports EINVAL for
 // msync().  A DSB followed by reads from both ends of the written range drains
 // posted PS stores before ZDMA becomes the reader.  The full C0 audit below is
 // stronger; this bounded fence remains enabled in normal execution.
@@ -5028,12 +5049,13 @@ static void p2_trace_set_job_context(const fpga_tile_job_t & job) {
     g_p2_trace_bank    = job.bank;
 }
 
-static bool p2_trace_this_tile(const fpga_tile_job_t & job) {
-    // Preserve the low-noise primary-path behavior.  Qualification and the
-    // explicit boundary diagnostic are the only modes allowed to trace every
-    // tile/transfer; this makes a board stop diagnosable without turning a
-    // normal PL-scale run into a terminal flood.
-    return g_p2_init_requested && (job.tile_id == 0U || g_p2_tile_trace_enabled);
+static bool p2_trace_this_tile() {
+    // Success breadcrumbs are diagnostic/qualification evidence only.  A
+    // normal P2 GEMV keeps STAGE/TOKEN and error logs, but emits no per-tile
+    // trace records into the primary latency log.
+    return g_p2_init_requested &&
+           (g_p2_boundary_diagnostics_enabled || g_p2_terminal_trace_enabled || g_p2_tile_trace_enabled ||
+            g_pl_scale_contract_check_limit > 0);
 }
 
 static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
@@ -5190,7 +5212,7 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
 }
 
 static void p2_trace_first_tile(const fpga_tile_job_t & job, const char * stage, const char * edge) {
-    if (!p2_trace_this_tile(job)) {
+    if (!p2_trace_this_tile()) {
         return;
     }
     LOGPROOF("P2_TILE_TRACE stage=%s edge=%s job=%u bank=%d tile=%u", stage, edge, job.job_id, job.bank, job.tile_id);
@@ -6417,7 +6439,14 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip(const struct ggml_tensor * src0,
 }
 
 int fpga_init(void) {
-    g_p2_init_requested = env_flag_enabled("FPGA_PL_SCALE_ENABLE") && !env_flag_enabled("FPGA_PL_SCALE_DISABLE");
+    const bool pl_scale_enable_env  = env_flag_enabled("FPGA_PL_SCALE_ENABLE");
+    const bool pl_scale_disable_env = env_flag_enabled("FPGA_PL_SCALE_DISABLE");
+    if (pl_scale_enable_env && pl_scale_disable_env) {
+        fpga_fatal("FPGA_PL_SCALE_ENABLE=1 conflicts with FPGA_PL_SCALE_DISABLE=1; select exactly one P2 policy");
+    }
+    // P2 is production-default.  FPGA_PL_SCALE_ENABLE=1 remains compatible;
+    // FPGA_PL_SCALE_DISABLE=1 is the explicit production opt-out.
+    g_p2_init_requested = !pl_scale_disable_env;
     g_p2_first_act_dma_trace_active     = false;
     g_p2_first_act_dma_trace_done       = false;
     g_p2_tile_limit                     = 0;
@@ -6577,8 +6606,8 @@ int fpga_init(void) {
             g_contract_check_limit, g_pl_scale_contract_check_limit);
     }
     if (g_pl_scale_contract_check_limit > 0) {
-        if (!env_flag_enabled("FPGA_PL_SCALE_ENABLE") || env_flag_enabled("FPGA_PL_SCALE_DISABLE")) {
-            fpga_fatal("P2 requires FPGA_PL_SCALE_ENABLE=1 and rejects FPGA_PL_SCALE_DISABLE");
+        if (pl_scale_disable_env) {
+            fpga_fatal("FPGA_PL_SCALE_CONTRACT_CHECK requires P2, but FPGA_PL_SCALE_DISABLE=1 opted it out");
         }
         if (env_flag_enabled("FPGA_PIPELINE_ENABLE")) {
             fpga_fatal(
@@ -6660,8 +6689,9 @@ int fpga_init(void) {
     g_abort_on_cpu_fallback            = !env_flag_disabled("FPGA_ABORT_ON_CPU_FALLBACK");
     g_activation_input_integrity_check = env_flag_enabled("FPGA_INPUT_INTEGRITY_CHECK");
     if ((g_contract_check_limit > 0 || g_pl_scale_contract_check_limit > 0) && !g_activation_input_integrity_check) {
-        // C0 deliberately exercises M>1 layouts. It must always prove that
-        // the host/VPU path leaves each live F32 source activation intact.
+        // Qualification deliberately exercises M>1 layouts and must prove
+        // that the host/VPU path leaves each live F32 source intact.  Ordinary
+        // primary P2 remains snapshot-free unless explicitly requested.
         g_activation_input_integrity_check = true;
         LOGPROOF(
             "qualification input-integrity policy: raw C0/P2 automatically enable the F32 src1 snapshot/verify guard; "
@@ -6677,7 +6707,7 @@ int fpga_init(void) {
     }
     if (g_p2_init_requested && g_ddr_mapping_kind != fpga_mapping_kind::UIO_PHYSICAL) {
         fpga_fatal(
-            "P2 requires the verified physical UIO ddr_high mapping; map_kind=%s. No ZDMA initialization or data-plane "
+            "P2 requires the verified physical UIO fpga_ddr_low mapping; map_kind=%s. No ZDMA initialization or data-plane "
             "transfer was issued",
             fpga_mapping_kind_name(g_ddr_mapping_kind));
     }
@@ -6805,9 +6835,16 @@ int fpga_init(void) {
         ((caps & VPU_CAP_SPU_RAW_STREAM) != 0U) && ((caps & VPU_CAP_SPU_Q8_SCALE_STREAM) != 0U) &&
         ((spu_caps & SPU_CAP_VPU_RAW_STREAM) != 0U) && ((spu_caps & SPU_CAP_VPU_Q8_SCALE_STREAM) != 0U) &&
         p2_admission_compatible && pl_scale_requested;
-    g_pingpong_scheduler_enabled = g_vpu_pingpong_supported && g_vpu_descriptor_supported && raw_fpga_compatible &&
-                                   env_flag_enabled("FPGA_PIPELINE_ENABLE") &&
-                                   !env_flag_enabled("FPGA_PIPELINE_DISABLE");
+    const bool pipeline_enable_env  = env_flag_enabled("FPGA_PIPELINE_ENABLE");
+    const bool pipeline_disable_env = env_flag_enabled("FPGA_PIPELINE_DISABLE");
+    if (pipeline_enable_env && pipeline_disable_env) {
+        fpga_fatal("FPGA_PIPELINE_ENABLE=1 conflicts with FPGA_PIPELINE_DISABLE=1; select exactly one scheduler policy");
+    }
+    // Once P2 admission has passed, the descriptor/bank scheduler is the
+    // production default.  FPGA_PIPELINE_ENABLE=1 remains compatible;
+    // FPGA_PIPELINE_DISABLE=1 is the explicit serialized-P2 opt-out.
+    g_pingpong_scheduler_enabled = g_p2_init_requested && g_vpu_pingpong_supported && g_vpu_descriptor_supported &&
+                                   raw_fpga_compatible && p2_admission_compatible && !pipeline_disable_env;
     if (pl_scale_requested && !g_spu_q8_scale_stream_supported) {
         fpga_fatal(
             "FPGA_PL_SCALE_ENABLE requested but P2 admission or stream/descriptors/protocol are incompatible: "
@@ -6820,9 +6857,11 @@ int fpga_init(void) {
     fpga_p2_init_breadcrumb("phase=admission pass p2_abi_ok=%d quiescent=%d capacity_ok=%d stream_supported=%d",
                             p2_abi_compatible ? 1 : 0, spu_stream_quiescent ? 1 : 0,
                             spu_word_capacity_compatible ? 1 : 0, g_spu_q8_scale_stream_supported ? 1 : 0);
-    if (env_flag_enabled("FPGA_PIPELINE_ENABLE") && !g_pingpong_scheduler_enabled) {
-        fpga_fatal("FPGA_PIPELINE_ENABLE requested but ping-pong descriptor capability is unavailable caps=0x%08x",
-                   caps);
+    if (g_p2_init_requested && !pipeline_disable_env && !g_pingpong_scheduler_enabled) {
+        fpga_fatal(
+            "P2 default ping-pong scheduler requires compatible bank/descriptor/identity/stream admission; "
+            "caps=0x%08x protocol=0x%08x p2_abi=0x%08x stream_status=0x%08x",
+            caps, g_stream_protocol_version, g_p2_stream_abi_signature, g_spu_stream_status);
     }
     LOGPROOF(
         "raw FPGA compatibility gate id_ok=%d protocol_ok=%d raw_compatible=%d legacy_diagnostic_override=%d route=%s",
@@ -6833,13 +6872,14 @@ int fpga_init(void) {
             (g_pl_scale_contract_check_limit > 0 ? "p2_pl_scale_contract" :
                                                    (g_contract_check_limit > 0 ? "contract_diagnostic" : "raw_fpga")));
     LOGPROOF(
-        "P2_SINGLE_BANK_CONFIG enabled=%d contract_limit=%d pipeline_enabled=%d scheduler=%d route=%s identity "
+        "P2_CONFIG enabled=%d contract_limit=%d pipeline_default_on=%d pipeline_disable=%d scheduler=%d route=%s identity "
         "protocol=0x%08x bitstream_id=0x%08x p2_abi=0x%08x stream_status=0x%08x spu_words=%u descriptor_cap=%d "
         "pingpong_cap=%d windows spu_param=0x%08x spu_out=0x%08x",
         g_spu_q8_scale_stream_supported ? 1 : 0, g_pl_scale_contract_check_limit,
-        env_flag_enabled("FPGA_PIPELINE_ENABLE") ? 1 : 0, g_pingpong_scheduler_enabled ? 1 : 0,
-        g_pl_scale_contract_check_limit > 0 ? "p2_single_bank_cpu_shadow" :
-                                              (g_spu_q8_scale_stream_supported ? "single_bank_production" : "disabled"),
+        pipeline_disable_env ? 0 : 1, pipeline_disable_env ? 1 : 0, g_pingpong_scheduler_enabled ? 1 : 0,
+        g_pl_scale_contract_check_limit > 0 ? "p2_contract_cpu_shadow" :
+                                              (g_pingpong_scheduler_enabled ? "pingpong_production" :
+                                                                               (g_spu_q8_scale_stream_supported ? "serialized_p2" : "disabled")),
         g_stream_protocol_version, g_bitstream_id, g_p2_stream_abi_signature, g_spu_stream_status, g_spu_word_capacity,
         g_vpu_descriptor_supported ? 1 : 0, g_vpu_pingpong_supported ? 1 : 0, SPU_PARAM_BASE, SPU_OUT_BASE);
     if (!g_p2_init_requested) {
@@ -6856,7 +6896,7 @@ int fpga_init(void) {
     LOGPROOF(
         "ready version=%s path=%s rows=%d host_row_limit=%d col_beats=%d cols=%d packed_q8=%d max_group_blocks=%d "
         "result_words=%d zdma_max_transfer_bytes=%zu pingpong_cap=%d descriptor_cap=%d scheduler=%d "
-        "scheduler_policy=opt_in pl_scale=%d pl_scale_policy=opt_in stream_protocol=0x%08x bitstream_id=0x%08x "
+        "scheduler_policy=default_on_opt_out pl_scale=%d pl_scale_policy=default_on_opt_out stream_protocol=0x%08x bitstream_id=0x%08x "
         "spu_silu=%d spu_rms=%d spu_rope=%d spu_softmax=%d weight_cache=%d activation_cache=%d "
         "input_integrity_check=%d vocab_cpu_bypass=%d legacy_raw_cpu_bypass=%d vocab_min_n=%lld contract_check=%d "
         "source_audit_only=%d contract_abort=%d contract_forensics=%d contract_deep_staging=%d "
@@ -6898,14 +6938,16 @@ int fpga_init(void) {
     LOGPROOF(
         "manifest host_version=%s host_build=\"%s %s\" limits=0x%08x caps=0x%08x spu_caps=0x%08x "
         "stream_protocol=0x%08x required_protocol=%u bitstream_id=0x%08x expected_bitstream_id=0x%08x "
-        "bitstream_id_compatible=%d pingpong_cap=%d descriptor_cap=%d scheduler=%d scheduler_policy=opt_in pl_scale=%d "
-        "pl_scale_policy=opt_in devmem_all_resources=%d vpu_devmem_compat=%d mapping_policy=%s spu_silu=%d spu_rms=%d "
+        "bitstream_id_compatible=%d pingpong_cap=%d descriptor_cap=%d scheduler=%d scheduler_policy=default_on_opt_out pl_scale=%d "
+        "pl_scale_policy=default_on_opt_out pl_scale_enable_env=%d pl_scale_disable_env=%d pipeline_disable_env=%d "
+        "devmem_all_resources=%d vpu_devmem_compat=%d mapping_policy=%s spu_silu=%d spu_rms=%d "
         "spu_rope=%d spu_softmax=%d bases my_ip=0x%llx dma=0x%llx ddr=0x%llx windows act=0x%08x weight=0x%08x "
         "result=0x%08x spu_out=0x%08x spu_param=0x%08x block_q8_0_size=%zu compact_weight_layout_required=1",
         FPGA_HOST_TRACE_VERSION, __DATE__, __TIME__, limits, caps, spu_caps, g_stream_protocol_version,
         FPGA_REQUIRED_STREAM_PROTOCOL_VERSION, g_bitstream_id, FPGA_EXPECTED_BITSTREAM_ID,
         bitstream_id_compatible ? 1 : 0, g_vpu_pingpong_supported ? 1 : 0, g_vpu_descriptor_supported ? 1 : 0,
-        g_pingpong_scheduler_enabled ? 1 : 0, g_spu_q8_scale_stream_supported ? 1 : 0, g_allow_devmem_fallback ? 1 : 0,
+        g_pingpong_scheduler_enabled ? 1 : 0, g_spu_q8_scale_stream_supported ? 1 : 0, pl_scale_enable_env ? 1 : 0,
+        pl_scale_disable_env ? 1 : 0, pipeline_disable_env ? 1 : 0, g_allow_devmem_fallback ? 1 : 0,
         g_allow_vpu_devmem_compat ? 1 : 0, mapping_policy, g_spu_silu_supported ? 1 : 0,
         g_spu_rmsnorm_supported ? 1 : 0, g_spu_rope_supported ? 1 : 0, g_spu_softmax_supported ? 1 : 0,
         (unsigned long long) MY_IP_BASE_ADDRESS, (unsigned long long) DMA_BASE_PHYS, (unsigned long long) DDR_BASE_PHYS,

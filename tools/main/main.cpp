@@ -291,7 +291,8 @@ int main(int argc, char ** argv) {
         } else if (fpga_init() == 0) {
             LOG_INF("%s: FPGA host initialized (Bare-metal mode)\n", __func__);
         } else {
-            LOG_WRN("%s: FPGA host init failed; CPU fallback remains available\n", __func__);
+            LOG_WRN("%s: FPGA host init failed; FPGA execution is unavailable and the configured fail-closed policy applies\n",
+                    __func__);
         }
     }
 #endif
