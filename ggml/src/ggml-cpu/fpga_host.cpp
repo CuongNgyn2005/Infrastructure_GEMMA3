@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <climits>
@@ -30,7 +31,7 @@
 #include <vector>
 
 #define FPGA_LOG_FILE           "/tmp/fpga_debug.log"
-#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v65-p2-sealed-tile-residency"
+#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v70-p1-scheduler-observability"
 
 #define MY_IP_BASE_ADDRESS 0x00000000A0000000LL
 #define REG_BASE_PHYS      0x00000000A0000000LL
@@ -277,6 +278,7 @@ static constexpr uint32_t SPU_SCRATCH_END        = 0x00400000;
 static constexpr size_t   VPU_DEVMEM_COMPAT_MMAP = SPU_SCRATCH_END;
 static constexpr size_t   DDR_REQUIRED_BYTES     = SPU_SCRATCH_END;
 static constexpr uint32_t WEIGHT_CACHE_BASE      = 0x01000000;
+static constexpr uint32_t P2_WEIGHT_RESIDENCY_END = 0x02000000;
 static constexpr size_t   WEIGHT_CACHE_ALIGN     = 4096;
 static_assert((DDR_BASE_PHYS & 0xFFFULL) == 0ULL, "DDR_BASE_PHYS must be page aligned");
 static_assert((DDR_REGION_SIZE & 0xFFFULL) == 0ULL, "DDR_REGION_SIZE must be page aligned");
@@ -293,9 +295,22 @@ static_assert((uint64_t) WEIGHT_CACHE_BASE < (uint64_t) DDR_REGION_SIZE,
 // enabled by the primary command accidentally.
 static constexpr long long WEIGHT_CACHE_DEFAULT_MAX_MB    = 16;
 // P2 residency is deliberately a different experiment from the legacy
-// weight cache. It owns exactly one sealed tile and never calls msync().
+// weight cache. It owns a fixed, non-evicting directory of sealed tiles and
+// never calls msync().
 static constexpr long long P2_WEIGHT_RESIDENCY_MAX_MB     = 16;
 static constexpr uint32_t  P2_WEIGHT_RESIDENCY_LAYOUT_V1  = 1U;
+static constexpr size_t    P2_WEIGHT_RESIDENCY_SLOT_CAPACITY = 128U;
+// Residency lookups are bounded without walking the slot directory.  Linear
+// probing is deterministic, capped, and never overwrites or evicts a seal.
+static constexpr size_t    P2_WEIGHT_RESIDENCY_INDEX_BUCKETS = 1024U;
+static constexpr size_t    P2_WEIGHT_RESIDENCY_INDEX_MAX_PROBES = 8U;
+static constexpr uint32_t  P2_WEIGHT_RESIDENCY_NO_SLOT       = UINT32_MAX;
+static constexpr uint32_t  P2_WEIGHT_RESIDENCY_INVALID_SLOT  = UINT32_MAX - 1U;
+static_assert(P2_WEIGHT_RESIDENCY_INDEX_BUCKETS >= P2_WEIGHT_RESIDENCY_SLOT_CAPACITY,
+              "P2 residency index must not be smaller than its sealed-slot directory");
+static_assert((uint64_t) P2_WEIGHT_RESIDENCY_END - (uint64_t) WEIGHT_CACHE_BASE ==
+                  (uint64_t) P2_WEIGHT_RESIDENCY_MAX_MB * 1024ULL * 1024ULL,
+              "P2 residency budget must remain inside [0x01000000,0x02000000)");
 // Avoid a repeated, unsupported msync only for cache payloads large enough to
 // make the call itself disruptive.  Per-tile scratch transfers retain v16's
 // conservative msync attempt even after a UIO driver reports EINVAL.
@@ -505,10 +520,9 @@ static_assert(sizeof(fpga_weight_cache_header_t) == 32, "unexpected weight-cache
 static constexpr uint32_t FPGA_WEIGHT_CACHE_MAGIC          = 0x46504348U;  // "FPCH"
 static constexpr uint32_t FPGA_WEIGHT_CACHE_FORMAT_VERSION = 1U;
 
-// This is intentionally not a general cache directory. The first P2
-// experiment admits at most one immutable tile, and its identity includes all
-// tensor layout, tile geometry, and deployed-ABI fields needed to prove that
-// a later DMA source is the tile that was sealed.
+// This is intentionally a fixed, non-evicting directory. Every slot carries
+// the complete immutable tensor/tile identity and deployed ABI identity needed
+// to prove that a later DMA source is the exact payload that was sealed.
 typedef struct {
     bool                      enabled;
     bool                      building;
@@ -527,6 +541,7 @@ typedef struct {
     int                       group_beats;
     size_t                    qs_bytes;
     size_t                    scale_bytes;
+    size_t                    allocation_bytes;
     uint32_t                  qs_off;
     uint32_t                  scale_off;
     uint32_t                  crc32;
@@ -535,6 +550,15 @@ typedef struct {
     uint32_t                  stream_protocol;
     uint32_t                  bitstream_id;
     uint32_t                  p2_abi;
+    uint64_t                  key_hash;
+    std::vector<uint16_t>     scale_bits;
+    size_t                    scale_count;
+    uint32_t                  scale_crc32;
+    uint32_t                  metadata_seal;
+    // This is published only after the build's DDR readback, CRC, and seal
+    // have all completed.  It makes ordinary reuse validation O(1) without
+    // pretending that an unsealed host vector is immutable.
+    uint64_t                  metadata_validated_epoch;
 } fpga_p2_resident_tile_t;
 
 typedef struct {
@@ -568,6 +592,7 @@ typedef struct {
     uint32_t                          weight_src_off;
     bool                              weight_cache_hit;
     bool                              p2_residency_hit;
+    uint32_t                          p2_residency_slot;
     uint64_t                          p2_residency_epoch;
     uint32_t                          p2_residency_seal;
     const block_q8_0_t *              act_group;
@@ -611,6 +636,7 @@ typedef struct {
     size_t                            preload_key_weight_bytes;
     size_t                            preload_key_scale_bytes;
     uint32_t                          preload_key_weight_src_off;
+    uint32_t                          preload_key_p2_residency_slot;
     uint64_t                          preload_key_p2_residency_epoch;
     uint32_t                          preload_key_p2_residency_seal;
     int                               preload_key_bank;
@@ -740,6 +766,10 @@ static bool     g_pingpong_scheduler_enabled    = false;
 // Existing capability bits do not prove that an inactive-bank write select is
 // harmless while VPU is active. P1 therefore remains explicit owner opt-in.
 static bool     g_p2_input_preload_enabled      = false;
+// File-only aggregate telemetry for a completed graph sequence.  This is
+// opt-in because even a host timestamp belongs outside the production fast
+// path unless the owner is actively measuring scheduler behavior.
+static bool     g_p1_sched_summary_enabled      = false;
 static uint32_t g_next_job_id                   = 1;
 
 static bool              g_dma_timing_enabled                         = false;
@@ -762,9 +792,46 @@ static bool              g_ddr_msync_unavailable                      = false;
 static bool              g_weight_cache_enabled                       = false;
 static bool              g_p2_weight_residency_requested              = false;
 static bool              g_p2_weight_residency_enabled                = false;
+static bool              g_p2_weight_residency_diagnostic             = false;
+static bool              g_p2_residency_trace_enabled                  = false;
+static bool              g_p2_residency_verify_metadata               = false;
 static long long         g_p2_weight_residency_budget_mb              = 0;
 static uint64_t          g_p2_weight_residency_epoch                  = 0;
-static fpga_p2_resident_tile_t g_p2_resident_tile                     = {};
+static std::array<fpga_p2_resident_tile_t, P2_WEIGHT_RESIDENCY_SLOT_CAPACITY> g_p2_resident_tiles = {};
+static std::array<uint32_t, P2_WEIGHT_RESIDENCY_INDEX_BUCKETS> g_p2_residency_index = {};
+static size_t            g_p2_resident_tile_count                     = 0;
+static size_t            g_p2_residency_next_slot                     = 0;
+static uint32_t          g_p2_residency_next_off                      = WEIGHT_CACHE_BASE;
+static long long         g_p2_residency_builds                        = 0;
+static long long         g_p2_residency_hits                          = 0;
+static long long         g_p2_residency_misses                        = 0;
+static long long         g_p2_residency_build_failures                = 0;
+static long long         g_p2_residency_logical_bytes                 = 0;
+static long long         g_p2_residency_miss_alignment                = 0;
+static long long         g_p2_residency_miss_shape                    = 0;
+static long long         g_p2_residency_miss_collision                = 0;
+static long long         g_p2_residency_miss_poison                   = 0;
+static long long         g_p2_residency_miss_stale                    = 0;
+static long long         g_p2_residency_miss_mismatch                 = 0;
+static long long         g_p2_residency_miss_capacity                 = 0;
+static long long         g_p2_residency_miss_quiescence               = 0;
+static long long         g_p2_residency_miss_range                    = 0;
+static long long         g_p2_residency_miss_verify                   = 0;
+static long long         g_p2_residency_probe_count                   = 0;
+static long long         g_p2_residency_probe_exhausted               = 0;
+static long long         g_p2_residency_host_metadata_hits            = 0;
+static long long         g_p2_residency_host_metadata_invalidations   = 0;
+static long long         g_p2_residency_volatile_ddr_reads            = 0;
+static long long         g_p2_residency_build_us                      = 0;
+static long long         g_p2_residency_select_us                     = 0;
+static long long         g_p2_residency_metadata_validate_us          = 0;
+static long long         g_p2_residency_resident_param_us             = 0;
+static long long         g_p2_residency_direct_weight_pack_us         = 0;
+static long long         g_p2_residency_avoided_cpu_pack_bytes        = 0;
+// Residency still transfers each selected tile from DDR to the IP.  Keep this
+// explicit so a diagnostic log never claims a traffic reduction it cannot
+// prove from the current RTL/descriptor contract.
+static long long         g_p2_residency_avoided_ddr_to_ip_bytes       = 0;
 static bool              g_weight_cache_full_logged                   = false;
 static bool              g_weight_cache_crc_verify_each_lookup        = false;
 static bool              g_activation_cache_enabled                   = false;
@@ -935,6 +1002,64 @@ static int64_t            g_active_matmul_shape_m    = 0;
 static bool               g_active_matmul_cpu_shadow = false;
 static bool               g_active_matmul_pingpong   = false;
 static const char *       g_active_matmul_tensor_name = nullptr;
+
+typedef struct {
+    bool      active;
+    int       graph_seq;
+    long long matmuls;
+    long long vpu_runs;
+    long long pingpong_pairs;
+    long long preload_attempts;
+    long long preload_admitted_while_active;
+    long long preload_terminal_skip;
+    long long serial_submit_after_no_preload;
+    long long input_preload_us;
+    long long preload_launch_bubble_us;
+    long long ip_compute_us;
+    long long dma_act_us;
+    long long dma_weight_us;
+    long long matrix_wall_us;
+} fpga_p1_sched_summary_t;
+
+static fpga_p1_sched_summary_t g_p1_sched_summary = {};
+
+static void fpga_p1_sched_summary_emit(const char * reason) {
+    if (!g_p1_sched_summary_enabled || !g_p1_sched_summary.active) {
+        return;
+    }
+    // Buffered and file-only: no terminal emission, forced flush, MMIO, or
+    // fence is associated with a scheduler summary.
+    fpga_log_line(
+        true, "P1_SCHED_SUMMARY", false,
+        "scope=graph_sequence reason=%s graph_seq=%d scheduler=%s preload_config=%d matmuls=%lld vpu_runs=%lld pingpong_pairs=%lld "
+        "preload_attempts=%lld preload_admitted_while_active=%lld preload_terminal_skip=%lld "
+        "serial_submit_after_no_preload=%lld input_preload_us=%lld preload_launch_bubble_us=%lld "
+        "ip_compute_us=%lld dma_act_us=%lld dma_weight_us=%lld matrix_wall_us=%lld "
+        "overlap_duration=not_measured",
+        reason ? reason : "?", g_p1_sched_summary.graph_seq,
+        g_pingpong_scheduler_enabled ? "pingpong" : "single_bank", g_p2_input_preload_enabled ? 1 : 0,
+        g_p1_sched_summary.matmuls,
+        g_p1_sched_summary.vpu_runs, g_p1_sched_summary.pingpong_pairs,
+        g_p1_sched_summary.preload_attempts, g_p1_sched_summary.preload_admitted_while_active,
+        g_p1_sched_summary.preload_terminal_skip, g_p1_sched_summary.serial_submit_after_no_preload,
+        g_p1_sched_summary.input_preload_us, g_p1_sched_summary.preload_launch_bubble_us,
+        g_p1_sched_summary.ip_compute_us, g_p1_sched_summary.dma_act_us, g_p1_sched_summary.dma_weight_us,
+        g_p1_sched_summary.matrix_wall_us);
+    g_p1_sched_summary = {};
+}
+
+static void fpga_p1_sched_summary_begin_graph(int graph_seq) {
+    if (!g_p1_sched_summary_enabled) {
+        return;
+    }
+    if (g_p1_sched_summary.active && g_p1_sched_summary.graph_seq != graph_seq) {
+        fpga_p1_sched_summary_emit("graph_sequence_change");
+    }
+    if (!g_p1_sched_summary.active) {
+        g_p1_sched_summary.active    = true;
+        g_p1_sched_summary.graph_seq = graph_seq;
+    }
+}
 
 static long long now_us(void) {
     struct timeval tv;
@@ -2236,10 +2361,12 @@ static bool configure_ddr_mapping_policy(void) {
         g_p2_weight_residency_budget_mb = residency_mb;
         g_ddr_requested_map_size = align_up_size((size_t) required_bytes, (size_t) page_size);
         LOGPROOF(
-            "P2_RESIDENCY_CONFIG requested=1 base_off=0x%08x phys=[0x%llx,0x%llx) budget_mb=%lld requested_map=0x%zx "
-            "policy=single_sealed_tile_no_msync",
-            WEIGHT_CACHE_BASE, (unsigned long long) (DDR_BASE_PHYS + WEIGHT_CACHE_BASE),
-            (unsigned long long) (DDR_BASE_PHYS + required_bytes), residency_mb, g_ddr_requested_map_size);
+            "P2_RESIDENCY_CONFIG requested=1 diagnostic=1 trace=%d verify_metadata=%d base_off=0x%08x phys=[0x%llx,0x%llx) budget_mb=%lld requested_map=0x%zx "
+            "policy=fixed_non_evicting_directory_index_no_msync slots=%zu index_buckets=%zu",
+            g_p2_residency_trace_enabled ? 1 : 0, g_p2_residency_verify_metadata ? 1 : 0, WEIGHT_CACHE_BASE,
+            (unsigned long long) (DDR_BASE_PHYS + WEIGHT_CACHE_BASE),
+            (unsigned long long) (DDR_BASE_PHYS + required_bytes), residency_mb, g_ddr_requested_map_size,
+            P2_WEIGHT_RESIDENCY_SLOT_CAPACITY, P2_WEIGHT_RESIDENCY_INDEX_BUCKETS);
         return true;
     }
     if (!g_weight_cache_enabled) {
@@ -5265,10 +5392,13 @@ static fpga_weight_cache_entry_t * get_weight_cache_entry(const struct ggml_tens
     return build_weight_cache_entry(src0, totals);
 }
 
-// Residency telemetry is deliberately file-only but force-flushed. It is an
-// operator diagnostic for the one-tile experiment, never a terminal/MMIO
-// ordering primitive.
-static void fpga_p2_residency_log(const char * event, const char * fmt, ...) {
+// Routine residency telemetry is opt-in and shares the normal buffered file
+// logger.  Forced records remain reserved for validation/invalidation events
+// whose evidence must survive a later failure or abort.
+static void fpga_p2_residency_log(bool force_flush, const char * event, const char * fmt, ...) {
+    if (!force_flush && !g_p2_residency_trace_enabled) {
+        return;
+    }
     FILE * fp = fpga_log_fp();
     fprintf(fp, "[FPGA][P2_RESIDENCY] event=%s ", event ? event : "?");
     va_list ap;
@@ -5276,51 +5406,15 @@ static void fpga_p2_residency_log(const char * event, const char * fmt, ...) {
     vfprintf(fp, fmt, ap);
     va_end(ap);
     fprintf(fp, "\n");
-    fflush(fp);
+    fpga_log_finish_line(fp, force_flush);
 }
 
-static void fpga_p2_residency_invalidate(const char * reason) {
-    if (g_p2_resident_tile.sealed || g_p2_resident_tile.building || g_p2_resident_tile.enabled) {
-        fpga_p2_residency_log("INVALIDATE", "reason=%s epoch=%llu seal=0x%08x action=direct_stage",
-                              reason ? reason : "?", (unsigned long long) g_p2_resident_tile.epoch,
-                              g_p2_resident_tile.seal);
-    }
-    g_p2_resident_tile.sealed   = false;
-    g_p2_resident_tile.building = false;
-    g_p2_resident_tile.poisoned = true;
+static uint64_t fpga_p2_residency_hash_mix(uint64_t hash, uint64_t value) {
+    hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6U) + (hash >> 2U);
+    return hash;
 }
 
-static bool fpga_p2_residency_identity_matches(const struct ggml_tensor * src0,
-                                               int64_t                    row0,
-                                               int                        rows,
-                                               int64_t                    k_block0,
-                                               int                        group_blocks,
-                                               int                        group_beats,
-                                               size_t                     qs_bytes,
-                                               size_t                     scale_bytes) {
-    const fpga_p2_resident_tile_t & tile = g_p2_resident_tile;
-    if (!tile.sealed || tile.poisoned || tile.tensor != src0 || tile.data != src0->data || tile.type != src0->type ||
-        tile.layout_version != P2_WEIGHT_RESIDENCY_LAYOUT_V1 || tile.row0 != row0 || tile.rows != rows ||
-        tile.k_block0 != k_block0 || tile.group_blocks != group_blocks || tile.group_beats != group_beats ||
-        tile.qs_bytes != qs_bytes || tile.scale_bytes != scale_bytes || tile.epoch != g_p2_weight_residency_epoch ||
-        tile.stream_protocol != g_stream_protocol_version || tile.bitstream_id != g_bitstream_id ||
-        tile.p2_abi != g_p2_stream_abi_signature || tile.seal == 0U || tile.crc32 == 0U ||
-        tile.qs_off != WEIGHT_CACHE_BASE ||
-        tile.scale_off != WEIGHT_CACHE_BASE + (uint32_t) align_up_size(qs_bytes, WEIGHT_CACHE_ALIGN)) {
-        return false;
-    }
-    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-        if (tile.ne[d] != src0->ne[d] || tile.nb[d] != src0->nb[d]) {
-            return false;
-        }
-    }
-    return ddr_range_fits(tile.qs_off, tile.qs_bytes) && ddr_range_fits(tile.scale_off, tile.scale_bytes);
-}
-
-// A different tensor/tile is an ordinary one-entry-cache miss, not evidence
-// that the sealed tile was damaged. Keep the resident tile available for the
-// next token that reuses its exact subject.
-static bool fpga_p2_residency_same_subject(const struct ggml_tensor * src0,
+static uint64_t fpga_p2_residency_key_hash(const struct ggml_tensor * src0,
                                            int64_t                    row0,
                                            int                        rows,
                                            int64_t                    k_block0,
@@ -5328,10 +5422,133 @@ static bool fpga_p2_residency_same_subject(const struct ggml_tensor * src0,
                                            int                        group_beats,
                                            size_t                     qs_bytes,
                                            size_t                     scale_bytes) {
-    const fpga_p2_resident_tile_t & tile = g_p2_resident_tile;
-    if (tile.tensor != src0 || tile.data != src0->data || tile.type != src0->type || tile.row0 != row0 ||
-        tile.rows != rows || tile.k_block0 != k_block0 || tile.group_blocks != group_blocks ||
-        tile.group_beats != group_beats || tile.qs_bytes != qs_bytes || tile.scale_bytes != scale_bytes) {
+    uint64_t hash = 0x84222325cbf29ce4ULL;
+    hash = fpga_p2_residency_hash_mix(hash, (uint64_t) (uintptr_t) src0);
+    hash = fpga_p2_residency_hash_mix(hash, (uint64_t) (uintptr_t) src0->data);
+    hash = fpga_p2_residency_hash_mix(hash, (uint64_t) src0->type);
+    hash = fpga_p2_residency_hash_mix(hash, P2_WEIGHT_RESIDENCY_LAYOUT_V1);
+    hash = fpga_p2_residency_hash_mix(hash, (uint64_t) row0);
+    hash = fpga_p2_residency_hash_mix(hash, (uint64_t) rows);
+    hash = fpga_p2_residency_hash_mix(hash, (uint64_t) k_block0);
+    hash = fpga_p2_residency_hash_mix(hash, (uint64_t) group_blocks);
+    hash = fpga_p2_residency_hash_mix(hash, (uint64_t) group_beats);
+    hash = fpga_p2_residency_hash_mix(hash, (uint64_t) qs_bytes);
+    hash = fpga_p2_residency_hash_mix(hash, (uint64_t) scale_bytes);
+    hash = fpga_p2_residency_hash_mix(hash, g_p2_weight_residency_epoch);
+    hash = fpga_p2_residency_hash_mix(hash, g_stream_protocol_version);
+    hash = fpga_p2_residency_hash_mix(hash, g_bitstream_id);
+    hash = fpga_p2_residency_hash_mix(hash, g_p2_stream_abi_signature);
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        hash = fpga_p2_residency_hash_mix(hash, (uint64_t) src0->ne[d]);
+        hash = fpga_p2_residency_hash_mix(hash, (uint64_t) src0->nb[d]);
+    }
+    return hash;
+}
+
+static size_t fpga_p2_residency_bucket(uint64_t key_hash) {
+    static_assert((P2_WEIGHT_RESIDENCY_INDEX_BUCKETS & (P2_WEIGHT_RESIDENCY_INDEX_BUCKETS - 1U)) == 0U,
+                  "P2 residency index bucket count must be a power of two");
+    return (size_t) key_hash & (P2_WEIGHT_RESIDENCY_INDEX_BUCKETS - 1U);
+}
+
+static uint32_t fpga_p2_residency_metadata_seal(uint32_t tile_seal,
+                                                uint32_t scale_crc32,
+                                                size_t   scale_count,
+                                                uint64_t validated_epoch) {
+    uint64_t mix = ((uint64_t) tile_seal << 32U) | scale_crc32;
+    mix = fpga_p2_residency_hash_mix(mix, (uint64_t) scale_count);
+    mix = fpga_p2_residency_hash_mix(mix, validated_epoch);
+    mix ^= 0x4d4554415343414cULL; // "METASCAL"
+    uint32_t seal = (uint32_t) mix ^ (uint32_t) (mix >> 32U);
+    return seal == 0U ? 1U : seal;
+}
+
+static bool fpga_p2_residency_align_up(size_t value, size_t alignment, size_t * out) {
+    if (!out || alignment == 0U || (alignment & (alignment - 1U)) != 0U ||
+        value > std::numeric_limits<size_t>::max() - (alignment - 1U)) {
+        return false;
+    }
+    *out = (value + alignment - 1U) & ~(alignment - 1U);
+    return true;
+}
+
+static bool fpga_p2_residency_range_end(uint32_t begin, size_t bytes, uint32_t limit, uint32_t * end) {
+    if (!end || begin < WEIGHT_CACHE_BASE || begin > limit || bytes == 0U || bytes > UINT32_MAX) {
+        return false;
+    }
+    const uint64_t end64 = (uint64_t) begin + (uint64_t) bytes;
+    if (end64 > limit || end64 > P2_WEIGHT_RESIDENCY_END || end64 > DDR_REGION_SIZE) {
+        return false;
+    }
+    *end = (uint32_t) end64;
+    return true;
+}
+
+static bool fpga_p2_residency_host_metadata_shape_valid(const fpga_p2_resident_tile_t & tile) {
+    return tile.sealed && !tile.poisoned && tile.scale_count != 0U &&
+           tile.scale_count == tile.scale_bits.size() &&
+           tile.scale_count == tile.scale_bytes / sizeof(uint16_t);
+}
+
+static uint32_t fpga_p2_residency_scale_bits_crc32(const std::vector<uint16_t> & scale_bits) {
+    uint32_t crc = 0xFFFFFFFFU;
+    for (const uint16_t bits : scale_bits) {
+        const uint8_t canonical_le[2] = {(uint8_t) (bits & 0xffU), (uint8_t) ((bits >> 8) & 0xffU)};
+        crc = fpga_crc32_update(crc, canonical_le, sizeof(canonical_le));
+    }
+    return ~crc;
+}
+
+static bool fpga_p2_residency_host_metadata_valid(const fpga_p2_resident_tile_t & tile) {
+    // Normal reuse is deliberately O(1): the sealed vector was read back and
+    // CRC-validated during build, and no mutable handle is exposed outside
+    // this mutex-protected directory.  A full vector CRC is a diagnostic-only
+    // integrity experiment because doing it on every hit defeats residency.
+    if (!fpga_p2_residency_host_metadata_shape_valid(tile) ||
+        tile.metadata_validated_epoch == 0U || tile.metadata_validated_epoch != tile.epoch ||
+        tile.metadata_validated_epoch != g_p2_weight_residency_epoch) {
+        return false;
+    }
+    if (tile.metadata_seal == 0U ||
+        tile.metadata_seal != fpga_p2_residency_metadata_seal(tile.seal, tile.scale_crc32, tile.scale_count,
+                                                              tile.metadata_validated_epoch)) {
+        return false;
+    }
+    return !g_p2_residency_verify_metadata || fpga_p2_residency_scale_bits_crc32(tile.scale_bits) == tile.scale_crc32;
+}
+
+static bool fpga_p2_residency_host_metadata_valid_timed(const fpga_p2_resident_tile_t & tile) {
+    const long long validation0 = now_us();
+    const bool valid = fpga_p2_residency_host_metadata_valid(tile);
+    g_p2_residency_metadata_validate_us += now_us() - validation0;
+    return valid;
+}
+
+static bool fpga_p2_residency_identity_matches(const fpga_p2_resident_tile_t & tile,
+                                               const struct ggml_tensor *      src0,
+                                               int64_t                         row0,
+                                               int                             rows,
+                                               int64_t                         k_block0,
+                                               int                             group_blocks,
+                                               int                             group_beats,
+                                               size_t                          qs_bytes,
+                                               size_t                          scale_bytes) {
+    size_t qs_padded = 0;
+    size_t scale_padded = 0;
+    if (!fpga_p2_residency_align_up(qs_bytes, WEIGHT_CACHE_ALIGN, &qs_padded) ||
+        !fpga_p2_residency_align_up(scale_bytes, WEIGHT_CACHE_ALIGN, &scale_padded) ||
+        qs_padded > std::numeric_limits<size_t>::max() - scale_padded) {
+        return false;
+    }
+    if (!tile.sealed || tile.poisoned || tile.tensor != src0 || tile.data != src0->data || tile.type != src0->type ||
+        tile.layout_version != P2_WEIGHT_RESIDENCY_LAYOUT_V1 || tile.row0 != row0 || tile.rows != rows ||
+        tile.k_block0 != k_block0 || tile.group_blocks != group_blocks || tile.group_beats != group_beats ||
+        tile.qs_bytes != qs_bytes || tile.scale_bytes != scale_bytes || tile.epoch != g_p2_weight_residency_epoch ||
+        tile.stream_protocol != g_stream_protocol_version || tile.bitstream_id != g_bitstream_id ||
+        tile.p2_abi != g_p2_stream_abi_signature || tile.seal == 0U ||
+        (tile.qs_off & (WEIGHT_CACHE_ALIGN - 1U)) != 0U || (tile.scale_off & (WEIGHT_CACHE_ALIGN - 1U)) != 0U ||
+        (uint64_t) tile.scale_off != (uint64_t) tile.qs_off + qs_padded ||
+        tile.allocation_bytes != qs_padded + scale_padded) {
         return false;
     }
     for (int d = 0; d < GGML_MAX_DIMS; ++d) {
@@ -5339,80 +5556,209 @@ static bool fpga_p2_residency_same_subject(const struct ggml_tensor * src0,
             return false;
         }
     }
+    const uint64_t phys_begin = DDR_BASE_PHYS + (uint64_t) tile.qs_off;
+    const uint64_t phys_end = phys_begin + (uint64_t) tile.allocation_bytes;
+    return tile.qs_off >= WEIGHT_CACHE_BASE && (uint64_t) tile.qs_off + tile.allocation_bytes <= P2_WEIGHT_RESIDENCY_END &&
+           phys_begin >= DDR_BASE_PHYS && phys_end >= phys_begin && phys_end <= DDR_END_EXCLUSIVE &&
+           tile.allocation_bytes != 0U && ddr_range_fits(tile.qs_off, tile.qs_bytes) &&
+           ddr_range_fits(tile.scale_off, tile.scale_bytes);
+}
+
+static void fpga_p2_residency_poison_slot(uint32_t slot, const char * reason) {
+    if (slot >= g_p2_resident_tiles.size()) {
+        return;
+    }
+    fpga_p2_resident_tile_t & tile = g_p2_resident_tiles[slot];
+    if (tile.sealed || tile.building || tile.enabled) {
+        fpga_p2_residency_log(true, "INVALIDATE", "slot=%u reason=%s epoch=%llu seal=0x%08x action=direct_stage_no_reuse",
+                              slot, reason ? reason : "?", (unsigned long long) tile.epoch, tile.seal);
+    }
+    tile.sealed   = false;
+    tile.building = false;
+    tile.poisoned = true;
+    g_p2_residency_host_metadata_invalidations++;
+}
+
+static bool fpga_p2_resident_scale_bits(uint32_t slot, size_t index, uint16_t * bits) {
+    if (slot >= g_p2_resident_tiles.size()) {
+        return false;
+    }
+    const fpga_p2_resident_tile_t & tile = g_p2_resident_tiles[slot];
+    if (!bits || !fpga_p2_residency_host_metadata_shape_valid(tile) || index >= tile.scale_count) {
+        return false;
+    }
+    *bits = tile.scale_bits[index];
     return true;
 }
 
-static uint16_t fpga_p2_resident_scale_bits(size_t index) {
-    const fpga_p2_resident_tile_t & tile = g_p2_resident_tile;
-    if (!tile.sealed || tile.poisoned || index >= tile.scale_bytes / sizeof(uint16_t)) {
-        fpga_fatal("P2 residency scale metadata access without a sealed bounded tile index=%zu", index);
-    }
-    const volatile uint8_t * src = (volatile const uint8_t *) ddr_ptr(tile.scale_off + (uint32_t) index * 2U, 2U);
-    return (uint16_t) src[0] | ((uint16_t) src[1] << 8);
-}
-
-// Build only the first scheduling tile. No descriptor, bank selector, START,
-// or DMA programming occurs here. A failed pre-selection build is explicitly
-// non-fatal to the model route and leaves the current job direct-staged.
-static bool fpga_p2_residency_build_first_tile(const struct ggml_tensor * src0,
-                                               const void *               weight_data_base,
-                                               int64_t                    row0,
-                                               int                        rows,
-                                               int64_t                    k_block0,
-                                               int                        group_blocks,
-                                               int                        group_beats) {
+// Select an exact sealed slot or construct one in an unused range. No
+// descriptor, bank selector, START, or DMA programming occurs here.
+// A residency validation failure returns INVALID_SLOT so the caller fails
+// closed before direct-stage, DMA, or START. Ordinary capacity/collision
+// misses return NO_SLOT and directly stage the immutable source.
+static uint32_t fpga_p2_residency_select_or_build_impl(const struct ggml_tensor * src0,
+                                                        const void *               weight_data_base,
+                                                        int64_t                    row0,
+                                                        int                        rows,
+                                                        int64_t                    k_block0,
+                                                        int                        group_blocks,
+                                                        int                        group_beats) {
     if (!g_p2_weight_residency_enabled) {
-        return false;
+        return P2_WEIGHT_RESIDENCY_NO_SLOT;
     }
     const size_t qs_bytes    = weight_window_bytes_for_rows(rows, group_beats);
     const size_t scale_bytes = (size_t) rows * (size_t) group_blocks * sizeof(uint16_t);
-    const size_t payload_end = align_up_size(qs_bytes, WEIGHT_CACHE_ALIGN) + align_up_size(scale_bytes, WEIGHT_CACHE_ALIGN);
+    size_t qs_padded = 0;
+    size_t scale_padded = 0;
+    if (!fpga_p2_residency_align_up(qs_bytes, WEIGHT_CACHE_ALIGN, &qs_padded) ||
+        !fpga_p2_residency_align_up(scale_bytes, WEIGHT_CACHE_ALIGN, &scale_padded) ||
+        qs_padded > std::numeric_limits<size_t>::max() - scale_padded) {
+        g_p2_residency_misses++;
+        g_p2_residency_miss_alignment++;
+        fpga_p2_residency_log(false, "MISS", "reason=payload_alignment_overflow action=direct_stage");
+        return P2_WEIGHT_RESIDENCY_NO_SLOT;
+    }
+    const size_t payload_bytes = qs_padded + scale_padded;
+    if (qs_bytes == 0U || scale_bytes == 0U) {
+        g_p2_residency_misses++;
+        g_p2_residency_miss_shape++;
+        fpga_p2_residency_log(false, "MISS", "reason=invalid_payload_shape action=direct_stage qs_bytes=%zu scale_bytes=%zu",
+                              qs_bytes, scale_bytes);
+        return P2_WEIGHT_RESIDENCY_NO_SLOT;
+    }
+    const uint64_t key_hash =
+        fpga_p2_residency_key_hash(src0, row0, rows, k_block0, group_blocks, group_beats, qs_bytes, scale_bytes);
+    const size_t bucket = fpga_p2_residency_bucket(key_hash);
+    size_t insertion_bucket = P2_WEIGHT_RESIDENCY_INDEX_BUCKETS;
+    for (size_t probe = 0; probe < P2_WEIGHT_RESIDENCY_INDEX_MAX_PROBES; ++probe) {
+        const size_t index_bucket = (bucket + probe) & (P2_WEIGHT_RESIDENCY_INDEX_BUCKETS - 1U);
+        g_p2_residency_probe_count++;
+        const uint32_t indexed_slot = g_p2_residency_index[index_bucket];
+        if (indexed_slot == P2_WEIGHT_RESIDENCY_NO_SLOT) {
+            insertion_bucket = index_bucket;
+            break;
+        }
+        if (indexed_slot >= g_p2_resident_tiles.size()) {
+            g_p2_residency_misses++;
+            g_p2_residency_miss_poison++;
+            fpga_p2_residency_log(true, "MISS", "reason=index_poison action=direct_stage bucket=%zu probe=%zu slot=%u",
+                                  index_bucket, probe, indexed_slot);
+            return P2_WEIGHT_RESIDENCY_NO_SLOT;
+        }
+        const fpga_p2_resident_tile_t & tile = g_p2_resident_tiles[indexed_slot];
+        if (tile.poisoned || tile.building || !tile.sealed || !tile.enabled) {
+            g_p2_residency_misses++;
+            g_p2_residency_miss_poison++;
+            g_p2_residency_host_metadata_invalidations++;
+            fpga_p2_residency_log(true, "MISS", "reason=poison_or_unsealed action=direct_stage bucket=%zu probe=%zu slot=%u",
+                                  index_bucket, probe, indexed_slot);
+            return P2_WEIGHT_RESIDENCY_NO_SLOT;
+        }
+        if (tile.key_hash != key_hash) {
+            g_p2_residency_miss_collision++;
+            continue;
+        }
+        if (tile.epoch != g_p2_weight_residency_epoch || tile.stream_protocol != g_stream_protocol_version ||
+            tile.bitstream_id != g_bitstream_id || tile.p2_abi != g_p2_stream_abi_signature) {
+            g_p2_residency_misses++;
+            g_p2_residency_miss_stale++;
+            fpga_p2_residency_log(true, "MISS", "reason=index_stale_identity action=direct_stage bucket=%zu probe=%zu slot=%u",
+                                  index_bucket, probe, indexed_slot);
+            return P2_WEIGHT_RESIDENCY_NO_SLOT;
+        }
+        if (!fpga_p2_residency_host_metadata_valid_timed(tile)) {
+            g_p2_residency_misses++;
+            g_p2_residency_miss_mismatch++;
+            fpga_p2_residency_poison_slot(indexed_slot, "host_scale_crc_or_metadata_seal_mismatch");
+            fpga_p2_residency_log(true, "MISS", "reason=host_scale_crc_or_metadata_seal_mismatch "
+                                  "action=fail_closed_no_direct_stage bucket=%zu probe=%zu slot=%u",
+                                  index_bucket, probe, indexed_slot);
+            return P2_WEIGHT_RESIDENCY_INVALID_SLOT;
+        }
+        if (!fpga_p2_residency_identity_matches(tile, src0, row0, rows, k_block0, group_blocks, group_beats,
+                                                qs_bytes, scale_bytes)) {
+            g_p2_residency_misses++;
+            g_p2_residency_miss_mismatch++;
+            fpga_p2_residency_poison_slot(indexed_slot, "host_metadata_or_identity_mismatch");
+            fpga_p2_residency_log(true, "MISS", "reason=index_identity_mismatch action=fail_closed_no_direct_stage bucket=%zu probe=%zu slot=%u",
+                                  index_bucket, probe, indexed_slot);
+            return P2_WEIGHT_RESIDENCY_INVALID_SLOT;
+        }
+        g_p2_residency_hits++;
+        g_p2_residency_host_metadata_hits++;
+        fpga_p2_residency_log(false, "HIT", "slot=%u bucket=%zu probe=%zu epoch=%llu seal=0x%08x qs_off=0x%08x scale_off=0x%08x "
+                                         "bytes=%zu",
+                              indexed_slot, index_bucket, probe, (unsigned long long) tile.epoch, tile.seal, tile.qs_off,
+                              tile.scale_off, tile.qs_bytes + tile.scale_bytes);
+        return indexed_slot;
+    }
+    if (insertion_bucket == P2_WEIGHT_RESIDENCY_INDEX_BUCKETS) {
+        g_p2_residency_misses++;
+        g_p2_residency_probe_exhausted++;
+        fpga_p2_residency_log(false, "MISS", "reason=index_probe_exhausted action=direct_stage bucket=%zu max_probes=%zu",
+                              bucket, P2_WEIGHT_RESIDENCY_INDEX_MAX_PROBES);
+        return P2_WEIGHT_RESIDENCY_NO_SLOT;
+    }
     const size_t budget_bytes = (size_t) g_p2_weight_residency_budget_mb * 1024U * 1024U;
-    if (payload_end == 0U || payload_end > budget_bytes ||
-        !ddr_range_fits(WEIGHT_CACHE_BASE, payload_end)) {
-        fpga_p2_residency_invalidate("build_range");
-        return false;
+    const uint64_t budget_end64 = (uint64_t) WEIGHT_CACHE_BASE + (uint64_t) budget_bytes;
+    uint32_t allocation_end = 0;
+    if (budget_end64 > P2_WEIGHT_RESIDENCY_END ||
+        !fpga_p2_residency_range_end(g_p2_residency_next_off, payload_bytes, (uint32_t) budget_end64, &allocation_end)) {
+        g_p2_residency_misses++;
+        g_p2_residency_miss_capacity++;
+        fpga_p2_residency_log(false, "MISS", "reason=budget_or_physical_range action=direct_stage qs_bytes=%zu scale_bytes=%zu budget=%zu",
+                              qs_bytes, scale_bytes, budget_bytes);
+        return P2_WEIGHT_RESIDENCY_NO_SLOT;
     }
-    if (g_p2_resident_tile.sealed) {
-        if (fpga_p2_residency_identity_matches(src0, row0, rows, k_block0, group_blocks, group_beats, qs_bytes,
-                                               scale_bytes)) {
-            fpga_p2_residency_log("HIT", "epoch=%llu seal=0x%08x qs_off=0x%08x qs_bytes=%zu scale_off=0x%08x "
-                                           "scale_bytes=%zu crc32=0x%08x",
-                                  (unsigned long long) g_p2_resident_tile.epoch, g_p2_resident_tile.seal,
-                                  g_p2_resident_tile.qs_off, g_p2_resident_tile.qs_bytes,
-                                  g_p2_resident_tile.scale_off, g_p2_resident_tile.scale_bytes,
-                                  g_p2_resident_tile.crc32);
-            return true;
+    // A build is optional. While P1 owns either bank, decline immediately so
+    // residency never blocks waiting for a running descriptor to retire.
+    if (g_pingpong_scheduler_enabled) {
+        mmio_fence();
+        const uint32_t status_before = vpu_rd32(REG_STATUS);
+        const uint32_t bank_stat     = vpu_rd32(REG_BANK_STAT);
+        const uint32_t slot_state    = vpu_rd32(REG_SLOT_STATE);
+        const uint32_t desc_flags    = vpu_rd32(REG_DESC_FLAGS);
+        const uint32_t status_after  = vpu_rd32(REG_STATUS);
+        mmio_fence();
+        const bool p1_registers_idle = status_before == status_after && (status_before & STATUS_BUSY) == 0U &&
+                                       (bank_stat & BANK_STAT_BUSY) == 0U &&
+                                       slot_state == fpga_slot_state_word(0, FPGA_SLOT_FREE, FPGA_SLOT_FREE) &&
+                                       desc_flags == 0U;
+        if (!p1_registers_idle) {
+            g_p2_residency_misses++;
+            g_p2_residency_miss_quiescence++;
+            fpga_p2_residency_log(false, "MISS", "reason=active_p1_registers_not_idle action=defer_direct_stage "
+                                          "status_before=0x%08x status_after=0x%08x bank_stat=0x%08x "
+                                          "slot_state=0x%08x flags=0x%08x",
+                                  status_before, status_after, bank_stat, slot_state, desc_flags);
+            return P2_WEIGHT_RESIDENCY_NO_SLOT;
         }
-        if (fpga_p2_residency_same_subject(src0, row0, rows, k_block0, group_blocks, group_beats, qs_bytes,
-                                           scale_bytes)) {
-            // The requested tile is the sealed subject, but a seal/ABI/range
-            // invariant changed. This is corruption or a stale selection,
-            // not an unrelated cache miss.
-            fpga_p2_residency_invalidate("same_subject_identity_mismatch");
-            return false;
-        }
-        fpga_p2_residency_log("MISS", "reason=unrelated_tile retain_epoch=%llu retain_seal=0x%08x "
-                                      "request_tensor=%p row0=%lld rows=%d k_block0=%lld group_blocks=%d action=direct_stage",
-                              (unsigned long long) g_p2_resident_tile.epoch, g_p2_resident_tile.seal,
-                              (const void *) src0, (long long) row0, rows, (long long) k_block0, group_blocks);
-        return false;
-    }
-    if (g_p2_resident_tile.poisoned) {
-        fpga_p2_residency_log("INVALIDATE", "reason=previous_poison action=direct_stage");
-        return false;
     }
     if (!zdma_wait_channel_disabled("P2_RESIDENCY", "before_build") ||
         !wait_spu_stream_quiescent("P2 residency build", false)) {
-        fpga_p2_residency_invalidate("quiescence_gate");
-        return false;
+        g_p2_residency_misses++;
+        g_p2_residency_miss_quiescence++;
+        fpga_p2_residency_log(false, "MISS", "reason=quiescence_gate action=direct_stage");
+        return P2_WEIGHT_RESIDENCY_NO_SLOT;
     }
     mmio_fence();
     if (vpu_rd32(REG_SLOT_STATE) != fpga_slot_state_word(0, FPGA_SLOT_FREE, FPGA_SLOT_FREE) ||
         vpu_rd32(REG_DESC_FLAGS) != 0U) {
-        fpga_p2_residency_invalidate("descriptor_not_free");
-        return false;
+        g_p2_residency_misses++;
+        g_p2_residency_miss_quiescence++;
+        fpga_p2_residency_log(false, "MISS", "reason=descriptor_not_free action=direct_stage");
+        return P2_WEIGHT_RESIDENCY_NO_SLOT;
     }
+
+    if (g_p2_residency_next_slot >= g_p2_resident_tiles.size()) {
+        g_p2_residency_misses++;
+        g_p2_residency_miss_capacity++;
+        fpga_p2_residency_log(false, "MISS", "reason=directory_full_non_evicting action=direct_stage slots=%zu",
+                              g_p2_resident_tiles.size());
+        return P2_WEIGHT_RESIDENCY_NO_SLOT;
+    }
+    const uint32_t slot = (uint32_t) g_p2_residency_next_slot++;
+    const long long build0 = now_us();
 
     fpga_p2_resident_tile_t pending = {};
     pending.enabled        = true;
@@ -5428,31 +5774,56 @@ static bool fpga_p2_residency_build_first_tile(const struct ggml_tensor * src0,
     pending.group_beats    = group_beats;
     pending.qs_bytes       = qs_bytes;
     pending.scale_bytes    = scale_bytes;
-    pending.qs_off         = WEIGHT_CACHE_BASE;
-    pending.scale_off      = WEIGHT_CACHE_BASE + (uint32_t) align_up_size(qs_bytes, WEIGHT_CACHE_ALIGN);
+    pending.allocation_bytes = payload_bytes;
+    pending.qs_off         = g_p2_residency_next_off;
+    const uint64_t scale_off64 = (uint64_t) pending.qs_off + (uint64_t) qs_padded;
+    if (scale_off64 > UINT32_MAX) {
+        g_p2_residency_build_us += now_us() - build0;
+        g_p2_residency_misses++;
+        g_p2_residency_miss_range++;
+        fpga_p2_residency_log(true, "MISS", "reason=scale_offset_overflow action=direct_stage slot=%u", slot);
+        return P2_WEIGHT_RESIDENCY_NO_SLOT;
+    }
+    pending.scale_off      = (uint32_t) scale_off64;
     pending.epoch          = g_p2_weight_residency_epoch;
     pending.stream_protocol = g_stream_protocol_version;
     pending.bitstream_id    = g_bitstream_id;
     pending.p2_abi          = g_p2_stream_abi_signature;
+    pending.key_hash        = key_hash;
     for (int d = 0; d < GGML_MAX_DIMS; ++d) {
         pending.ne[d] = src0->ne[d];
         pending.nb[d] = src0->nb[d];
     }
-    g_p2_resident_tile = pending;
-    fpga_p2_residency_log("BUILD_BEGIN", "epoch=%llu base=0x%08x qs_bytes=%zu scale_bytes=%zu row0=%lld rows=%d "
+    if (!ddr_range_fits(pending.qs_off, pending.qs_bytes) || !ddr_range_fits(pending.scale_off, pending.scale_bytes) ||
+        allocation_end > P2_WEIGHT_RESIDENCY_END || allocation_end > (uint32_t) DDR_REGION_SIZE ||
+        DDR_BASE_PHYS > UINT64_MAX - (uint64_t) allocation_end ||
+        DDR_BASE_PHYS + (uint64_t) allocation_end > DDR_END_EXCLUSIVE) {
+        g_p2_residency_build_us += now_us() - build0;
+        g_p2_residency_misses++;
+        g_p2_residency_miss_range++;
+        fpga_p2_residency_log(false, "MISS", "reason=map_or_physical_range action=direct_stage slot=%u", slot);
+        return P2_WEIGHT_RESIDENCY_NO_SLOT;
+    }
+    // Reserve before touching DDR. A failed slot remains poisoned and its
+    // physical range is never recycled during this process epoch.
+    g_p2_residency_next_off = allocation_end;
+    fpga_p2_residency_log(false, "BUILD_BEGIN", "slot=%u epoch=%llu base=0x%08x qs_bytes=%zu scale_bytes=%zu row0=%lld rows=%d "
                                                "k_block0=%lld group_blocks=%d protocol=0x%08x bitstream=0x%08x p2_abi=0x%08x",
-                          (unsigned long long) pending.epoch, WEIGHT_CACHE_BASE, qs_bytes, scale_bytes,
+                          slot, (unsigned long long) pending.epoch, pending.qs_off, qs_bytes, scale_bytes,
                           (long long) row0, rows, (long long) k_block0, group_blocks, pending.stream_protocol,
                           pending.bitstream_id, pending.p2_abi);
 
     std::vector<uint8_t> expected_qs(qs_bytes);
     std::vector<uint8_t> expected_scales(scale_bytes);
+    pending.scale_bits.resize(scale_bytes / sizeof(uint16_t));
     for (int row = 0; row < rows; ++row) {
         for (int gb = 0; gb < group_blocks; ++gb) {
             const block_q8_0_t * wb = weight_block_from_base(src0, weight_data_base, row0 + row, k_block0 + gb);
             const size_t scale_index = (size_t) row * (size_t) group_blocks + (size_t) gb;
-            expected_scales[scale_index * 2U]     = (uint8_t) ((uint16_t) wb->d & 0xffU);
-            expected_scales[scale_index * 2U + 1U] = (uint8_t) (((uint16_t) wb->d >> 8) & 0xffU);
+            const uint16_t weight_scale_bits = (uint16_t) wb->d;
+            pending.scale_bits[scale_index]        = weight_scale_bits;
+            expected_scales[scale_index * 2U]     = (uint8_t) (weight_scale_bits & 0xffU);
+            expected_scales[scale_index * 2U + 1U] = (uint8_t) ((weight_scale_bits >> 8) & 0xffU);
             for (int beat = 0; beat < VPU_BLOCK_BEATS; ++beat) {
                 const size_t word = (size_t) row * (size_t) group_beats + (size_t) gb * VPU_BLOCK_BEATS + (size_t) beat;
                 memcpy(expected_qs.data() + word * 16U, wb->qs + beat * VPU_NUM_LANES, 16U);
@@ -5465,46 +5836,93 @@ static bool fpga_p2_residency_build_first_tile(const struct ggml_tensor * src0,
     for (size_t i = 0; i < scale_bytes; ++i) dst_scales[i] = expected_scales[i];
     if (!fpga_p2_ddr_sync(pending.qs_off, qs_bytes, false, "p2_residency_qs") ||
         !fpga_p2_ddr_sync(pending.scale_off, scale_bytes, false, "p2_residency_scales")) {
-        fpga_p2_residency_log("VERIFY_FAIL", "reason=ddr_write_sync");
-        fpga_p2_residency_invalidate("ddr_write_sync");
-        return false;
+        g_p2_residency_build_us += now_us() - build0;
+        fpga_p2_residency_log(true, "VERIFY_FAIL", "reason=ddr_write_sync");
+        fpga_p2_residency_poison_slot(slot, "ddr_write_sync");
+        g_p2_residency_build_failures++;
+        g_p2_residency_misses++;
+        g_p2_residency_miss_verify++;
+        fpga_p2_residency_log(false, "MISS", "reason=ddr_write_sync action=direct_stage slot=%u", slot);
+        return P2_WEIGHT_RESIDENCY_NO_SLOT;
     }
-    fpga_p2_residency_log("DDR_WRITE_SYNC", "qs_off=0x%08x qs_bytes=%zu scale_off=0x%08x scale_bytes=%zu",
+    fpga_p2_residency_log(false, "DDR_WRITE_SYNC", "qs_off=0x%08x qs_bytes=%zu scale_off=0x%08x scale_bytes=%zu",
                           pending.qs_off, qs_bytes, pending.scale_off, scale_bytes);
     const volatile uint8_t * verify_qs = (volatile const uint8_t *) ddr_ptr(pending.qs_off, qs_bytes);
     const volatile uint8_t * verify_scales = (volatile const uint8_t *) ddr_ptr(pending.scale_off, scale_bytes);
     for (size_t i = 0; i < qs_bytes; ++i) {
         if (verify_qs[i] != expected_qs[i]) {
-            fpga_p2_residency_log("VERIFY_FAIL", "kind=qs offset=%zu expected=0x%02x actual=0x%02x", i,
+            g_p2_residency_build_us += now_us() - build0;
+            fpga_p2_residency_log(true, "VERIFY_FAIL", "kind=qs offset=%zu expected=0x%02x actual=0x%02x", i,
                                   expected_qs[i], verify_qs[i]);
-            fpga_p2_residency_invalidate("qs_readback_mismatch");
-            return false;
+            fpga_p2_residency_poison_slot(slot, "qs_readback_mismatch");
+            g_p2_residency_build_failures++;
+            g_p2_residency_misses++;
+            g_p2_residency_miss_verify++;
+            fpga_p2_residency_log(false, "MISS", "reason=qs_readback_mismatch action=direct_stage slot=%u", slot);
+            return P2_WEIGHT_RESIDENCY_NO_SLOT;
         }
     }
     for (size_t i = 0; i < scale_bytes; ++i) {
         if (verify_scales[i] != expected_scales[i]) {
-            fpga_p2_residency_log("VERIFY_FAIL", "kind=scale offset=%zu expected=0x%02x actual=0x%02x", i,
+            g_p2_residency_build_us += now_us() - build0;
+            fpga_p2_residency_log(true, "VERIFY_FAIL", "kind=scale offset=%zu expected=0x%02x actual=0x%02x", i,
                                   expected_scales[i], verify_scales[i]);
-            fpga_p2_residency_invalidate("scale_readback_mismatch");
-            return false;
+            fpga_p2_residency_poison_slot(slot, "scale_readback_mismatch");
+            g_p2_residency_build_failures++;
+            g_p2_residency_misses++;
+            g_p2_residency_miss_verify++;
+            fpga_p2_residency_log(false, "MISS", "reason=scale_readback_mismatch action=direct_stage slot=%u", slot);
+            return P2_WEIGHT_RESIDENCY_NO_SLOT;
         }
     }
     uint32_t crc = fpga_crc32_update(0xFFFFFFFFU, expected_qs.data(), expected_qs.size());
     pending.crc32 = ~fpga_crc32_update(crc, expected_scales.data(), expected_scales.size());
-    fpga_p2_residency_log("VERIFY_PASS", "qs_bytes=%zu scale_bytes=%zu crc32=0x%08x", qs_bytes, scale_bytes,
+    pending.scale_count = pending.scale_bits.size();
+    pending.scale_crc32 = ~fpga_crc32_update(0xFFFFFFFFU, expected_scales.data(), expected_scales.size());
+    fpga_p2_residency_log(false, "VERIFY_PASS", "qs_bytes=%zu scale_bytes=%zu crc32=0x%08x", qs_bytes, scale_bytes,
                           pending.crc32);
     // Two-phase seal: pending metadata is published only after exact readback,
     // then the nonzero seal makes it selectable by a later job.
-    fpga_p2_residency_log("SEAL", "phase=prepare epoch=%llu", (unsigned long long) pending.epoch);
+    fpga_p2_residency_log(false, "SEAL", "phase=prepare epoch=%llu", (unsigned long long) pending.epoch);
     pending.seal = pending.crc32 ^ 0xA5C35A3CU;
     if (pending.seal == 0U) pending.seal = 1U;
     pending.building = false;
     pending.sealed   = true;
+    // Publish this only after exact DDR readback, both CRCs, and the tile
+    // seal have completed.  Normal reuse may therefore trust the immutable
+    // vector count/seal without re-hashing the entire scale vector.
+    pending.metadata_validated_epoch = pending.epoch;
+    pending.metadata_seal = fpga_p2_residency_metadata_seal(
+        pending.seal, pending.scale_crc32, pending.scale_count, pending.metadata_validated_epoch);
     std::atomic_thread_fence(std::memory_order_release);
-    g_p2_resident_tile = pending;
-    fpga_p2_residency_log("SEAL", "phase=commit epoch=%llu seal=0x%08x qs_off=0x%08x scale_off=0x%08x",
-                          (unsigned long long) pending.epoch, pending.seal, pending.qs_off, pending.scale_off);
-    return true;
+    g_p2_resident_tiles[slot] = pending;
+    std::atomic_thread_fence(std::memory_order_release);
+    g_p2_residency_index[insertion_bucket] = slot;
+    g_p2_resident_tile_count++;
+    g_p2_residency_builds++;
+    g_p2_residency_build_us += now_us() - build0;
+    g_p2_residency_logical_bytes += (long long) (pending.qs_bytes + pending.scale_bytes);
+    fpga_p2_residency_log(false, "SEAL", "phase=commit slot=%u bucket=%zu epoch=%llu metadata_validated_epoch=%llu seal=0x%08x metadata_seal=0x%08x "
+                                  "scale_count=%zu scale_crc32=0x%08x qs_off=0x%08x scale_off=0x%08x",
+                          slot, insertion_bucket, (unsigned long long) pending.epoch,
+                          (unsigned long long) pending.metadata_validated_epoch, pending.seal, pending.metadata_seal,
+                          pending.scale_count, pending.scale_crc32, pending.qs_off,
+                          pending.scale_off);
+    return slot;
+}
+
+static uint32_t fpga_p2_residency_select_or_build(const struct ggml_tensor * src0,
+                                                   const void *               weight_data_base,
+                                                   int64_t                    row0,
+                                                   int                        rows,
+                                                   int64_t                    k_block0,
+                                                   int                        group_blocks,
+                                                   int                        group_beats) {
+    const long long select0 = now_us();
+    const uint32_t slot = fpga_p2_residency_select_or_build_impl(src0, weight_data_base, row0, rows, k_block0,
+                                                                   group_blocks, group_beats);
+    g_p2_residency_select_us += now_us() - select0;
+    return slot;
 }
 
 static void p2_trace_first_tile(const fpga_tile_job_t & job, const char * stage, const char * edge);
@@ -5616,6 +6034,7 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
     job.result_words     = result_words;
     job.scale_words      = result_words;
     job.weight_src_off   = WEIGHT_BASE;
+    job.p2_residency_slot = P2_WEIGHT_RESIDENCY_NO_SLOT;
     job.act_group        = act_group;
     job.src0             = src0;
     job.weight_cache     = weight_cache;
@@ -5640,18 +6059,33 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
             job.weight_cache_hit = true;
         }
     }
-    if (g_p2_weight_residency_enabled &&
-        fpga_p2_residency_identity_matches(src0, row0, rows, k_block0, group_blocks, group_beats, weight_bytes,
-                                           (size_t) rows * (size_t) group_blocks * sizeof(uint16_t))) {
-        job.weight_src_off      = g_p2_resident_tile.qs_off;
+    const uint32_t residency_slot =
+        g_p2_weight_residency_enabled ?
+            fpga_p2_residency_select_or_build(src0, weight_data_base, row0, rows, k_block0, group_blocks, group_beats) :
+            P2_WEIGHT_RESIDENCY_NO_SLOT;
+    if (residency_slot == P2_WEIGHT_RESIDENCY_INVALID_SLOT) {
+        LOGE("P2_RESIDENCY_HOST_METADATA_FAIL job=%u tile=%u action=no_dma_no_start_no_direct_stage", job.job_id,
+             job.tile_id);
+        return false;
+    }
+    if (residency_slot != P2_WEIGHT_RESIDENCY_NO_SLOT) {
+        const fpga_p2_resident_tile_t & resident = g_p2_resident_tiles[residency_slot];
+        const size_t resident_scale_bytes = (size_t) rows * (size_t) group_blocks * sizeof(uint16_t);
+        if (!fpga_p2_residency_identity_matches(resident, src0, row0, rows, k_block0, group_blocks, group_beats,
+                                                weight_bytes, resident_scale_bytes)) {
+            fpga_p2_residency_poison_slot(residency_slot, "prepare_host_metadata_mismatch");
+            LOGE("P2_RESIDENCY_HOST_METADATA_FAIL job=%u tile=%u slot=%u action=no_dma_no_start", job.job_id,
+                 job.tile_id, residency_slot);
+            return false;
+        }
+        job.weight_src_off      = resident.qs_off;
         job.p2_residency_hit    = true;
-        job.p2_residency_epoch  = g_p2_resident_tile.epoch;
-        job.p2_residency_seal   = g_p2_resident_tile.seal;
-        fpga_p2_residency_log("HIT", "job=%u tile=%u epoch=%llu seal=0x%08x weight_src_off=0x%08x",
-                              job.job_id, job.tile_id, (unsigned long long) job.p2_residency_epoch,
-                              job.p2_residency_seal, job.weight_src_off);
+        job.p2_residency_slot   = residency_slot;
+        job.p2_residency_epoch  = resident.epoch;
+        job.p2_residency_seal   = resident.seal;
     }
 
+    const long long direct_weight_pack0 = !job.weight_cache_hit && !job.p2_residency_hit ? now_us() : 0;
     if (!job.weight_cache_hit && !job.p2_residency_hit) {
         for (int row = 0; row < rows; ++row) {
             for (int gb = 0; gb < group_blocks; ++gb) {
@@ -5664,20 +6098,40 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
             }
         }
     }
+    if (direct_weight_pack0 != 0) {
+        g_p2_residency_direct_weight_pack_us += now_us() - direct_weight_pack0;
+    } else if (job.p2_residency_hit) {
+        g_p2_residency_avoided_cpu_pack_bytes += (long long) job.weight_bytes;
+    }
 
+    const long long resident_param0 = job.p2_residency_hit ? now_us() : 0;
     ddr_zero_range32(SPU_PARAM_BASE, job.scale_bytes);
     for (int row = 0; row < rows; ++row) {
         for (int gb = 0; gb < group_blocks; ++gb) {
             const uint32_t       linear = (uint32_t) row * (uint32_t) group_blocks + (uint32_t) gb;
             const uint32_t       word   = linear / (uint32_t) VPU_RESULT_PACK_LANES;
             const uint32_t       lane   = linear % (uint32_t) VPU_RESULT_PACK_LANES;
-            const block_q8_0_t * wb = weight_block_from_base(src0, weight_data_base, row0 + row, k_block0 + gb);
-            const uint16_t weight_d = job.p2_residency_hit ?
-                                          fpga_p2_resident_scale_bits((size_t) row * (size_t) group_blocks + (size_t) gb) :
-                                          (uint16_t) wb->d;
+            uint16_t weight_d = 0U;
+            if (job.p2_residency_hit) {
+                if (!fpga_p2_resident_scale_bits(job.p2_residency_slot,
+                                                 (size_t) row * (size_t) group_blocks + (size_t) gb, &weight_d)) {
+                    fpga_p2_residency_poison_slot(job.p2_residency_slot, "param_host_scale_read_invalid");
+                    LOGE("P2_RESIDENCY_HOST_METADATA_FAIL job=%u tile=%u slot=%u action=no_dma_no_start", job.job_id,
+                         job.tile_id, job.p2_residency_slot);
+                    return false;
+                }
+            } else {
+                const block_q8_0_t * wb =
+                    weight_block_from_base(src0, weight_data_base, row0 + row, k_block0 + gb);
+                weight_d = (uint16_t) wb->d;
+            }
             const uint32_t packed_scale = (uint32_t) act_group[gb].d | ((uint32_t) weight_d << 16);
             ddr_write_u32(SPU_PARAM_BASE + word * 16U + lane * 4U, packed_scale);
         }
+    }
+
+    if (job.p2_residency_hit) {
+        g_p2_residency_resident_param_us += now_us() - resident_param0;
     }
 
     for (int gb = 0; gb < group_blocks; ++gb) {
@@ -5687,6 +6141,7 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
             write_i8x16_to_ddr(ACT_BASE + word_index * 16U, act.qs + beat * VPU_NUM_LANES);
         }
     }
+
     mmio_fence();
     const long long event_prep_done = p2_event_now_us();
 
@@ -5694,7 +6149,7 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
         totals->prep_us += now_us() - prep0;
         if (job.weight_cache_hit) {
             totals->weight_cache_hits++;
-        } else {
+        } else if (!job.p2_residency_hit) {
             totals->weight_cache_misses++;
         }
     }
@@ -5722,6 +6177,7 @@ static bool fpga_q8_input_preload_key_matches(const fpga_tile_job_t & job) {
            job.preload_key_group_blocks == job.group_blocks && job.preload_key_act_bytes == job.act_bytes &&
            job.preload_key_weight_bytes == job.weight_bytes && job.preload_key_scale_bytes == job.scale_bytes &&
            job.preload_key_weight_src_off == job.weight_src_off &&
+           job.preload_key_p2_residency_slot == job.p2_residency_slot &&
            job.preload_key_p2_residency_epoch == job.p2_residency_epoch &&
            job.preload_key_p2_residency_seal == job.p2_residency_seal && job.preload_key_bank == (job.bank & 1);
 }
@@ -5730,15 +6186,22 @@ static bool fpga_p2_residency_job_still_valid(const fpga_tile_job_t & job) {
     if (!job.p2_residency_hit) {
         return true;
     }
-    const bool valid = g_p2_weight_residency_enabled && job.p2_residency_epoch == g_p2_resident_tile.epoch &&
-                       job.p2_residency_seal == g_p2_resident_tile.seal &&
-                       fpga_p2_residency_identity_matches(job.src0, job.row0, job.rows, job.k_block0, job.group_blocks,
-                                                          job.group_beats, job.weight_bytes,
+    const bool valid = g_p2_weight_residency_enabled && job.p2_residency_slot < g_p2_resident_tiles.size() &&
+                       job.weight_src_off == g_p2_resident_tiles[job.p2_residency_slot].qs_off &&
+                       job.weight_bytes == g_p2_resident_tiles[job.p2_residency_slot].qs_bytes &&
+                       job.p2_residency_epoch == g_p2_resident_tiles[job.p2_residency_slot].epoch &&
+                       job.p2_residency_seal == g_p2_resident_tiles[job.p2_residency_slot].seal &&
+                       fpga_p2_residency_host_metadata_valid_timed(g_p2_resident_tiles[job.p2_residency_slot]) &&
+                       fpga_p2_residency_identity_matches(g_p2_resident_tiles[job.p2_residency_slot], job.src0, job.row0,
+                                                          job.rows, job.k_block0, job.group_blocks, job.group_beats,
+                                                          job.weight_bytes,
                                                           (size_t) job.rows * (size_t) job.group_blocks * sizeof(uint16_t));
     if (!valid) {
-        fpga_p2_residency_log("INVALIDATE", "reason=post_selection_identity_mismatch job=%u tile=%u action=no_start",
-                              job.job_id, job.tile_id);
-        fpga_p2_residency_invalidate("post_selection_identity_mismatch");
+        fpga_p2_residency_log(
+            true, "INVALIDATE", "reason=post_selection_binding_mismatch job=%u tile=%u slot=%u weight_src_off=0x%08x "
+                          "weight_bytes=%zu action=no_dma_no_start",
+            job.job_id, job.tile_id, job.p2_residency_slot, job.weight_src_off, job.weight_bytes);
+        fpga_p2_residency_poison_slot(job.p2_residency_slot, "post_selection_binding_mismatch");
     }
     return valid;
 }
@@ -5810,6 +6273,9 @@ static fpga_p1_preload_state_t fpga_classify_p1_preload_state(
 static bool fpga_preload_q8_tile_inputs(fpga_tile_job_t &       job,
                                         const fpga_tile_job_t & running,
                                         fpga_stage_totals_t *   totals) {
+    if (g_p1_sched_summary_enabled) {
+        g_p1_sched_summary.preload_attempts++;
+    }
     const auto poison = [&job, &running](const char * reason) {
         job.input_preload_poisoned = true;
         LOGE("P1_INPUT_PRELOAD_FAIL job=%u running_job=%u bank=%d running_bank=%d reason=%s action=abort_no_deferred_launch",
@@ -5836,8 +6302,14 @@ static bool fpga_preload_q8_tile_inputs(fpga_tile_job_t &       job,
     const fpga_p1_preload_register_snapshot_t snapshot = fpga_p1_preload_register_snapshot();
     const fpga_p1_preload_state_t preload_state = fpga_classify_p1_preload_state(snapshot, running);
     if (preload_state == FPGA_P1_PRELOAD_STATE_TERMINAL) {
+        if (g_p1_sched_summary_enabled) {
+            // This is the one non-fatal no-overlap outcome: N has already
+            // reached the exact terminal signature, so N+1 must submit
+            // serially after the established drain/retire boundary.
+            g_p1_sched_summary.preload_terminal_skip++;
+        }
         fpga_p1_preload_breadcrumb(
-            true,
+            false,
             "event=P1_INPUT_PRELOAD_SKIP reason=running_job_terminal_before_preload job=%u running_job=%u "
             "bank=%d running_bank=%d status_before=0x%08x status_after=0x%08x bank_stat=0x%08x active_bank=%d "
             "done_bank=%d active_job=0x%08x done_job=0x%08x descriptor_job=0x%08x slot_state=0x%08x "
@@ -5908,8 +6380,13 @@ static bool fpga_preload_q8_tile_inputs(fpga_tile_job_t &       job,
                        job.weight_bytes, "P1_WEIGHT")) {
         return poison("weight_dma_failed");
     }
+    if (g_p1_sched_summary_enabled) {
+        // ACT and WEIGHT have both completed into the inactive bank while
+        // the admitted running job was still observed active.
+        g_p1_sched_summary.preload_admitted_while_active++;
+    }
     if (job.p2_residency_hit) {
-        fpga_p2_residency_log("P1_PRELOAD_CACHE_SOURCE",
+        fpga_p2_residency_log(false, "P1_PRELOAD_CACHE_SOURCE",
                               "job=%u bank=%d epoch=%llu seal=0x%08x weight_src_off=0x%08x bytes=%zu",
                               job.job_id, job.bank & 1, (unsigned long long) job.p2_residency_epoch,
                               job.p2_residency_seal, job.weight_src_off, job.weight_bytes);
@@ -5928,6 +6405,7 @@ static bool fpga_preload_q8_tile_inputs(fpga_tile_job_t &       job,
     job.preload_key_weight_bytes = job.weight_bytes;
     job.preload_key_scale_bytes = job.scale_bytes;
     job.preload_key_weight_src_off = job.weight_src_off;
+    job.preload_key_p2_residency_slot = job.p2_residency_slot;
     job.preload_key_p2_residency_epoch = job.p2_residency_epoch;
     job.preload_key_p2_residency_seal = job.p2_residency_seal;
     job.preload_key_bank        = job.bank & 1;
@@ -6919,6 +7397,11 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                 }
 
                 if (running) {
+                    if (g_p1_sched_summary_enabled) {
+                        // A pair is a scheduler handoff opportunity, whether
+                        // it overlaps or must submit serially after drain.
+                        g_p1_sched_summary.pingpong_pairs++;
+                    }
                     // P1 may overlap only the inactive-bank ACT/WEIGHT DMA.
                     // It must not touch descriptor/config/CTRL/SPU windows or
                     // the running job's read bank; all of those remain
@@ -6938,6 +7421,8 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                     // launch run; preloaded ACT/WEIGHT are reused verbatim.
                     if (prepared.input_preloaded) {
                         prepared.preload_ready_to_launch_us = now_us();
+                    } else if (g_p1_sched_summary_enabled) {
+                        g_p1_sched_summary.serial_submit_after_no_preload++;
                     }
                     if (!fpga_submit_q8_tile_job(prepared, totals, tensor_name, layer_id, k, n, m, 0)) {
                         return false;
@@ -7135,18 +7620,6 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip(const struct ggml_tensor * src0,
         totals->prep_us += now_us() - weight_cache0;
     }
 
-    // The residency experiment is constructed before either serialized or P1
-    // scheduling touches a tile descriptor. Its failure remains a bounded
-    // cache miss: the selected job directly stages the immutable source.
-    if (use_pl_scale_path && g_p2_weight_residency_enabled && n > 0 && nb > 0) {
-        const int first_rows = (int) std::min<int64_t>(g_vpu_max_rows, n);
-        const int first_blocks = packed_q8_group_blocks_for_rows(first_rows, (int) nb);
-        if (!fpga_p2_residency_build_first_tile(src0, weight_data_base, 0, first_rows, 0, first_blocks,
-                                                first_blocks * VPU_BLOCK_BEATS)) {
-            fpga_p2_residency_log("MISS", "reason=preselection_not_selected action=direct_stage_no_selection");
-        }
-    }
-
     if (use_pl_scale_path) {
         if (g_pingpong_scheduler_enabled && !pl_scale_contract_active) {
             return fpga_hw_q8_0_matmul_dma_to_ip_pipelined(src0, dst, act_blocks_all, act_scales, weight_cache, totals,
@@ -7281,6 +7754,8 @@ int fpga_init(void) {
     g_p2_boundary_diagnostics_enabled   = false;
     g_p2_event_trace_enabled             = env_flag_enabled("FPGA_P2_EVENT_TRACE");
     g_p2_input_preload_enabled           = env_flag_enabled("FPGA_P2_INPUT_PRELOAD");
+    g_p1_sched_summary_enabled           = env_flag_enabled("FPGA_P1_SCHED_SUMMARY");
+    g_p1_sched_summary                   = {};
     g_p1_preload_breadcrumbs              = 0U;
     g_p2_trace_job_id                   = 0U;
     g_p2_trace_tile_id                  = 0U;
@@ -7309,9 +7784,53 @@ int fpga_init(void) {
     g_status_stderr        = env_flag_enabled("FPGA_STATUS_STDERR");
     g_trace_data_enabled   = env_flag_enabled("FPGA_TRACE_DATA");
     g_weight_cache_enabled = env_flag_enabled("FPGA_WEIGHT_CACHE");
-    g_p2_weight_residency_requested = env_flag_enabled("FPGA_P2_WEIGHT_RESIDENCY");
+    const bool p2_weight_residency_env_requested = env_flag_enabled("FPGA_P2_WEIGHT_RESIDENCY");
+    g_p2_weight_residency_diagnostic = env_flag_enabled("FPGA_P2_WEIGHT_RESIDENCY_DIAGNOSTIC");
+    // Residency has only low-coverage board evidence.  A lone request must
+    // not enlarge the physical UIO map or change normal 4 MiB direct staging.
+    // The diagnostic flag is intentionally separate so accidental deployment
+    // of an old residency environment remains production-safe.
+    g_p2_weight_residency_requested = p2_weight_residency_env_requested && g_p2_weight_residency_diagnostic;
     g_p2_weight_residency_enabled   = false;
-    g_p2_resident_tile              = {};
+    g_p2_residency_trace_enabled    = env_flag_enabled("FPGA_P2_RESIDENCY_TRACE");
+    g_p2_residency_verify_metadata  = env_flag_enabled("FPGA_P2_RESIDENCY_VERIFY_METADATA");
+    if (p2_weight_residency_env_requested && !g_p2_weight_residency_diagnostic) {
+        LOGPROOF(
+            "P2_RESIDENCY_DISABLED reason=low_coverage_not_production requested=1 diagnostic=0 "
+            "action=direct_staging_4MiB_map");
+    }
+    g_p2_resident_tiles.fill({});
+    g_p2_residency_index.fill(P2_WEIGHT_RESIDENCY_NO_SLOT);
+    g_p2_resident_tile_count = 0;
+    g_p2_residency_next_slot = 0;
+    g_p2_residency_next_off = WEIGHT_CACHE_BASE;
+    g_p2_residency_builds = 0;
+    g_p2_residency_hits = 0;
+    g_p2_residency_misses = 0;
+    g_p2_residency_build_failures = 0;
+    g_p2_residency_logical_bytes = 0;
+    g_p2_residency_miss_alignment = 0;
+    g_p2_residency_miss_shape = 0;
+    g_p2_residency_miss_collision = 0;
+    g_p2_residency_miss_poison = 0;
+    g_p2_residency_miss_stale = 0;
+    g_p2_residency_miss_mismatch = 0;
+    g_p2_residency_miss_capacity = 0;
+    g_p2_residency_miss_quiescence = 0;
+    g_p2_residency_miss_range = 0;
+    g_p2_residency_miss_verify = 0;
+    g_p2_residency_probe_count = 0;
+    g_p2_residency_probe_exhausted = 0;
+    g_p2_residency_host_metadata_hits = 0;
+    g_p2_residency_host_metadata_invalidations = 0;
+    g_p2_residency_volatile_ddr_reads = 0;
+    g_p2_residency_build_us = 0;
+    g_p2_residency_select_us = 0;
+    g_p2_residency_metadata_validate_us = 0;
+    g_p2_residency_resident_param_us = 0;
+    g_p2_residency_direct_weight_pack_us = 0;
+    g_p2_residency_avoided_cpu_pack_bytes = 0;
+    g_p2_residency_avoided_ddr_to_ip_bytes = 0;
     if (g_p2_weight_residency_requested) {
         if (++g_p2_weight_residency_epoch == 0U) {
             fpga_fatal("P2 residency epoch exhausted; refusing identity reuse");
@@ -7710,14 +8229,14 @@ int fpga_init(void) {
                 raw_fpga_compatible ? 1 : 0, p2_admission_compatible ? 1 : 0,
                 g_spu_q8_scale_stream_supported ? 1 : 0);
         }
-        g_p2_resident_tile.enabled = true;
         g_p2_weight_residency_enabled = true;
         LOGPROOF(
-            "P2_RESIDENCY_ADMISSION pass epoch=%llu base_off=0x%08x range=[0x%llx,0x%llx) map_kind=%s "
+            "P2_RESIDENCY_ADMISSION pass diagnostic=1 verify_metadata=%d epoch=%llu base_off=0x%08x range=[0x%llx,0x%llx) map_kind=%s slots=%zu index_buckets=%zu "
             "protocol=0x%08x bitstream_id=0x%08x p2_abi=0x%08x",
-            (unsigned long long) g_p2_weight_residency_epoch, WEIGHT_CACHE_BASE,
+            g_p2_residency_verify_metadata ? 1 : 0, (unsigned long long) g_p2_weight_residency_epoch, WEIGHT_CACHE_BASE,
             (unsigned long long) (DDR_BASE_PHYS + WEIGHT_CACHE_BASE),
             (unsigned long long) (DDR_BASE_PHYS + expected_map), fpga_mapping_kind_name(g_ddr_mapping_kind),
+            P2_WEIGHT_RESIDENCY_SLOT_CAPACITY, P2_WEIGHT_RESIDENCY_INDEX_BUCKETS,
             g_stream_protocol_version, g_bitstream_id, g_p2_stream_abi_signature);
     }
     fpga_p2_init_breadcrumb("phase=admission pass p2_abi_ok=%d quiescent=%d capacity_ok=%d stream_supported=%d",
@@ -7885,6 +8404,9 @@ void fpga_cleanup(void) {
         "cleanup begin lifecycle=explicit-before-backend-free ddr_mapped=%d vpu_mapped=%d dma_mapped=%d "
         "weight_cache_entries=%zu",
         ddr_is_mapped() ? 1 : 0, vpu_is_mapped() ? 1 : 0, dma_is_mapped() ? 1 : 0, g_weight_cache.size());
+    if (g_p1_sched_summary_enabled) {
+        fpga_p1_sched_summary_emit("cleanup");
+    }
 
     // No local source establishes a safe software abort/reset sequence for an
     // in-flight ZDMA descriptor.  Therefore cleanup must observe the
@@ -7949,11 +8471,43 @@ void fpga_cleanup(void) {
                                         g_legacy_raw_cpu_bypass_count > 0 ? "cpu_quarantine" :
                                         q8_coverage_complete              ? "active" :
                                                                             "incomplete";
+    const uint64_t p2_residency_budget_bytes = g_p2_weight_residency_budget_mb > 0 ?
+                                                  (uint64_t) g_p2_weight_residency_budget_mb * 1024ULL * 1024ULL :
+                                                  0ULL;
+    const uint64_t p2_residency_allocated_bytes =
+        g_p2_residency_next_off >= WEIGHT_CACHE_BASE ? (uint64_t) g_p2_residency_next_off - WEIGHT_CACHE_BASE : 0ULL;
+    const uint64_t p2_residency_remaining_bytes = p2_residency_allocated_bytes <= p2_residency_budget_bytes ?
+                                                     p2_residency_budget_bytes - p2_residency_allocated_bytes :
+                                                     0ULL;
     LOGPROOF(
         "FPGA_GEMV_COVERAGE hook_calls=%lld q8_candidates=%lld q8_expected_fpga=%lld q8_hw_completed=%lld "
         "q8_intentional_cpu_bypass=%lld q8_unavailable_cpu_fallback=%lld routing_verdict=%s fpga_block_gemv=%s",
         hook_calls, q8_candidates, q8_expected_fpga, g_fpga_count, q8_intentional_cpu, q8_unavailable_cpu,
         q8_coverage_complete ? "complete" : "incomplete", fpga_block_gemv_mode);
+    LOGPROOF(
+        "P2_RESIDENCY_SUMMARY forced=1 enabled=%d diagnostic=%d trace=%d verify_metadata=%d slots=%zu/%zu index_buckets=%zu max_probes=%zu probes=%lld "
+        "probe_exhausted_direct_stage=%lld hits=%lld misses=%lld host_metadata_hits=%lld host_metadata_invalidations=%lld "
+        "volatile_ddr_reads=%lld build_us=%lld select_us=%lld metadata_validate_us=%lld resident_param_us=%lld "
+        "direct_weight_pack_us=%lld avoided_cpu_pack_bytes=%lld avoided_ddr_to_ip_bytes=%lld "
+        "miss_alignment=%lld miss_shape=%lld miss_collision=%lld miss_poison=%lld miss_stale=%lld miss_mismatch=%lld "
+        "miss_capacity=%lld miss_quiescence=%lld miss_range=%lld miss_verify=%lld builds=%lld build_failures=%lld logical_bytes=%lld "
+        "allocated_bytes=%llu remaining_bytes=%llu budget_bytes=%llu",
+        g_p2_weight_residency_enabled ? 1 : 0, g_p2_weight_residency_diagnostic ? 1 : 0,
+        g_p2_residency_trace_enabled ? 1 : 0, g_p2_residency_verify_metadata ? 1 : 0, g_p2_resident_tile_count,
+        g_p2_resident_tiles.size(), g_p2_residency_index.size(), P2_WEIGHT_RESIDENCY_INDEX_MAX_PROBES,
+        g_p2_residency_probe_count, g_p2_residency_probe_exhausted, g_p2_residency_hits, g_p2_residency_misses,
+        g_p2_residency_host_metadata_hits, g_p2_residency_host_metadata_invalidations,
+        g_p2_residency_volatile_ddr_reads, g_p2_residency_build_us, g_p2_residency_select_us,
+        g_p2_residency_metadata_validate_us, g_p2_residency_resident_param_us,
+        g_p2_residency_direct_weight_pack_us, g_p2_residency_avoided_cpu_pack_bytes,
+        g_p2_residency_avoided_ddr_to_ip_bytes,
+        g_p2_residency_miss_alignment, g_p2_residency_miss_shape, g_p2_residency_miss_collision,
+        g_p2_residency_miss_poison, g_p2_residency_miss_stale, g_p2_residency_miss_mismatch,
+        g_p2_residency_miss_capacity, g_p2_residency_miss_quiescence, g_p2_residency_miss_range,
+        g_p2_residency_miss_verify,
+        g_p2_residency_builds, g_p2_residency_build_failures, g_p2_residency_logical_bytes,
+        (unsigned long long) p2_residency_allocated_bytes, (unsigned long long) p2_residency_remaining_bytes,
+        (unsigned long long) p2_residency_budget_bytes);
     LOGPROOF(
         "cleanup complete fpga_calls=%lld vpu_runs=%lld rejects=%lld attention_cpu_bypass=%lld "
         "vocab_projection_cpu_bypass=%lld legacy_raw_cpu_bypass=%lld elapsed_s=%.3f pingpong_cap=%d descriptor_cap=%d "
@@ -7964,7 +8518,9 @@ void fpga_cleanup(void) {
         "value_mismatches=%lld contract_cpu_shadow_dst_values=%lld staging_restages=%lld q8_source_audit_checks=%lld "
         "q8_source_audit_failures=%lld p2_matrix_contract_checks=%lld p2_tile_q16_checks=%lld p2_tile_limit=%d "
         "p2_tile_boundary=%d matrix_value_contract=%s p2_jobs=%lld p2_banks=%lld p2_stream_drops=%lld "
-        "p2_stream_errors=%lld",
+        "p2_stream_errors=%lld p2_residency_enabled=%d p2_residency_slots=%zu/%zu p2_residency_builds=%lld "
+        "p2_residency_hits=%lld p2_residency_direct_stage_misses=%lld p2_residency_build_failures=%lld "
+        "p2_residency_logical_bytes=%lld p2_residency_allocated_bytes=%llu p2_residency_remaining_bytes=%llu",
         g_fpga_count, g_fpga_vpu_runs, g_reject_count, g_attention_bypass_count, g_vocab_projection_bypass_count,
         g_legacy_raw_cpu_bypass_count, elapsed_us > 0 ? (double) elapsed_us / 1000000.0 : 0.0,
         g_vpu_pingpong_supported ? 1 : 0, g_vpu_descriptor_supported ? 1 : 0, g_pingpong_scheduler_enabled ? 1 : 0,
@@ -7977,7 +8533,10 @@ void fpga_cleanup(void) {
         g_q8_source_audit_checks, g_q8_source_audit_failures, g_p2_matrix_contract_checks, g_p2_tile_q16_checks,
         g_p2_tile_limit, g_p2_tile_contract_boundary_reached ? 1 : 0,
         g_pl_scale_contract_check_limit > 0 ? "not_attempted" : "not_applicable", g_pl_scale_jobs, g_pl_scale_banks,
-        g_pl_scale_stream_drops, g_pl_scale_stream_errors);
+        g_pl_scale_stream_drops, g_pl_scale_stream_errors, g_p2_weight_residency_enabled ? 1 : 0,
+        g_p2_resident_tile_count, g_p2_resident_tiles.size(), g_p2_residency_builds, g_p2_residency_hits,
+        g_p2_residency_misses, g_p2_residency_build_failures, g_p2_residency_logical_bytes,
+        (unsigned long long) p2_residency_allocated_bytes, (unsigned long long) p2_residency_remaining_bytes);
     fflush(fpga_log_fp());
     pthread_mutex_unlock(&g_mutex);
 }
@@ -8288,6 +8847,7 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
     g_active_matmul_cpu_shadow = g_contract_cpu_shadow_dst;
     g_active_matmul_pingpong   = g_pingpong_scheduler_enabled;
     g_active_matmul_tensor_name = tensor_name;
+    fpga_p1_sched_summary_begin_graph(g_active_matmul_graph_seq);
     if (verify_activation_input) {
         if (!fpga_capture_activation_input_snapshot(src1, k, m, g_scratch.activation_input_snapshot)) {
             LOGE("FPGA_INPUT_INTEGRITY_INTERNAL_ERROR tensor=%s layer=%d reason=snapshot_capture_failed K=%lld M=%lld",
@@ -8347,6 +8907,16 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
     g_fpga_vpu_runs += totals.vpu_runs;
     g_weight_cache_hits += totals.weight_cache_hits;
     g_weight_cache_misses += totals.weight_cache_misses;
+    if (g_p1_sched_summary_enabled) {
+        g_p1_sched_summary.matmuls++;
+        g_p1_sched_summary.vpu_runs += totals.vpu_runs;
+        g_p1_sched_summary.input_preload_us += totals.input_preload_us;
+        g_p1_sched_summary.preload_launch_bubble_us += totals.preload_launch_bubble_us;
+        g_p1_sched_summary.ip_compute_us += totals.ip_compute_us;
+        g_p1_sched_summary.dma_act_us += totals.dma_act_us;
+        g_p1_sched_summary.dma_weight_us += totals.dma_weight_us;
+        g_p1_sched_summary.matrix_wall_us += t1 - t0;
+    }
     const double total_ms        = (double) (t1 - t0) / 1000.0;
     const double prep_ms         = (double) totals.prep_us / 1000.0;
     const double dma_act_ms      = (double) totals.dma_act_us / 1000.0;
