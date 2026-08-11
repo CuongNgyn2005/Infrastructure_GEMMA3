@@ -33,6 +33,11 @@
 #define FPGA_LOG_FILE           "/tmp/fpga_debug.log"
 #define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v88-compact-telemetry"
 
+// Phase 6 is an intentionally small, line-oriented diagnostic capture.  This
+// finite bound limits both retained accounting and owner log volume; it is not
+// a hardware capability or a production tiling limit.
+static constexpr size_t FPGA_P6_RECORD_LIMIT_HARD_MAX = 4096U;
+
 #define MY_IP_BASE_ADDRESS 0x00000000A0000000LL
 #define REG_BASE_PHYS      0x00000000A0000000LL
 #define LMM_BASE_PHYS      0x00000000A0000000LL
@@ -68,6 +73,30 @@ static bool               g_p2_tile_contract_boundary_reached = false;
 static long long          g_p2_tile_q16_checks                = 0;
 static long long          g_p2_matrix_contract_checks         = 0;
 static bool               g_p2_tile_trace_enabled             = false;
+// Phase 6 is a deliberately narrow ARM-host golden capture.  It observes the
+// deployed host's existing FP32 accumulator operation after the P2 Q16 tile
+// check; it does not compare with, or prescribe, a future PL FP32 result.
+typedef struct {
+    bool        enabled;
+    std::string tensor;
+    int         layer;
+    int64_t     tile_row0;
+    int64_t     row_first;
+    int         row_count;
+    int         expected_k_chunks;
+    size_t      record_limit;
+    size_t      records_emitted;
+    int         chunks_seen;
+    int64_t     next_k_block0;
+    // The selected tensor may be evaluated during a multi-token warm-up
+    // before its single-token decode GEMV.  Record the M=1 sighting
+    // separately so cleanup can report a missing decode capture precisely.
+    bool        selected_m1_matmul_seen;
+    bool        selected_non_m1_defer_logged;
+    bool        capture_complete;
+} fpga_p6_accum_trace_t;
+
+static fpga_p6_accum_trace_t g_p6_accum_trace = {};
 // Keep routine P2 breadcrumbs in /tmp/fpga_debug.log.  Their stderr mirrors
 // are an explicit diagnostic opt-in so normal inference remains readable.
 static bool               g_p2_terminal_trace_enabled         = false;
@@ -792,6 +821,36 @@ static size_t                                 g_ddr_requested_map_size = DDR_REQ
 static std::string                            g_dma_map_source;
 static std::string                            g_vpu_map_source;
 static std::string                            g_ddr_map_source;
+// FPGA_WEIGHT_PATH_BENCH is an in-process, passive diagnostic.  It records
+// only the live tiler geometry and keeps tensor references private to this
+// process; it never serializes or logs host pointers.
+typedef struct {
+    const struct ggml_tensor * src0;
+    const void *               weight_data_base;
+    int64_t                    source_k;
+    int64_t                    source_n;
+    size_t                     source_nb0;
+    size_t                     source_nb1;
+    size_t                     source_span_bytes;
+    int64_t                    row0;
+    int                        rows;
+    int64_t                    k_block0;
+    int                        group_blocks;
+    int                        group_beats;
+    size_t                     payload_bytes;
+} fpga_weight_path_bench_job_t;
+
+typedef struct {
+    bool                                    enabled;
+    bool                                    passive_mapping;
+    bool                                    replayed;
+    int                                     graph_seq;
+    uint64_t                                payload_bytes;
+    std::vector<fpga_weight_path_bench_job_t> jobs;
+    std::vector<uint32_t>                   cached_payload;
+} fpga_weight_path_bench_trace_t;
+
+static fpga_weight_path_bench_trace_t g_weight_path_bench = {};
 // This is set by the mapper that created g_ddr, not inferred later from a
 // display string or the O_SYNC open flag.  P2's no-msync policy is legal only
 // for the bounded physical UIO mapping it has admitted.
@@ -3280,6 +3339,116 @@ static bool map_registers_dma_ddr(void) {
     return true;
 }
 
+static bool fpga_weight_path_bench_host_self_test(void);
+
+// The weight-path benchmark intentionally has no ZDMA ownership.  It maps
+// only the verified UIO resources needed to read identity/capability words
+// and to make bounded CPU stores into the existing WEIGHT staging window.
+static bool map_weight_path_bench_vpu_ddr(void) {
+    g_ddr_requested_map_size = DDR_REQUIRED_BYTES;
+    g_ddr_advertised_size    = 0U;
+    g_ddr_mapping_kind       = fpga_mapping_kind::UNKNOWN;
+
+    if (!map_uio_region("MY_IP", "FPGA_VPU_UIO", REG_BASE_PHYS, VPU_DEVMEM_COMPAT_MMAP,
+                        VPU_DEVMEM_COMPAT_MMAP, "MY_IP/VPU passive benchmark", VPU_DEVMEM_COMPAT_MMAP,
+                        &g_vpu_map_base, &g_vpu_map_size, nullptr, &g_vpu_map_source, nullptr)) {
+        return false;
+    }
+    g_vpu = (volatile uint8_t *) g_vpu_map_base;
+
+    if (!fpga_ddr_iomem_preflight() ||
+        !map_uio_region("fpga_ddr_low", "FPGA_DDR_UIO", DDR_BASE_PHYS, DDR_REGION_SIZE, DDR_REQUIRED_BYTES,
+                        "fpga_ddr_low passive benchmark", DDR_REQUIRED_BYTES, &g_ddr_map_base, &g_ddr_map_size,
+                        &g_ddr_advertised_size, &g_ddr_map_source, &g_ddr_mapping_kind)) {
+        if (g_vpu_map_base && g_vpu_map_base != MAP_FAILED) {
+            munmap(g_vpu_map_base, g_vpu_map_size);
+        }
+        g_vpu_map_base = nullptr;
+        g_vpu          = nullptr;
+        g_vpu_map_size = 0U;
+        return false;
+    }
+    g_ddr = (uint8_t *) g_ddr_map_base;
+    return true;
+}
+
+static bool fpga_weight_path_bench_read_capabilities(void) {
+    if (!vpu_is_mapped()) {
+        return false;
+    }
+    const uint32_t limits = vpu_rd32(REG_LIMITS);
+    const uint32_t caps   = vpu_rd32(REG_CAPS);
+    g_stream_protocol_version = vpu_rd32(REG_STREAM_PROTOCOL_VERSION);
+    g_bitstream_id            = vpu_rd32(REG_BITSTREAM_ID);
+    g_p2_stream_abi_signature = vpu_rd32(REG_P2_STREAM_ABI);
+
+    const int rows  = (int) (limits & 0xFFFFU);
+    const int beats = (int) ((limits >> 16) & 0xFFFFU);
+    const int blocks = (int) ((caps >> 8) & 0xFFU);
+    const int result_words = (int) ((caps >> 16) & 0xFFFFU);
+    const bool caps_valid = caps != 0U && caps != 0xFFFFFFFFU;
+    const bool identity_ok = g_bitstream_id == FPGA_EXPECTED_BITSTREAM_ID &&
+                             g_stream_protocol_version == FPGA_REQUIRED_STREAM_PROTOCOL_VERSION &&
+                             g_p2_stream_abi_signature == FPGA_REQUIRED_P2_STREAM_ABI;
+    const bool layout_ok = caps_valid && (caps & VPU_CAP_PACKED_Q8) != 0U &&
+                           (caps & VPU_CAP_COMPACT_WEIGHT_LAYOUT) != 0U &&
+                           (caps & VPU_CAP_P2_TWO_ROW_TRANSPORT) != 0U && rows > 0 && rows <= VPU_DEFAULT_ROWS &&
+                           beats > 0 && beats <= VPU_DEFAULT_BEATS && blocks > 0 && result_words > 0;
+    if (!identity_ok || !layout_ok) {
+        LOGE("WEIGHT_PATH_BENCH_CAPS_REJECT protocol=0x%08x bitstream_id=0x%08x p2_abi=0x%08x limits=0x%08x "
+             "caps=0x%08x identity_ok=%d layout_ok=%d action=no_ddr_write_no_zdma_no_vpu_start",
+             g_stream_protocol_version, g_bitstream_id, g_p2_stream_abi_signature, limits, caps,
+             identity_ok ? 1 : 0, layout_ok ? 1 : 0);
+        return false;
+    }
+    g_vpu_max_rows           = rows;
+    g_vpu_max_beats          = beats;
+    g_vpu_max_cols           = beats * VPU_NUM_LANES;
+    g_runtime_max_rows = env_int_value("FPGA_RUNTIME_MAX_ROWS", VPU_SAFE_RUNTIME_ROWS, 1, VPU_DEFAULT_ROWS);
+    if (g_runtime_max_rows < g_vpu_max_rows) {
+        g_vpu_max_rows = g_runtime_max_rows;
+    }
+    g_packed_q8_supported    = 1;
+    g_packed_q8_max_blocks   = std::min(blocks, beats / VPU_BLOCK_BEATS);
+    if (g_packed_q8_max_blocks <= 0) {
+        return false;
+    }
+    // Match the admitted normal host tiler: capability reporting is checked
+    // above, then its safe runtime tile geometry becomes the grouping limit.
+    g_packed_q8_result_words =
+        (g_vpu_max_rows * g_packed_q8_max_blocks + VPU_RESULT_PACK_LANES - 1) / VPU_RESULT_PACK_LANES;
+    LOGINIT("WEIGHT_PATH_BENCH_PASSIVE_READY version=%s protocol=0x%08x bitstream_id=0x%08x p2_abi=0x%08x "
+            "rows=%d host_row_limit=%d beats=%d max_group_blocks=%d result_words=%d vpu_map=0x%zx ddr_map=0x%zx "
+            "zdma=not_mapped dma_init=not_run vpu_start=not_run",
+            FPGA_HOST_TRACE_VERSION, g_stream_protocol_version, g_bitstream_id, g_p2_stream_abi_signature,
+            g_vpu_max_rows, g_runtime_max_rows, g_vpu_max_beats, g_packed_q8_max_blocks,
+            g_packed_q8_result_words, g_vpu_map_size, g_ddr_map_size);
+    return true;
+}
+
+static bool fpga_weight_path_bench_environment_allowed(void) {
+    if (env_flag_enabled("FPGA_DISABLE")) {
+        fpga_fatal("FPGA_WEIGHT_PATH_BENCH=1 conflicts with FPGA_DISABLE=1; explicit disable wins before any UIO mapping");
+    }
+    const bool incompatible = env_flag_enabled("FPGA_WEIGHT_CACHE") ||
+                              env_flag_enabled("FPGA_P2_WEIGHT_RESIDENCY") ||
+                              env_flag_enabled("FPGA_P2_WEIGHT_RESIDENCY_DIAGNOSTIC") ||
+                              env_flag_enabled("FPGA_P2_RESIDENCY_TRACE") ||
+                              env_flag_enabled("FPGA_P2_RESIDENCY_VERIFY_METADATA") ||
+                              env_flag_enabled("FPGA_P3_SPLIT_SCALE") ||
+                              env_int_value("FPGA_CONTRACT_CHECK", 0, 0, 1000000) != 0 ||
+                              env_int_value("FPGA_PL_SCALE_CONTRACT_CHECK", 0, 0, 1000000) != 0 ||
+                              env_flag_enabled("FPGA_SOURCE_AUDIT_ONLY") ||
+                              env_flag_enabled("FPGA_PIPELINE_ENABLE") ||
+                              env_flag_enabled("FPGA_P2_INPUT_PRELOAD") ||
+                              env_flag_enabled("FPGA_ABORT_ON_CPU_FALLBACK");
+    if (incompatible) {
+        fpga_fatal("FPGA_WEIGHT_PATH_BENCH=1 rejects cache/residency/P3/contract/source-audit/preload/pipeline/explicit-"
+                   "abort modes; benchmark routes the captured m==1 sequence to native CPU and never launches ZDMA/VPU");
+    }
+    return true;
+}
+
 static bool configure_ddr_mapping_policy(void) {
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
@@ -4861,6 +5030,185 @@ static bool fpga_p2_cumulative_tile_limit_reached(long long q16_checks, int tile
 // existing DMA/SPU/descriptor boundary sequence.
 static bool fpga_p2_cumulative_tile_state_consistent(long long q16_checks, int tile_limit, bool boundary_reached) {
     return fpga_p2_cumulative_tile_limit_reached(q16_checks, tile_limit) == boundary_reached;
+}
+
+static bool fpga_p6_parse_required_i64(const char * name, int64_t min_value, int64_t * value) {
+    const char * const text = getenv(name);
+    if (!text || text[0] == '\0' || !value) {
+        return false;
+    }
+    errno       = 0;
+    char * end  = nullptr;
+    const long long parsed = strtoll(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || parsed < min_value) {
+        return false;
+    }
+    *value = (int64_t) parsed;
+    return true;
+}
+
+// P6 captures the deployed ARM accumulation only for the selected decode
+// GEMV.  The same tensor can legitimately occur with M>1 during warm-up;
+// that work must stay native CPU and must not enter any FPGA accounting.
+static bool fpga_p6_selected_m1_eligible(bool selected_name_layer, int64_t shape_m) {
+    return selected_name_layer && shape_m == 1;
+}
+
+// Invoke this only after the ordered cleanup sequence has released all safe
+// host/PL resources.  A configured P6 run without a complete golden capture
+// is incomplete evidence even when the selected M=1 GEMV was never reached.
+static bool fpga_p6_cleanup_requires_failure(bool fpga_initialized, const fpga_p6_accum_trace_t & trace) {
+    return fpga_initialized && trace.enabled && !trace.capture_complete;
+}
+
+static bool fpga_p6_job_selected(const fpga_tile_job_t & job) {
+    const fpga_p6_accum_trace_t & trace = g_p6_accum_trace;
+    if (!trace.enabled || !job.tensor_name || trace.tensor != job.tensor_name || trace.layer != job.layer_id ||
+        trace.tile_row0 != job.row0 || job.col != 0 || job.shape_m != 1) {
+        return false;
+    }
+    const int64_t row_end = trace.row_first + (int64_t) trace.row_count;
+    const int64_t tile_end = job.row0 + (int64_t) job.rows;
+    return trace.row_first >= job.row0 && row_end >= trace.row_first && row_end <= tile_end;
+}
+
+// Admit one whole selected K chunk before writing any trace record.  This is
+// intentionally host-only state: an error leaves the native CPU destination
+// ownership intact and stops the qualification rather than concealing it.
+static bool fpga_p6_accept_chunk(const fpga_tile_job_t & job, int * ordinal, bool * final_chunk) {
+    fpga_p6_accum_trace_t & trace = g_p6_accum_trace;
+    if (!trace.enabled || !ordinal || !final_chunk || !fpga_p6_job_selected(job) || trace.capture_complete) {
+        return false;
+    }
+    const int64_t nb = job.shape_k / VPU_QK8_0;
+    if (job.shape_k <= 0 || job.shape_k % VPU_QK8_0 != 0 || job.group_blocks <= 0 || job.k_block0 < 0 ||
+        job.k_block0 > nb || (int64_t) job.group_blocks > nb - job.k_block0 ||
+        trace.records_emitted > trace.record_limit ||
+        (size_t) trace.row_count > trace.record_limit - trace.records_emitted) {
+        return false;
+    }
+    if ((trace.chunks_seen == 0 && job.k_block0 != 0) ||
+        (trace.chunks_seen > 0 && job.k_block0 != trace.next_k_block0) ||
+        trace.chunks_seen >= trace.expected_k_chunks) {
+        return false;
+    }
+    const bool actual_final = job.k_block0 + (int64_t) job.group_blocks == nb;
+    const bool expected_final = trace.chunks_seen + 1 == trace.expected_k_chunks;
+    if (actual_final != expected_final) {
+        return false;
+    }
+    *ordinal             = trace.chunks_seen;
+    *final_chunk         = actual_final;
+    trace.next_k_block0  = job.k_block0 + (int64_t) job.group_blocks;
+    trace.chunks_seen++;
+    return true;
+}
+
+static bool fpga_p6_accum_trace_host_self_test(void) {
+    fpga_p6_accum_trace_t saved = g_p6_accum_trace;
+    fpga_p6_accum_trace_t trace = {};
+    trace.enabled = true;
+    trace.tensor = "p6-self-test";
+    trace.layer = 3;
+    trace.tile_row0 = 0;
+    trace.row_first = 0;
+    trace.row_count = 1;
+    trace.expected_k_chunks = 4;
+    trace.record_limit = 4;
+    g_p6_accum_trace = trace;
+    const bool m2_deferred = !fpga_p6_selected_m1_eligible(true, 2);
+    const bool m1_eligible = fpga_p6_selected_m1_eligible(true, 1) &&
+                             !fpga_p6_selected_m1_eligible(false, 1);
+    fpga_p6_accum_trace_t cleanup_incomplete = trace;
+    cleanup_incomplete.selected_m1_matmul_seen = true;
+    const bool cleanup_incomplete_rejected = fpga_p6_cleanup_requires_failure(true, cleanup_incomplete);
+    cleanup_incomplete.capture_complete = true;
+    const bool cleanup_complete_accepted = !fpga_p6_cleanup_requires_failure(true, cleanup_incomplete);
+    const bool cleanup_before_init_accepted = !fpga_p6_cleanup_requires_failure(false, trace);
+    fpga_tile_job_t job = {};
+    job.tensor_name = "p6-self-test";
+    job.layer_id = 3;
+    job.row0 = 0;
+    job.rows = 1;
+    job.col = 0;
+    job.shape_k = 128;
+    job.shape_m = 1;
+    job.k_block0 = 0;
+    job.group_blocks = 1;
+    int ordinal = -1;
+    bool final_chunk = true;
+    const bool first_ok = fpga_p6_accept_chunk(job, &ordinal, &final_chunk) && ordinal == 0 && !final_chunk;
+    const bool duplicate_rejected = !fpga_p6_accept_chunk(job, &ordinal, &final_chunk);
+    job.k_block0 = 2;
+    const bool gap_rejected = !fpga_p6_accept_chunk(job, &ordinal, &final_chunk);
+    job.k_block0 = 1;
+    const bool second_ok = fpga_p6_accept_chunk(job, &ordinal, &final_chunk) && ordinal == 1 && !final_chunk;
+    job.k_block0 = 2;
+    const bool third_ok = fpga_p6_accept_chunk(job, &ordinal, &final_chunk) && ordinal == 2 && !final_chunk;
+    job.k_block0 = 3;
+    const bool fourth_ok = fpga_p6_accept_chunk(job, &ordinal, &final_chunk) && ordinal == 3 && final_chunk;
+    const bool extra_chunk_rejected = !fpga_p6_accept_chunk(job, &ordinal, &final_chunk);
+    job.layer_id = 4;
+    const bool selector_rejected = !fpga_p6_job_selected(job);
+    job.layer_id = 3;
+    uint32_t plus_zero_bits = 0U;
+    uint32_t minus_zero_bits = 0U;
+    const float plus_zero = 0.0f;
+    const float minus_zero = -0.0f;
+    memcpy(&plus_zero_bits, &plus_zero, sizeof(plus_zero_bits));
+    memcpy(&minus_zero_bits, &minus_zero, sizeof(minus_zero_bits));
+    const bool zero_bits_ok = plus_zero_bits == 0x00000000U && minus_zero_bits == 0x80000000U;
+
+    // Exercise the deployed accumulation ordering in memory over four chunks.
+    // This covers positive, negative, and exact cancellation, while keeping
+    // the production accumulation statement below singular and unchanged.
+    static constexpr int64_t q16_values[] = {65536, -65536, -32768, 32768};
+    static constexpr uint32_t before_expected[] = {0x00000000U, 0x3f800000U, 0x00000000U, 0xbf000000U};
+    static constexpr uint32_t after_expected[]  = {0x3f800000U, 0x00000000U, 0xbf000000U, 0x00000000U};
+    float p6_accum = 0.0f;
+    size_t p6_records = 0U;
+    bool accumulation_bits_ok = true;
+    for (size_t chunk = 0U; chunk < sizeof(q16_values) / sizeof(q16_values[0]); ++chunk) {
+        uint32_t before_bits = 0U;
+        memcpy(&before_bits, &p6_accum, sizeof(before_bits));
+        const float contribution = (float) q16_values[chunk] * (1.0f / 65536.0f);
+        p6_accum = p6_accum + contribution;
+        uint32_t after_bits = 0U;
+        memcpy(&after_bits, &p6_accum, sizeof(after_bits));
+        accumulation_bits_ok = accumulation_bits_ok && before_bits == before_expected[chunk] &&
+                               after_bits == after_expected[chunk];
+        ++p6_records;
+    }
+    const bool final_record_count_ok = p6_records == (size_t) trace.row_count * (size_t) trace.expected_k_chunks &&
+                                       p6_records == trace.record_limit;
+
+    // Premature-final and record-cap failures are tested from clean states.
+    g_p6_accum_trace = trace;
+    job.k_block0 = 0;
+    job.shape_k = 64;
+    job.group_blocks = 2;
+    const bool premature_final_rejected = !fpga_p6_accept_chunk(job, &ordinal, &final_chunk);
+    g_p6_accum_trace = trace;
+    g_p6_accum_trace.expected_k_chunks = 2;
+    g_p6_accum_trace.record_limit = 2;
+    job.shape_k = 96;
+    job.group_blocks = 1;
+    const bool missing_final_first_ok = fpga_p6_accept_chunk(job, &ordinal, &final_chunk) && !final_chunk;
+    job.k_block0 = 1;
+    const bool missing_final_rejected = !fpga_p6_accept_chunk(job, &ordinal, &final_chunk);
+    g_p6_accum_trace = trace;
+    g_p6_accum_trace.row_count = 2;
+    g_p6_accum_trace.record_limit = 1;
+    job.shape_k = 128;
+    job.k_block0 = 0;
+    job.group_blocks = 1;
+    job.rows = 2;
+    const bool cap_rejected = !fpga_p6_accept_chunk(job, &ordinal, &final_chunk);
+    g_p6_accum_trace = saved;
+    return m2_deferred && m1_eligible && cleanup_incomplete_rejected && cleanup_complete_accepted &&
+           cleanup_before_init_accepted && first_ok && duplicate_rejected && gap_rejected && second_ok && third_ok && fourth_ok &&
+           extra_chunk_rejected && selector_rejected && zero_bits_ok && accumulation_bits_ok && final_record_count_ok &&
+           premature_final_rejected && missing_final_first_ok && missing_final_rejected && cap_rejected;
 }
 
 // Host-only policy check for the cumulative qualification boundary.  The
@@ -6547,6 +6895,379 @@ static int packed_q8_group_blocks_for_rows(int rows, int remaining_blocks) {
     blocks     = std::min(blocks, result_limited_blocks);
     blocks     = std::min(blocks, remaining_blocks);
     return std::max(1, blocks);
+}
+
+static bool fpga_weight_path_bench_pack_cached(const fpga_weight_path_bench_job_t & job,
+                                                std::vector<uint32_t> &            cached_words) {
+    if (!job.src0 || !job.weight_data_base || job.payload_bytes == 0U || (job.payload_bytes & 0xFU) != 0U ||
+        cached_words.size() < job.payload_bytes / sizeof(uint32_t)) {
+        return false;
+    }
+    size_t written_words = 0U;
+    return fpga_pack_direct_weight_pair_range((volatile uint32_t *) cached_words.data(), job.src0, job.weight_data_base,
+                                              job.row0, job.k_block0, job.rows, job.group_blocks, job.group_beats, 0U,
+                                              ((size_t) job.rows + 1U) / 2U, &written_words) &&
+           written_words == job.payload_bytes / sizeof(uint32_t);
+}
+
+static bool fpga_weight_path_bench_revalidate_job(const fpga_weight_path_bench_job_t & job) {
+    if (!job.src0 || job.src0->type != GGML_TYPE_Q8_0 || job.src0->data != job.weight_data_base ||
+        job.src0->ne[0] != job.source_k || job.src0->ne[1] != job.source_n || job.src0->nb[0] != job.source_nb0 ||
+        job.src0->nb[1] != job.source_nb1 || ggml_nbytes(job.src0) != job.source_span_bytes || job.source_k <= 0 ||
+        job.source_n <= 0 || job.source_k % VPU_QK8_0 != 0 || job.row0 < 0 || job.rows <= 0 ||
+        job.row0 > job.source_n - job.rows || job.k_block0 < 0 || job.group_blocks <= 0 ||
+        job.k_block0 > job.source_k / VPU_QK8_0 - job.group_blocks || job.group_beats != job.group_blocks * VPU_BLOCK_BEATS) {
+        return false;
+    }
+    size_t payload_bytes = 0U;
+    return fpga_weight_layout_payload_bytes(job.rows, job.group_beats, &payload_bytes) &&
+           payload_bytes == job.payload_bytes && range_fits(WEIGHT_BASE, payload_bytes, WEIGHT_BASE, WEIGHT_END) &&
+           ddr_range_fits(WEIGHT_BASE, payload_bytes);
+}
+
+static bool fpga_weight_path_bench_store_uio(const std::vector<uint32_t> & cached_words, size_t bytes) {
+    if (bytes == 0U || (bytes & 0xFU) != 0U || cached_words.size() < bytes / sizeof(uint32_t) ||
+        !range_fits(WEIGHT_BASE, bytes, WEIGHT_BASE, WEIGHT_END) || !ddr_range_fits(WEIGHT_BASE, bytes)) {
+        return false;
+    }
+    volatile uint32_t * const dst = ddr_checked_u32_ptr(WEIGHT_BASE, bytes);
+    for (size_t word = 0; word < bytes / sizeof(uint32_t); ++word) {
+        dst[word] = cached_words[word];
+    }
+    // This is the same bounded volatile-write/readback commit used by normal
+    // staging, but benchmark mode has no following ZDMA descriptor.
+    mmio_fence();
+    fpga_ddr_staging_readback_commit(WEIGHT_BASE, bytes);
+    return true;
+}
+
+static bool fpga_weight_path_bench_pack_uio(const fpga_weight_path_bench_job_t & job) {
+    if (!fpga_weight_path_bench_revalidate_job(job)) {
+        return false;
+    }
+    volatile uint32_t * const dst = ddr_checked_u32_ptr(WEIGHT_BASE, job.payload_bytes);
+    size_t written_words = 0U;
+    if (!fpga_pack_direct_weight_pair_range(dst, job.src0, job.weight_data_base, job.row0, job.k_block0, job.rows,
+                                             job.group_blocks, job.group_beats, 0U, ((size_t) job.rows + 1U) / 2U,
+                                             &written_words) ||
+        written_words != job.payload_bytes / sizeof(uint32_t)) {
+        return false;
+    }
+    mmio_fence();
+    fpga_ddr_staging_readback_commit(WEIGHT_BASE, job.payload_bytes);
+    return true;
+}
+
+static bool fpga_weight_path_bench_reset_required(const fpga_weight_path_bench_trace_t & trace,
+                                                  int                                    previous_graph_seq,
+                                                  int                                    n_tokens) {
+    return trace.enabled && !trace.replayed && trace.graph_seq != INT_MIN &&
+           (n_tokens != 1 || trace.graph_seq != previous_graph_seq);
+}
+
+// This host-only diagnostic has not written DDR until replay begins.  It is
+// therefore safe to discard a trace which crossed a graph boundary before its
+// one-token replay point.  Callers hold g_mutex.
+static void fpga_weight_path_bench_reset_unreplayed_trace(fpga_weight_path_bench_trace_t * trace,
+                                                          int                              new_graph_seq,
+                                                          const char *                     reason,
+                                                          bool                             emit_log) {
+    if (!trace || trace->replayed || trace->graph_seq == INT_MIN) {
+        return;
+    }
+    const int      old_graph_seq = trace->graph_seq;
+    const size_t   stale_jobs    = trace->jobs.size();
+    const uint64_t stale_bytes   = trace->payload_bytes;
+    trace->cached_payload.clear();
+    trace->jobs.clear();
+    trace->payload_bytes = 0U;
+    trace->graph_seq     = new_graph_seq;
+    if (emit_log) {
+        LOGPROOF("WEIGHT_PATH_BENCH_CAPTURE_RESET old_seq=%d new_seq=%d stale_jobs=%zu stale_bytes=%llu reason=%s",
+                 old_graph_seq, new_graph_seq, stale_jobs, (unsigned long long) stale_bytes,
+                 reason ? reason : "unspecified");
+    }
+}
+
+static bool fpga_weight_path_bench_prepare_capture(fpga_weight_path_bench_trace_t * trace,
+                                                   int                              graph_seq,
+                                                   const char **                    reason,
+                                                   bool                             emit_log) {
+    if (reason) {
+        *reason = "state_unknown";
+    }
+    if (!trace || !trace->enabled) {
+        if (reason) {
+            *reason = "state_benchmark_disabled";
+        }
+        return false;
+    }
+    if (trace->replayed) {
+        if (reason) {
+            *reason = "state_trace_replayed";
+        }
+        return false;
+    }
+    if (trace->graph_seq == INT_MIN) {
+        trace->graph_seq = graph_seq;
+        return true;
+    }
+    if (trace->graph_seq != graph_seq) {
+        fpga_weight_path_bench_reset_unreplayed_trace(trace, graph_seq,
+                                                      "sequence_advanced_before_single_token_boundary", emit_log);
+    }
+    return true;
+}
+
+static bool fpga_weight_path_bench_capture(const struct ggml_tensor * src0, int graph_seq, const char ** reason) {
+    if (reason) {
+        *reason = "source_unknown";
+    }
+    if (!src0 || src0->type != GGML_TYPE_Q8_0 || !src0->data || src0->ne[0] <= 0 || src0->ne[1] <= 0 ||
+        src0->ne[0] % VPU_QK8_0 != 0) {
+        if (reason) {
+            *reason = "source_invalid_q8_tensor";
+        }
+        return false;
+    }
+    if (!fpga_weight_path_bench_prepare_capture(&g_weight_path_bench, graph_seq, reason, true)) {
+        return false;
+    }
+    const int64_t k           = src0->ne[0];
+    const int64_t n           = src0->ne[1];
+    const int64_t nb          = k / VPU_QK8_0;
+    const size_t  source_span = ggml_nbytes(src0);
+    for (int64_t row0 = 0; row0 < n; row0 += g_vpu_max_rows) {
+        const int rows = (int) std::min<int64_t>(g_vpu_max_rows, n - row0);
+        for (int64_t k_block0 = 0; k_block0 < nb;) {
+            const int group_blocks  = packed_q8_group_blocks_for_rows(rows, (int) (nb - k_block0));
+            const int group_beats   = group_blocks * VPU_BLOCK_BEATS;
+            size_t    payload_bytes = 0U;
+            if (group_blocks <= 0 || group_beats <= 0 ||
+                !fpga_weight_layout_payload_bytes(rows, group_beats, &payload_bytes)) {
+                if (reason) {
+                    *reason = "geometry_invalid_tile";
+                }
+                return false;
+            }
+            if (!range_fits(WEIGHT_BASE, payload_bytes, WEIGHT_BASE, WEIGHT_END) ||
+                !ddr_range_fits(WEIGHT_BASE, payload_bytes)) {
+                if (reason) {
+                    *reason = "range_staging_window";
+                }
+                return false;
+            }
+            if (payload_bytes > UINT64_MAX - g_weight_path_bench.payload_bytes) {
+                if (reason) {
+                    *reason = "state_payload_counter_overflow";
+                }
+                return false;
+            }
+            try {
+                g_weight_path_bench.jobs.push_back({ src0, src0->data, k, n, src0->nb[0], src0->nb[1], source_span,
+                                                     row0, rows, k_block0, group_blocks, group_beats, payload_bytes });
+            } catch (...) {
+                if (reason) {
+                    *reason = "state_job_allocation_failure";
+                }
+                return false;
+            }
+            g_weight_path_bench.payload_bytes += payload_bytes;
+            k_block0 += group_blocks;
+        }
+    }
+    return true;
+}
+
+static bool fpga_weight_path_bench_stats(const std::array<long long, 5> & samples,
+                                         long long *                       min_us,
+                                         long long *                       median_us,
+                                         long long *                       max_us) {
+    if (!min_us || !median_us || !max_us) {
+        return false;
+    }
+    std::array<long long, 5> sorted = samples;
+    for (long long sample : sorted) {
+        if (sample < 0) return false;
+    }
+    std::sort(sorted.begin(), sorted.end());
+    *min_us = sorted.front();
+    *median_us = sorted[sorted.size() / 2U];
+    *max_us = sorted.back();
+    return true;
+}
+
+enum class fpga_weight_path_bench_phase : uint8_t { PACK_CACHED, STORE_UIO, PACK_UIO };
+
+static bool fpga_weight_path_bench_replay_phase(fpga_weight_path_bench_phase phase,
+                                                 bool                         store_timing_only,
+                                                 long long *                  store_elapsed_us) {
+    if (store_timing_only && (phase != fpga_weight_path_bench_phase::STORE_UIO || !store_elapsed_us)) {
+        return false;
+    }
+    if (store_elapsed_us) {
+        *store_elapsed_us = 0;
+    }
+    for (size_t i = 0; i < g_weight_path_bench.jobs.size(); ++i) {
+        const fpga_weight_path_bench_job_t & job = g_weight_path_bench.jobs[i];
+        if (!fpga_weight_path_bench_revalidate_job(job)) {
+            return false;
+        }
+        bool ok = false;
+        if (phase == fpga_weight_path_bench_phase::PACK_CACHED) {
+            ok = fpga_weight_path_bench_pack_cached(job, g_weight_path_bench.cached_payload);
+        } else if (phase == fpga_weight_path_bench_phase::STORE_UIO) {
+            // T_store_uio must not include transform time.  Repack this exact
+            // job into the bounded reusable cache before starting its store
+            // interval; sum those intervals into one full-workload replay.
+            if (!fpga_weight_path_bench_pack_cached(job, g_weight_path_bench.cached_payload)) {
+                return false;
+            }
+            const long long store_start = store_timing_only ? monotonic_now_us() : 0;
+            ok = fpga_weight_path_bench_store_uio(g_weight_path_bench.cached_payload, job.payload_bytes);
+            if (store_timing_only) {
+                const long long store_end = monotonic_now_us();
+                if (store_end < store_start || *store_elapsed_us > LLONG_MAX - (store_end - store_start)) {
+                    return false;
+                }
+                *store_elapsed_us += store_end - store_start;
+            }
+        } else {
+            ok = fpga_weight_path_bench_pack_uio(job);
+        }
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static bool fpga_weight_path_bench_emit_phase(const char * name, fpga_weight_path_bench_phase phase) {
+    if (!fpga_weight_path_bench_replay_phase(phase, false, nullptr)) {
+        return false; // Untimed warm-up.
+    }
+    std::array<long long, 5> samples = {};
+    for (size_t replay = 0; replay < samples.size(); ++replay) {
+        if (phase == fpga_weight_path_bench_phase::STORE_UIO) {
+            if (!fpga_weight_path_bench_replay_phase(phase, true, &samples[replay])) {
+                return false;
+            }
+            continue;
+        }
+        const long long start = monotonic_now_us();
+        if (!fpga_weight_path_bench_replay_phase(phase, false, nullptr)) {
+            return false;
+        }
+        const long long end = monotonic_now_us();
+        if (end < start) return false;
+        samples[replay] = end - start;
+    }
+    long long min_us = 0;
+    long long median_us = 0;
+    long long max_us = 0;
+    if (!fpga_weight_path_bench_stats(samples, &min_us, &median_us, &max_us)) {
+        return false;
+    }
+    const double mib_s = median_us > 0 ? (double) g_weight_path_bench.payload_bytes * 1000000.0 /
+                                             ((double) median_us * 1024.0 * 1024.0) :
+                                         0.0;
+    LOGPROOF("WEIGHT_PATH_BENCH name=%s warmup=1 timed_replays=5 timing_scope=%s median_us=%lld min_us=%lld max_us=%lld "
+             "MiB_s=%.3f bytes=%llu jobs=%zu route=host_only_no_zdma_no_vpu_no_dst",
+             name, phase == fpga_weight_path_bench_phase::STORE_UIO ? "sum_per_job_store_intervals_prepack_excluded" :
+                                                                       "full_replay_elapsed",
+             median_us, min_us, max_us, mib_s, (unsigned long long) g_weight_path_bench.payload_bytes,
+             g_weight_path_bench.jobs.size());
+    return true;
+}
+
+static bool fpga_weight_path_bench_host_self_test(void) {
+    std::array<long long, 5> samples = {{9, 1, 5, 3, 7}};
+    long long min_us = 0;
+    long long median_us = 0;
+    long long max_us = 0;
+    size_t overflow_bytes = 0U;
+    if (!fpga_weight_path_bench_stats(samples, &min_us, &median_us, &max_us) || min_us != 1 || median_us != 5 ||
+        max_us != 9 || fpga_weight_layout_payload_bytes(3, VPU_BLOCK_BEATS, nullptr) ||
+        fpga_weight_layout_payload_bytes(INT_MAX, INT_MAX, &overflow_bytes)) {
+        return false;
+    }
+    std::array<block_q8_0_t, 6> blocks = {};
+    for (size_t block = 0; block < blocks.size(); ++block) {
+        for (int lane = 0; lane < VPU_QK8_0; ++lane) blocks[block].qs[lane] = (int8_t) (block * 17U + (size_t) lane);
+    }
+    struct ggml_tensor tensor = {};
+    tensor.type = GGML_TYPE_Q8_0;
+    tensor.ne[0] = 64;
+    tensor.ne[1] = 3;
+    tensor.ne[2] = 1;
+    tensor.ne[3] = 1;
+    tensor.nb[0] = sizeof(block_q8_0_t);
+    tensor.nb[1] = 2 * sizeof(block_q8_0_t);
+    tensor.nb[2] = 3 * tensor.nb[1];
+    tensor.nb[3] = tensor.nb[2];
+    tensor.data = blocks.data();
+    size_t payload_bytes = 0U;
+    if (!fpga_weight_layout_payload_bytes(3, 2 * VPU_BLOCK_BEATS, &payload_bytes)) return false;
+    fpga_weight_path_bench_job_t job = {&tensor, blocks.data(), 64, 3, tensor.nb[0], tensor.nb[1],
+                                        3 * 2 * sizeof(block_q8_0_t), 0, 3, 0, 2, 2 * VPU_BLOCK_BEATS, payload_bytes};
+    std::vector<uint32_t> cached(payload_bytes / sizeof(uint32_t));
+    std::vector<uint32_t> direct(payload_bytes / sizeof(uint32_t));
+    size_t direct_words = 0U;
+    const bool direct_ok = fpga_pack_direct_weight_pair_range((volatile uint32_t *) direct.data(), &tensor, blocks.data(),
+                                                               0, 0, 3, 2, 2 * VPU_BLOCK_BEATS, 0, 2, &direct_words);
+    fpga_weight_path_bench_trace_t trace = {};
+    trace.enabled                         = true;
+    trace.graph_seq                       = 7;
+    trace.payload_bytes                   = 64U;
+    trace.jobs.push_back(job);
+    trace.cached_payload.assign(4U, 0U);
+    // An exact one-token boundary retains the trace so captures from the same
+    // graph continue to aggregate.  A later graph must discard only host
+    // trace state before it binds the new sequence.
+    const char * lifecycle_reason = nullptr;
+    const bool same_sequence_aggregates = fpga_weight_path_bench_prepare_capture(&trace, 7, &lifecycle_reason, false) &&
+                                          trace.jobs.size() == 1U && trace.payload_bytes == 64U;
+    const bool stale_sequence_resets = fpga_weight_path_bench_reset_required(trace, 8, 1) &&
+                                       fpga_weight_path_bench_prepare_capture(&trace, 8, &lifecycle_reason, false);
+    return fpga_weight_path_bench_pack_cached(job, cached) && direct_ok && direct_words == direct.size() &&
+           memcmp(cached.data(), direct.data(), payload_bytes) == 0 && same_sequence_aggregates &&
+           stale_sequence_resets && trace.graph_seq == 8 && trace.jobs.empty() && trace.payload_bytes == 0U &&
+           trace.cached_payload.empty();
+}
+
+static bool fpga_weight_path_bench_replay_at_boundary(int previous_graph_seq, int n_tokens) {
+    if (!g_weight_path_bench.enabled || g_weight_path_bench.replayed || n_tokens != 1 ||
+        g_weight_path_bench.graph_seq != previous_graph_seq) {
+        return true;
+    }
+    if (g_weight_path_bench.jobs.empty()) {
+        return false;
+    }
+    try {
+        size_t max_payload_bytes = 0U;
+        for (const fpga_weight_path_bench_job_t & job : g_weight_path_bench.jobs) {
+            max_payload_bytes = std::max(max_payload_bytes, job.payload_bytes);
+        }
+        if (max_payload_bytes == 0U || (max_payload_bytes & 0xFU) != 0U ||
+            max_payload_bytes > WEIGHT_END - WEIGHT_BASE) {
+            return false;
+        }
+        // One tile-sized cache avoids retaining every replay payload (which
+        // would scale with the complete model and can exhaust host RAM).
+        g_weight_path_bench.cached_payload.assign(max_payload_bytes / sizeof(uint32_t), 0U);
+        LOGPROOF("WEIGHT_PATH_BENCH_REPLAY_BUFFER bytes=%zu scope=max_single_captured_tile aggregate_payload_bytes=%llu "
+                 "jobs=%zu allocation=bounded_reusable",
+                 max_payload_bytes, (unsigned long long) g_weight_path_bench.payload_bytes,
+                 g_weight_path_bench.jobs.size());
+    } catch (...) {
+        return false;
+    }
+    const bool ok = fpga_weight_path_bench_emit_phase("T_pack_cached", fpga_weight_path_bench_phase::PACK_CACHED) &&
+                    fpga_weight_path_bench_emit_phase("T_store_uio", fpga_weight_path_bench_phase::STORE_UIO) &&
+                    fpga_weight_path_bench_emit_phase("T_pack_uio", fpga_weight_path_bench_phase::PACK_UIO);
+    g_weight_path_bench.cached_payload.clear();
+    g_weight_path_bench.jobs.clear();
+    g_weight_path_bench.payload_bytes = 0U;
+    g_weight_path_bench.replayed      = true;
+    return ok;
 }
 
 static bool weight_cache_entry_matches(const fpga_weight_cache_entry_t & entry, const struct ggml_tensor * src0) {
@@ -8553,11 +9274,31 @@ static void fpga_accumulate_q8_tile_job(const fpga_tile_job_t &    job,
 
 static bool fpga_accumulate_pl_scaled_q8_tile_job(fpga_tile_job_t & job,
                                                   std::vector<float> &    accum,
-                                                  fpga_stage_totals_t *   totals) {
+                                                  fpga_stage_totals_t *   totals,
+                                                  bool                     p6_q16_verified) {
     const long long result0   = now_us();
     const long long event_host_read_accum0 = p2_event_now_us();
     float *         accum_col = &accum[(size_t) (job.col * job.rows)];
+    const bool      p6_trace_job = g_p6_accum_trace.enabled;
+    int             p6_chunk_ordinal = -1;
+    bool            p6_final_chunk = false;
+    if (p6_trace_job) {
+        if (!p6_q16_verified || !fpga_p6_accept_chunk(job, &p6_chunk_ordinal, &p6_final_chunk)) {
+            LOGE(
+                "P6_ARM_GOLDEN_CAPTURE_REJECT tensor=%s layer=%d graph=%d job=%u tile=%u bank=%d col=%lld "
+                "q16_verified=%d chunks_seen=%d expected_k_chunks=%d records=%zu record_limit=%zu "
+                "reason=selector_or_contiguous_k_contract",
+                job.tensor_name ? job.tensor_name : "?", job.layer_id, job.graph_seq, job.job_id, job.tile_id, job.bank,
+                (long long) job.col, p6_q16_verified ? 1 : 0, g_p6_accum_trace.chunks_seen,
+                g_p6_accum_trace.expected_k_chunks, g_p6_accum_trace.records_emitted,
+                g_p6_accum_trace.record_limit);
+            return false;
+        }
+    }
     for (int row = 0; row < job.rows; ++row) {
+        const int64_t global_row = job.row0 + (int64_t) row;
+        const bool p6_emit_row = p6_trace_job && global_row >= g_p6_accum_trace.row_first &&
+                                 global_row < g_p6_accum_trace.row_first + (int64_t) g_p6_accum_trace.row_count;
         uint16_t      row_id = 0xffffU;
         const int64_t q16    = ddr_read_spu_q16_row(SPU_OUT_BASE + (uint32_t) row * 16U, &row_id);
         if (row_id != (uint16_t) row) {
@@ -8565,7 +9306,43 @@ static bool fpga_accumulate_pl_scaled_q8_tile_job(fpga_tile_job_t & job,
                  job.bank, row, (unsigned) row_id, (long long) q16);
             return false;
         }
+        uint32_t before_bits = 0U;
+        if (p6_emit_row) {
+            memcpy(&before_bits, &accum_col[(size_t) row], sizeof(before_bits));
+        }
         accum_col[(size_t) row] += (float) q16 * (1.0f / 65536.0f);
+        uint32_t after_bits = 0U;
+        if (p6_emit_row) {
+            memcpy(&after_bits, &accum_col[(size_t) row], sizeof(after_bits));
+            LOGI(
+                "P6_ARM_GOLDEN_CAPTURE tensor=%s layer=%d graph=%d job=%u tile=%u bank=%d col=%lld tile_row0=%lld "
+                "tile_row=%d global_row=%lld q16=%lld k_chunk_ordinal=%d k_chunk_order=%d k_block0=%lld "
+                "group_blocks=%d before_bits=0x%08x after_bits=0x%08x final_chunk=%d",
+                job.tensor_name ? job.tensor_name : "?", job.layer_id, job.graph_seq, job.job_id, job.tile_id, job.bank,
+                (long long) job.col, (long long) job.row0, row, (long long) global_row, (long long) q16,
+                p6_chunk_ordinal, p6_chunk_ordinal + 1, (long long) job.k_block0, job.group_blocks, before_bits,
+                after_bits, p6_final_chunk ? 1 : 0);
+            g_p6_accum_trace.records_emitted++;
+        }
+    }
+    if (p6_trace_job && p6_final_chunk) {
+        const size_t expected_records =
+            (size_t) g_p6_accum_trace.row_count * (size_t) g_p6_accum_trace.expected_k_chunks;
+        if (g_p6_accum_trace.chunks_seen != g_p6_accum_trace.expected_k_chunks ||
+            g_p6_accum_trace.records_emitted != expected_records) {
+            LOGE(
+                "P6_ARM_GOLDEN_CAPTURE_REJECT reason=missing_final_or_record_count chunks_seen=%d expected_k_chunks=%d "
+                "records=%zu expected_records=%zu",
+                g_p6_accum_trace.chunks_seen, g_p6_accum_trace.expected_k_chunks,
+                g_p6_accum_trace.records_emitted, expected_records);
+            return false;
+        }
+        g_p6_accum_trace.capture_complete = true;
+        LOGI(
+            "P6_ARM_GOLDEN_CAPTURE_COMPLETE tensor=%s layer=%d graph=%d chunks=%d records=%zu route=cpu_shadow "
+            "pl_accum_bits=unavailable pl_bit_match=unavailable status=ARM_GOLDEN_ONLY",
+            job.tensor_name ? job.tensor_name : "?", job.layer_id, job.graph_seq, g_p6_accum_trace.chunks_seen,
+            g_p6_accum_trace.records_emitted);
     }
     const long long result1 = now_us();
     const long long event_host_read_accum_done = p2_event_now_us();
@@ -9242,7 +10019,7 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                     if (!fpga_wait_and_drain_q8_tile_job(*running, totals, tensor_name, layer_id, k, n, m, 0)) {
                         return false;
                     }
-                    if (!fpga_accumulate_pl_scaled_q8_tile_job(*running, accum, totals)) {
+                    if (!fpga_accumulate_pl_scaled_q8_tile_job(*running, accum, totals, false)) {
                         return false;
                     }
                     if (totals && running->event_launch_us > 0 && running->event_spu_finality_us > 0 &&
@@ -9301,7 +10078,7 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
             if (!fpga_wait_and_drain_q8_tile_job(*running, totals, tensor_name, layer_id, k, n, m, 0)) {
                 return false;
             }
-            if (!fpga_accumulate_pl_scaled_q8_tile_job(*running, accum, totals)) {
+            if (!fpga_accumulate_pl_scaled_q8_tile_job(*running, accum, totals, false)) {
                 return false;
             }
         }
@@ -9358,6 +10135,12 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pl_scale_single_bank(const struct ggml
 
     for (int64_t row0 = 0; row0 < n; row0 += g_vpu_max_rows) {
         const int rows = (int) std::min<int64_t>(g_vpu_max_rows, n - row0);
+        // The P6 matrix remains CPU-shadowed.  It therefore may omit
+        // nonselected row tiles entirely instead of staging them just to
+        // reach the requested tile selector.
+        if (g_p6_accum_trace.enabled && row0 != g_p6_accum_trace.tile_row0) {
+            continue;
+        }
         accum.assign((size_t) m * (size_t) rows, 0.0f);
         for (int64_t ib0 = 0; ib0 < nb;) {
             const int group_blocks = packed_q8_group_blocks_for_rows(rows, (int) (nb - ib0));
@@ -9386,11 +10169,19 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pl_scale_single_bank(const struct ggml
                 if (pl_scale_contract_active) {
                     ++g_p2_tile_q16_checks;
                 }
-                if (!fpga_accumulate_pl_scaled_q8_tile_job(job, accum, totals)) {
+                if (!fpga_accumulate_pl_scaled_q8_tile_job(job, accum, totals, pl_scale_contract_active)) {
                     return false;
                 }
                 if (pl_scale_contract_active &&
                     fpga_p2_cumulative_tile_limit_reached(g_p2_tile_q16_checks, g_p2_tile_limit)) {
+                    if (g_p6_accum_trace.enabled && !g_p6_accum_trace.capture_complete) {
+                        LOGE(
+                            "P6_ARM_GOLDEN_CAPTURE_REJECT reason=terminal_p2_boundary_without_complete_capture "
+                            "chunks_seen=%d expected_k_chunks=%d records=%zu",
+                            g_p6_accum_trace.chunks_seen, g_p6_accum_trace.expected_k_chunks,
+                            g_p6_accum_trace.records_emitted);
+                        return false;
+                    }
                     if (!fpga_p2_complete_tile_contract_boundary(job, tensor_name, layer_id)) {
                         return false;
                     }
@@ -9416,6 +10207,14 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pl_scale_single_bank(const struct ggml
         if (totals) {
             totals->host_accum_us += now_us() - store0;
         }
+    }
+    if (g_p6_accum_trace.enabled && !g_p6_accum_trace.capture_complete) {
+        LOGE(
+            "P6_ARM_GOLDEN_CAPTURE_REJECT reason=missing_selected_tile_or_final_chunk tensor=%s layer=%d "
+            "tile_row0=%lld chunks_seen=%d expected_k_chunks=%d records=%zu",
+            tensor_name ? tensor_name : "?", layer_id, (long long) g_p6_accum_trace.tile_row0,
+            g_p6_accum_trace.chunks_seen, g_p6_accum_trace.expected_k_chunks, g_p6_accum_trace.records_emitted);
+        return false;
     }
     if (pl_scale_contract_active) {
         if (g_p2_tile_contract_boundary_reached ||
@@ -9637,6 +10436,7 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip(const struct ggml_tensor * src0,
 
 int fpga_init(void) {
     pthread_mutex_lock(&g_mutex);
+    const bool weight_path_bench_requested = env_flag_enabled("FPGA_WEIGHT_PATH_BENCH");
     const bool dma_mapped = dma_is_mapped();
     const bool vpu_mapped = vpu_is_mapped();
     const bool ddr_mapped = ddr_is_mapped();
@@ -9649,6 +10449,16 @@ int fpga_init(void) {
     // or change ZDMA ownership.  The marker intentionally uses only retained
     // host state, so re-entry itself performs no board access.
     if (g_fpga_init_complete) {
+        if (g_weight_path_bench.passive_mapping) {
+            if (!weight_path_bench_requested || dma_mapped || !vpu_mapped || !ddr_mapped) {
+                fpga_fatal("WEIGHT_PATH_BENCH_REENTRY_FAIL requested=%d dma_mapped=%d vpu_mapped=%d ddr_mapped=%d "
+                           "action=fail_closed_no_mapping_or_mmio_change",
+                           weight_path_bench_requested ? 1 : 0, dma_mapped ? 1 : 0, vpu_mapped ? 1 : 0,
+                           ddr_mapped ? 1 : 0);
+            }
+            pthread_mutex_unlock(&g_mutex);
+            return 0;
+        }
         if (!all_mapped) {
             fpga_fatal(
                 "FPGA_INIT_REENTRY_PARTIAL_FAIL init_complete=1 dma_mapped=%d vpu_mapped=%d ddr_mapped=%d "
@@ -9670,6 +10480,33 @@ int fpga_init(void) {
             "FPGA_INIT_REENTRY_PARTIAL_FAIL init_complete=0 dma_mapped=%d vpu_mapped=%d ddr_mapped=%d "
             "action=fail_closed_no_config_mmio_dma_map_change",
             dma_mapped ? 1 : 0, vpu_mapped ? 1 : 0, ddr_mapped ? 1 : 0);
+    }
+    if (weight_path_bench_requested) {
+        if (!fpga_weight_path_bench_environment_allowed() || !fpga_p2_scale_layout_self_test() ||
+            !fpga_weight_path_bench_host_self_test() || !map_weight_path_bench_vpu_ddr() ||
+            !fpga_weight_path_bench_read_capabilities()) {
+            pthread_mutex_unlock(&g_mutex);
+            fpga_fatal("FPGA_WEIGHT_PATH_BENCH passive initialization failed before any ZDMA configuration, DMA, or VPU start");
+        }
+        g_weight_path_bench.enabled         = true;
+        g_weight_path_bench.passive_mapping = true;
+        g_weight_path_bench.replayed        = false;
+        g_weight_path_bench.graph_seq       = INT_MIN;
+        g_weight_path_bench.payload_bytes   = 0U;
+        g_weight_path_bench.jobs.clear();
+        g_weight_path_bench.cached_payload.clear();
+        g_cleanup_done       = false;
+        g_fpga_init_complete = true;
+        g_fpga_start_us      = now_us();
+        LOGINIT(
+            "WEIGHT_PATH_BENCH_HOST_SELFTEST pass geometry_overflow=1 statistics_median=1 "
+            "cached_direct_bytes=identical "
+            "stale_sequence_reset=1 same_sequence_aggregation=1");
+        LOGINIT("WEIGHT_PATH_BENCH_MODE enabled=1 route=capture_m1_tiler_then_native_cpu replay_boundary=fpga_advance_sequence_position(1) "
+                "timing=one_warmup_plus_five_full_replays metrics=median_min_max_mib_s_bytes_jobs "
+                "zdma=not_mapped dma_init=not_run register_writes=none dst_access=none");
+        pthread_mutex_unlock(&g_mutex);
+        return 0;
     }
     g_init_verbose = env_flag_enabled("FPGA_INIT_VERBOSE");
     // This checks the host-only P2 PARAM packing contract before any UIO,
@@ -9723,6 +10560,7 @@ int fpga_init(void) {
     g_p2_tile_q16_checks                = 0;
     g_p2_matrix_contract_checks         = 0;
     g_p2_tile_trace_enabled             = false;
+    g_p6_accum_trace                    = {};
     g_p2_terminal_trace_enabled         = env_flag_enabled("FPGA_P2_TERMINAL_TRACE");
     g_p2_boundary_diagnostics_enabled   = false;
     g_p2_event_trace_enabled             = env_flag_enabled("FPGA_P2_EVENT_TRACE");
@@ -10045,6 +10883,69 @@ int fpga_init(void) {
         LOGINIT(
             "v49 forensic policy: FPGA_CONTRACT_RAW_PROPAGATION_DIAGNOSTIC=1; accepted raw-F32 FPGA results will "
             "propagate into CPU attention/KV. This mode diagnoses end-to-end sensitivity and is not a C0/C1 pass.");
+    }
+    if (env_flag_enabled("FPGA_P6_ACCUM_TRACE")) {
+        const char * const tensor = getenv("FPGA_P6_TENSOR");
+        int64_t layer = -1;
+        int64_t tile_row0 = -1;
+        int64_t row_first = -1;
+        int64_t row_count = -1;
+        int64_t expected_chunks = -1;
+        int64_t record_limit = -1;
+        if (!tensor || tensor[0] == '\0' || !fpga_p6_parse_required_i64("FPGA_P6_LAYER", 0, &layer) ||
+            !fpga_p6_parse_required_i64("FPGA_P6_TILE_ROW0", 0, &tile_row0) ||
+            !fpga_p6_parse_required_i64("FPGA_P6_ROW_FIRST", 0, &row_first) ||
+            !fpga_p6_parse_required_i64("FPGA_P6_ROW_COUNT", 1, &row_count) ||
+            !fpga_p6_parse_required_i64("FPGA_P6_EXPECTED_K_CHUNKS", 2, &expected_chunks) ||
+            !fpga_p6_parse_required_i64("FPGA_P6_RECORD_LIMIT", 1, &record_limit) ||
+            layer > INT_MAX || tile_row0 > INT64_MAX - row_count || row_first > INT64_MAX - row_count ||
+            row_count > INT_MAX || expected_chunks > INT_MAX) {
+            fpga_fatal("FPGA_P6_ACCUM_TRACE requires valid explicit selectors: FPGA_P6_TENSOR, FPGA_P6_LAYER, "
+                       "FPGA_P6_TILE_ROW0, FPGA_P6_ROW_FIRST, FPGA_P6_ROW_COUNT, FPGA_P6_EXPECTED_K_CHUNKS>=2, "
+                       "and FPGA_P6_RECORD_LIMIT");
+        }
+        // Reject before any P6 log line or board mapping.  The quotient form
+        // proves the product is both representable and within the documented
+        // finite diagnostic budget without relying on SIZE_MAX as a policy.
+        if ((uint64_t) record_limit > (uint64_t) FPGA_P6_RECORD_LIMIT_HARD_MAX ||
+            (uint64_t) row_count > (uint64_t) FPGA_P6_RECORD_LIMIT_HARD_MAX / (uint64_t) expected_chunks) {
+            fpga_fatal(
+                "P6_ARM_GOLDEN_CAPTURE_REJECT reason=record_budget_exceeds_hard_max record_limit=%lld row_count=%lld "
+                "expected_k_chunks=%lld hard_max=%zu action=abort_before_mapping",
+                (long long) record_limit, (long long) row_count, (long long) expected_chunks,
+                FPGA_P6_RECORD_LIMIT_HARD_MAX);
+        }
+        const size_t required_records = (size_t) row_count * (size_t) expected_chunks;
+        if ((size_t) record_limit < required_records ||
+            g_pl_scale_contract_check_limit != 1 || !g_p2_allow_multitile ||
+            g_p2_tile_limit != (int) expected_chunks || g_p3_split_scale_requested ||
+            env_flag_enabled("FPGA_PIPELINE_ENABLE") || g_p2_input_preload_enabled ||
+            env_flag_enabled("FPGA_CONTRACT_RAW_PROPAGATION_DIAGNOSTIC") || g_contract_raw_repair_enabled ||
+            getenv("FPGA_CONTRACT_CANONICAL_DST") != nullptr || env_flag_enabled("FPGA_SOURCE_AUDIT_ONLY") ||
+            env_flag_enabled("FPGA_WEIGHT_PATH_BENCH") ||
+            !g_contract_cpu_shadow_dst) {
+            fpga_fatal(
+                "FPGA_P6_ACCUM_TRACE rejects this mode: requires FPGA_PL_SCALE_CONTRACT_CHECK=1, "
+                "FPGA_P2_ALLOW_MULTITILE=1, FPGA_P2_TILE_LIMIT==FPGA_P6_EXPECTED_K_CHUNKS, P2 single-bank, "
+                "CPU shadow, no P3/pipeline/preload/raw propagation/raw repair/canonical override/source audit/weight "
+                "benchmark, RECORD_LIMIT <= P6 hard maximum, and RECORD_LIMIT >= ROW_COUNT*EXPECTED_K_CHUNKS");
+        }
+        g_p6_accum_trace.enabled           = true;
+        g_p6_accum_trace.tensor            = tensor;
+        g_p6_accum_trace.layer             = (int) layer;
+        g_p6_accum_trace.tile_row0         = tile_row0;
+        g_p6_accum_trace.row_first         = row_first;
+        g_p6_accum_trace.row_count         = (int) row_count;
+        g_p6_accum_trace.expected_k_chunks = (int) expected_chunks;
+        g_p6_accum_trace.record_limit      = (size_t) record_limit;
+        LOGINIT(
+            "P6_ARM_GOLDEN_CONFIG tensor=%s layer=%d tile_row0=%lld row_first=%lld row_count=%d expected_k_chunks=%d "
+            "record_limit=%zu required_records=%zu hard_max=%zu route=p2_single_bank_cpu_shadow pl_bits=unavailable "
+            "bit_match=unavailable",
+            g_p6_accum_trace.tensor.c_str(), g_p6_accum_trace.layer, (long long) g_p6_accum_trace.tile_row0,
+            (long long) g_p6_accum_trace.row_first, g_p6_accum_trace.row_count,
+            g_p6_accum_trace.expected_k_chunks, g_p6_accum_trace.record_limit, required_records,
+            FPGA_P6_RECORD_LIMIT_HARD_MAX);
     }
     g_dma_trace_enabled =
         env_flag_enabled("FPGA_DMA_AUDIT") || g_contract_check_limit > 0 || g_pl_scale_contract_check_limit > 0;
@@ -10473,6 +11374,15 @@ int fpga_init(void) {
     if (g_pl_scale_contract_check_limit > 0 && !fpga_p2_cumulative_tile_limit_host_self_test()) {
         fpga_fatal("P3 cumulative tile-limit host self-test failed; refusing qualification traffic");
     }
+    if (g_p6_accum_trace.enabled && !fpga_p6_accum_trace_host_self_test()) {
+        fpga_fatal("P6 ARM golden trace host self-test failed; refusing qualification traffic");
+    }
+    if (g_p6_accum_trace.enabled) {
+        LOGINIT(
+            "P6_ARM_GOLDEN_HOST_SELFTEST pass selectors=1 m2_defer=1 m1_eligible=1 "
+            "cleanup_incomplete_rejected=1 cleanup_complete_accepted=1 cap=1 plus_zero_bits=1 minus_zero_bits=1 "
+            "four_contiguous_chunks=1 duplicate_gap_premature_missing_final_extra_rejected=1");
+    }
     if (g_p2_init_requested) {
         // P2 initialization is deliberately passive after UIO, ZDMA, and
         // identity admission.  The first bounded P2 tile supplies its exact
@@ -10524,10 +11434,12 @@ void fpga_cleanup(void) {
         return;
     }
     g_cleanup_done = true;
+    const bool fpga_initialized_before_cleanup = g_fpga_init_complete;
     LOGPROOF(
         "cleanup begin lifecycle=explicit-before-backend-free ddr_mapped=%d vpu_mapped=%d dma_mapped=%d "
-        "weight_cache_entries=%zu",
-        ddr_is_mapped() ? 1 : 0, vpu_is_mapped() ? 1 : 0, dma_is_mapped() ? 1 : 0, g_weight_cache.size());
+        "weight_cache_entries=%zu weight_path_bench_passive=%d",
+        ddr_is_mapped() ? 1 : 0, vpu_is_mapped() ? 1 : 0, dma_is_mapped() ? 1 : 0, g_weight_cache.size(),
+        g_weight_path_bench.passive_mapping ? 1 : 0);
     if (g_p1_sched_summary_enabled) {
         fpga_p1_sched_summary_emit("cleanup");
     }
@@ -10571,6 +11483,16 @@ void fpga_cleanup(void) {
             "left owned by the process and no unmap was issued");
     }
 
+    // Trace records contain only in-process references.  Release them before
+    // unmapping DDR/VPU so passive diagnostic cleanup has the same single,
+    // idempotent mapping owner as normal initialization.
+    g_weight_path_bench.jobs.clear();
+    g_weight_path_bench.cached_payload.clear();
+    g_weight_path_bench.payload_bytes   = 0U;
+    g_weight_path_bench.graph_seq       = INT_MIN;
+    g_weight_path_bench.enabled         = false;
+    g_weight_path_bench.passive_mapping = false;
+
     if (ddr_is_mapped()) {
         for (fpga_weight_cache_entry_t & entry : g_weight_cache) {
             if (entry.valid && ddr_range_fits(entry.header_off, sizeof(fpga_weight_cache_header_t))) {
@@ -10610,6 +11532,28 @@ void fpga_cleanup(void) {
     }
     g_committed_stream_mode = -1;
     g_fpga_init_complete = false;
+
+    // P6 has no safe early failure path here: ZDMA quiescence, the optional
+    // P3 mode recovery, helper join, and every mapping/fd release above must
+    // complete first.  Only then turn incomplete golden evidence into the
+    // requested fail-closed result.  `selected_m1_matmul_seen` distinguishes
+    // a run that never reached decode from one that started but did not finish.
+    if (fpga_p6_cleanup_requires_failure(fpga_initialized_before_cleanup, g_p6_accum_trace)) {
+        const bool selected_m1_matmul_seen = g_p6_accum_trace.selected_m1_matmul_seen;
+        const char * const reason = selected_m1_matmul_seen ?
+                                       "selected_m1_capture_incomplete" :
+                                       "selected_m1_not_seen";
+        const int chunks_seen = g_p6_accum_trace.chunks_seen;
+        const int expected_chunks = g_p6_accum_trace.expected_k_chunks;
+        const size_t records_emitted = g_p6_accum_trace.records_emitted;
+        const size_t record_limit = g_p6_accum_trace.record_limit;
+        pthread_mutex_unlock(&g_mutex);
+        fpga_fatal(
+            "P6_ARM_GOLDEN_CAPTURE_REJECT reason=%s selected_m1_seen=%d capture_complete=0 chunks_seen=%d "
+            "expected_k_chunks=%d records=%zu record_limit=%zu action=abort_after_safe_teardown",
+            reason, selected_m1_matmul_seen ? 1 : 0, chunks_seen, expected_chunks, records_emitted,
+            record_limit);
+    }
 
     const long long elapsed_us         = g_fpga_start_us > 0 ? now_us() - g_fpga_start_us : 0;
     const long long hook_calls         = g_matmul_hook_calls.load(std::memory_order_relaxed);
@@ -10764,7 +11708,25 @@ extern "C" void fpga_advance_sequence_position(int n_tokens) {
     if (n_tokens < 0 || g_current_seq_pos > INT_MAX - n_tokens) {
         fpga_fatal("invalid FPGA sequence advance current=%d delta=%d", g_current_seq_pos, n_tokens);
     }
+
     const int previous_graph_seq = g_current_seq_pos;
+    if (g_weight_path_bench.enabled) {
+        pthread_mutex_lock(&g_mutex);
+        bool benchmark_ok = true;
+        if (fpga_weight_path_bench_reset_required(g_weight_path_bench, previous_graph_seq, n_tokens)) {
+            fpga_weight_path_bench_reset_unreplayed_trace(&g_weight_path_bench, previous_graph_seq + n_tokens,
+                                                          "sequence_advanced_before_single_token_boundary", true);
+        } else if (!g_weight_path_bench.replayed && n_tokens == 1 &&
+                   g_weight_path_bench.graph_seq == previous_graph_seq) {
+            benchmark_ok = fpga_weight_path_bench_replay_at_boundary(previous_graph_seq, n_tokens);
+        }
+        pthread_mutex_unlock(&g_mutex);
+        if (!benchmark_ok) {
+            fpga_fatal("WEIGHT_PATH_BENCH_REPLAY_FAIL graph_seq=%d action=abort_after_bounded_ddr_weight_staging "
+                       "zdma=not_mapped vpu_start=not_run dst_access=none",
+                       previous_graph_seq);
+        }
+    }
     if (g_token_timing_collection_enabled && g_token_timing.active && g_token_timing.graph_seq == previous_graph_seq) {
         fpga_token_timing_emit(previous_graph_seq + n_tokens, n_tokens, "sequence_advance", monotonic_now_us());
     }
@@ -10830,12 +11792,56 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
     const int64_t probe_k            = src0 ? src0->ne[0] : 0;
     const int64_t probe_n            = src0 ? src0->ne[1] : 0;
     const int64_t probe_m            = src1 ? src1->ne[1] : 0;
+    // Resolve the P6 selector before any native-CPU route.  The selected
+    // warm-up M>1 call is deferred; the selected decode M=1 call must fail
+    // closed rather than being hidden by an audit, attention, vocabulary,
+    // legacy, or validation bypass.
+    const bool p6_selected_name_layer = g_p6_accum_trace.enabled && tensor_name &&
+                                        g_p6_accum_trace.tensor == tensor_name &&
+                                        g_p6_accum_trace.layer == effective_layer_id;
+    const bool p6_selected_m1 = fpga_p6_selected_m1_eligible(p6_selected_name_layer, probe_m);
+    if (p6_selected_name_layer && !p6_selected_m1) {
+        // Gemma's empty/warm-up graph legitimately evaluates the selected
+        // tensor with M>1.  That is not the requested decode measurement, so
+        // leave it entirely to native GGML before validation, counters,
+        // staging, DMA/VPU submission, or destination ownership can change.
+        pthread_mutex_lock(&g_mutex);
+        if (!g_p6_accum_trace.selected_non_m1_defer_logged) {
+            LOGPROOF(
+                "P6_ARM_GOLDEN_DEFER tensor=%s layer=%d M=%lld reason=selector_qualifies_decode_M1_only "
+                "action=native_cpu_before_validation_accounting_staging_hardware_dst",
+                tensor_name, effective_layer_id, (long long) probe_m);
+            g_p6_accum_trace.selected_non_m1_defer_logged = true;
+        }
+        pthread_mutex_unlock(&g_mutex);
+        return FPGA_MATMUL_NOT_HANDLED;
+    }
+    if (p6_selected_m1) {
+        // This state is intentionally set before the M=1 fail-closed checks
+        // below.  If any such check rejects, cleanup can distinguish it from
+        // a graph that never reached the requested decode call at all.
+        pthread_mutex_lock(&g_mutex);
+        g_p6_accum_trace.selected_m1_matmul_seen = true;
+        pthread_mutex_unlock(&g_mutex);
+    }
+    if (p6_selected_m1 && is_attention) {
+        fpga_fatal(
+            "P6_ARM_GOLDEN_CAPTURE_REJECT tensor=%s layer=%d M=%lld reason=selected_target_is_attention "
+            "action=abort_no_hardware",
+            tensor_name, effective_layer_id, (long long) probe_m);
+    }
 
     // This path deliberately runs before every board-facing policy branch.
     // It must validate the same Q8 tensors the normal graph would consume,
     // including the vocabulary projection, while leaving all work to CPU.
     const bool source_audit_only = fpga_source_audit_only_requested() != 0;
     if (source_audit_only) {
+        if (p6_selected_m1) {
+            fpga_fatal(
+                "P6_ARM_GOLDEN_CAPTURE_REJECT tensor=%s layer=%d M=%lld reason=source_audit_cpu_route "
+                "action=abort_no_hardware",
+                tensor_name, effective_layer_id, (long long) probe_m);
+        }
         if (env_int_value("FPGA_CONTRACT_CHECK", 0, 0, 1000000) > 0 ||
             env_int_value("FPGA_PL_SCALE_CONTRACT_CHECK", 0, 0, 1000000) > 0) {
             fpga_fatal(
@@ -10891,11 +11897,70 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
     // workers return success below without launching their own VPU job.
     const bool q8_f32_f32_candidate = src0 && src1 && dst && src0->type == GGML_TYPE_Q8_0 &&
                                       src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+    if (g_p6_accum_trace.enabled) {
+        if (p6_selected_m1 && !q8_f32_f32_candidate) {
+            fpga_fatal(
+                "P6_ARM_GOLDEN_CAPTURE_REJECT tensor=%s layer=%d M=%lld reason=selected_target_requires_Q8_0_F32_F32 "
+                "action=abort_no_hardware",
+                tensor_name, effective_layer_id, (long long) probe_m);
+        }
+        // P6 has one explicit hardware target.  Every other Q8 candidate is
+        // intentionally returned to native GGML before validation, staging,
+        // fallback accounting, or FPGA-completion accounting.
+        if (!p6_selected_m1) {
+            return FPGA_MATMUL_NOT_HANDLED;
+        }
+        // Other GGML workers can encounter the already-completed selected
+        // matrix.  Preserve its CPU-shadow ownership explicitly; do not let
+        // it re-enter a policy branch that could be mistaken for a fallback.
+        if (g_p6_accum_trace.capture_complete) {
+            return FPGA_MATMUL_CONTRACT_CPU_SHADOW;
+        }
+    }
     if (ith == 0) {
         g_matmul_hook_calls.fetch_add(1, std::memory_order_relaxed);
         if (q8_f32_f32_candidate) {
             g_q8_candidate_calls.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+
+    // This explicit diagnostic route is not an FPGA-unavailability fallback:
+    // it captures the same geometry the admitted normal tiler would use, then
+    // deliberately leaves dst to native GGML.  It has no prepare/submit/DMA/
+    // VPU operation and never observes or writes destination storage.
+    if (g_weight_path_bench.enabled) {
+        if (p6_selected_m1) {
+            fpga_fatal(
+                "P6_ARM_GOLDEN_CAPTURE_REJECT tensor=%s layer=%d M=%lld reason=weight_path_benchmark_cpu_route "
+                "action=abort_no_hardware",
+                tensor_name, effective_layer_id, (long long) probe_m);
+        }
+        if (ith != 0 || g_weight_path_bench.replayed) {
+            return FPGA_MATMUL_NOT_HANDLED;
+        }
+        if (q8_f32_f32_candidate && probe_m == 1 &&
+            !should_bypass_vocab_projection_to_cpu(tensor_name, probe_k, probe_n, probe_m)) {
+            const char * bench_reason = nullptr;
+            if (fpga_validate_tensors(src0, src1, dst, true, &bench_reason)) {
+                pthread_mutex_lock(&g_mutex);
+                const char * capture_reason = nullptr;
+                const bool captured = fpga_weight_path_bench_capture(src0, seq_pos, &capture_reason);
+                const size_t jobs = g_weight_path_bench.jobs.size();
+                const uint64_t bytes = g_weight_path_bench.payload_bytes;
+                pthread_mutex_unlock(&g_mutex);
+                if (!captured) {
+                    fpga_fatal(
+                        "WEIGHT_PATH_BENCH_CAPTURE_FAIL reason=%s tensor=%s layer=%d seq=%d jobs=%zu bytes=%llu "
+                        "action=abort_no_ddr_write_no_zdma_no_vpu_start",
+                        capture_reason ? capture_reason : "state_unknown", tensor_name, effective_layer_id, seq_pos,
+                        jobs, (unsigned long long) bytes);
+                }
+            } else {
+                LOGI("WEIGHT_PATH_BENCH_SKIP tensor=%s layer=%d seq=%d reason=%s route=native_cpu",
+                     tensor_name, effective_layer_id, seq_pos, bench_reason ? bench_reason : "unsupported_tensor");
+            }
+        }
+        return FPGA_MATMUL_NOT_HANDLED;
     }
 
     // A qualification limit must stop all board launches once it is reached.
@@ -10915,6 +11980,12 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
         g_pl_scale_contract_check_limit > 0 &&
         (g_p2_tile_contract_boundary_reached ||
          fpga_p2_cumulative_tile_limit_reached(g_p2_tile_q16_checks, g_p2_tile_limit));
+    if (p6_selected_m1 && (raw_contract_boundary || p2_contract_boundary)) {
+        fpga_fatal(
+            "P6_ARM_GOLDEN_CAPTURE_REJECT tensor=%s layer=%d M=%lld reason=qualification_boundary_before_selected "
+            "action=abort_no_hardware",
+            tensor_name, effective_layer_id, (long long) probe_m);
+    }
     if (q8_f32_f32_candidate && g_contract_cpu_shadow_dst && (raw_contract_boundary || p2_contract_boundary)) {
         if (ith == 0) {
             pthread_mutex_lock(&g_mutex);
@@ -10942,7 +12013,7 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
         return FPGA_MATMUL_NOT_HANDLED;
     }
 
-    if (should_bypass_vocab_projection_to_cpu(tensor_name, probe_k, probe_n, probe_m)) {
+    if (!p6_selected_m1 && should_bypass_vocab_projection_to_cpu(tensor_name, probe_k, probe_n, probe_m)) {
         if (ith == 0) {
             if (q8_f32_f32_candidate) {
                 g_q8_intentional_cpu_bypass_calls.fetch_add(1, std::memory_order_relaxed);
@@ -10961,7 +12032,7 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
         return 0;
     }
 
-    if (g_legacy_raw_cpu_bypass) {
+    if (!p6_selected_m1 && g_legacy_raw_cpu_bypass) {
         if (ith == 0) {
             if (q8_f32_f32_candidate) {
                 g_q8_intentional_cpu_bypass_calls.fetch_add(1, std::memory_order_relaxed);
@@ -10981,6 +12052,12 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
 
     const char * reason = nullptr;
     if (!fpga_validate_tensors(src0, src1, dst, true, &reason)) {
+        if (p6_selected_m1) {
+            fpga_fatal(
+                "P6_ARM_GOLDEN_CAPTURE_REJECT tensor=%s layer=%d M=%lld reason=selected_target_validation_%s "
+                "action=abort_no_hardware",
+                tensor_name, effective_layer_id, (long long) probe_m, reason ? reason : "unknown");
+        }
         if (ith == 0) {
             if (q8_f32_f32_candidate) {
                 g_q8_unavailable_cpu_fallback_calls.fetch_add(1, std::memory_order_relaxed);
@@ -11003,6 +12080,12 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
     }
 
     if (!dma_is_mapped() || !vpu_is_mapped() || !ddr_is_mapped()) {
+        if (p6_selected_m1) {
+            fpga_fatal(
+                "P6_ARM_GOLDEN_CAPTURE_REJECT tensor=%s layer=%d M=%lld reason=required_mapping_unavailable "
+                "action=abort_no_hardware",
+                tensor_name, effective_layer_id, (long long) probe_m);
+        }
         if (ith == 0) {
             if (q8_f32_f32_candidate) {
                 g_q8_unavailable_cpu_fallback_calls.fetch_add(1, std::memory_order_relaxed);
