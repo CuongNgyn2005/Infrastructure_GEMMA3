@@ -2162,6 +2162,152 @@ static bool ddr_range_fits(uint32_t off, size_t bytes) {
     return offset <= g_ddr_map_size && bytes <= g_ddr_map_size - offset;
 }
 
+// P2 packs four {weight_scale_fp16[31:16], activation_scale_fp16[15:0]}
+// entries in each 128-bit SPU_PARAM word.  Keep this arithmetic independent
+// of mappings and job state so both the producer and the pre-mapping self-test
+// share exactly the same checked contract.
+typedef struct {
+    size_t entries;
+    size_t words;
+    size_t bytes;
+    size_t tail_entries;
+} fpga_p2_scale_shape_t;
+
+static inline uint32_t fpga_p2_pack_scale_entry(uint16_t activation_scale, uint16_t weight_scale) {
+    return (uint32_t) activation_scale | ((uint32_t) weight_scale << 16);
+}
+
+static bool fpga_p2_checked_scale_shape(int                   rows,
+                                        int                   group_blocks,
+                                        uint32_t              job_result_values,
+                                        uint32_t              job_result_words,
+                                        size_t                job_scale_bytes,
+                                        uint32_t              scale_off,
+                                        fpga_p2_scale_shape_t * shape) {
+    if (!shape || rows <= 0 || group_blocks <= 0 || (scale_off & 0xFU) != 0U) {
+        return false;
+    }
+
+    const size_t rows_size         = (size_t) rows;
+    const size_t group_blocks_size = (size_t) group_blocks;
+    if (rows_size > std::numeric_limits<size_t>::max() / group_blocks_size) {
+        return false;
+    }
+    const size_t entries = rows_size * group_blocks_size;
+    if (entries > std::numeric_limits<uint32_t>::max() ||
+        entries > std::numeric_limits<size_t>::max() - ((size_t) VPU_RESULT_PACK_LANES - 1U)) {
+        return false;
+    }
+    const size_t words =
+        (entries + (size_t) VPU_RESULT_PACK_LANES - 1U) / (size_t) VPU_RESULT_PACK_LANES;
+    if (words == 0U || words > std::numeric_limits<uint32_t>::max() ||
+        words > std::numeric_limits<size_t>::max() / 16U) {
+        return false;
+    }
+    const size_t bytes = words * 16U;
+    if ((bytes & 0xFU) != 0U || job_result_values != (uint32_t) entries ||
+        job_result_words != (uint32_t) words || job_scale_bytes != bytes) {
+        return false;
+    }
+
+    if (words > std::numeric_limits<size_t>::max() / (size_t) VPU_RESULT_PACK_LANES) {
+        return false;
+    }
+    const size_t covered_entries = words * (size_t) VPU_RESULT_PACK_LANES;
+    const size_t tail_entries    = covered_entries - entries;
+    if (tail_entries > (size_t) VPU_RESULT_PACK_LANES - 1U) {
+        return false;
+    }
+
+    *shape = {entries, words, bytes, tail_entries};
+    return true;
+}
+
+static bool fpga_p2_scale_layout_case(int rows, int group_blocks) {
+    const size_t entries = (size_t) rows * (size_t) group_blocks;
+    const size_t words = (entries + (size_t) VPU_RESULT_PACK_LANES - 1U) / (size_t) VPU_RESULT_PACK_LANES;
+    const size_t bytes = words * 16U;
+    fpga_p2_scale_shape_t shape = {};
+    if (!fpga_p2_checked_scale_shape(rows, group_blocks, (uint32_t) entries, (uint32_t) words, bytes, SPU_PARAM_BASE,
+                                     &shape)) {
+        return false;
+    }
+
+    static constexpr size_t guard_words = 4U;
+    static constexpr uint32_t sentinel = 0xA55AA55AU;
+    std::vector<uint32_t> words_with_guards(guard_words + shape.words * (size_t) VPU_RESULT_PACK_LANES + guard_words,
+                                            sentinel);
+    uint32_t * const packed = words_with_guards.data() + guard_words;
+    for (size_t linear = 0; linear < shape.entries; ++linear) {
+        const uint16_t activation_scale = (uint16_t) (0x1000U | ((uint32_t) linear & 0x0FFFU));
+        const uint16_t weight_scale     = (uint16_t) (0xA000U | ((uint32_t) linear & 0x0FFFU));
+        const size_t word                = linear / (size_t) VPU_RESULT_PACK_LANES;
+        const size_t lane                = linear % (size_t) VPU_RESULT_PACK_LANES;
+        packed[word * (size_t) VPU_RESULT_PACK_LANES + lane] =
+            fpga_p2_pack_scale_entry(activation_scale, weight_scale);
+    }
+    for (size_t linear = shape.entries; linear < shape.words * (size_t) VPU_RESULT_PACK_LANES; ++linear) {
+        packed[linear] = 0U;
+    }
+
+    for (size_t i = 0; i < guard_words; ++i) {
+        if (words_with_guards[i] != sentinel ||
+            words_with_guards[guard_words + shape.words * (size_t) VPU_RESULT_PACK_LANES + i] != sentinel) {
+            return false;
+        }
+    }
+    for (size_t linear = 0; linear < shape.entries; ++linear) {
+        const uint16_t activation_scale = (uint16_t) (0x1000U | ((uint32_t) linear & 0x0FFFU));
+        const uint16_t weight_scale     = (uint16_t) (0xA000U | ((uint32_t) linear & 0x0FFFU));
+        const uint32_t expected          = fpga_p2_pack_scale_entry(activation_scale, weight_scale);
+        const size_t word                = linear / (size_t) VPU_RESULT_PACK_LANES;
+        const size_t lane                = linear % (size_t) VPU_RESULT_PACK_LANES;
+        const uint32_t actual            = packed[word * (size_t) VPU_RESULT_PACK_LANES + lane];
+        if (actual != expected || (uint16_t) actual != activation_scale ||
+            (uint16_t) (actual >> 16) != weight_scale) {
+            return false;
+        }
+    }
+    for (size_t linear = shape.entries; linear < shape.words * (size_t) VPU_RESULT_PACK_LANES; ++linear) {
+        if (packed[linear] != 0U) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool fpga_p2_scale_layout_self_test(void) {
+    // Modulo coverage, odd/even rows, a nontrivial multi-row shape, and the
+    // deployed maximum P2 tile all exercise the same host-only layout path.
+    static constexpr int cases[][2] = {
+        {1, 4}, {1, 1}, {1, 2}, {1, 3}, {3, 5}, {2, 6}, {7, 5}, {256, 64},
+    };
+    for (const auto & test_case : cases) {
+        if (!fpga_p2_scale_layout_case(test_case[0], test_case[1])) {
+            return false;
+        }
+    }
+
+    uint32_t sentinels[8];
+    for (uint32_t & sentinel : sentinels) {
+        sentinel = 0xC33CC33CU;
+    }
+    fpga_p2_scale_shape_t rejected = {17U, 19U, 23U, 29U};
+    const bool rejected_shape =
+        !fpga_p2_checked_scale_shape(0, 4, 0U, 0U, 0U, SPU_PARAM_BASE, &rejected) &&
+        !fpga_p2_checked_scale_shape(1, 3, 3U, 1U, 32U, SPU_PARAM_BASE, &rejected) &&
+        !fpga_p2_checked_scale_shape(1, 4, 4U, 2U, 16U, SPU_PARAM_BASE, &rejected) &&
+        !fpga_p2_checked_scale_shape(1, 4, 3U, 1U, 16U, SPU_PARAM_BASE, &rejected) &&
+        !fpga_p2_checked_scale_shape(1, 4, 4U, 1U, 16U, SPU_PARAM_BASE + 4U, &rejected);
+    for (uint32_t sentinel : sentinels) {
+        if (sentinel != 0xC33CC33CU) {
+            return false;
+        }
+    }
+    return rejected_shape && rejected.entries == 17U && rejected.words == 19U && rejected.bytes == 23U &&
+           rejected.tail_entries == 29U;
+}
+
 static uint8_t * ddr_ptr(uint32_t off, size_t bytes) {
     if (!ddr_range_fits(off, bytes)) {
         fpga_fatal("DDR mapped range overflow off=0x%08x bytes=%zu mapped_size=0x%zx", off, bytes, g_ddr_map_size);
@@ -7622,12 +7768,25 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
             }
         }
     } else {
-        ddr_zero_range32(SPU_PARAM_BASE, job.scale_bytes);
+        fpga_p2_scale_shape_t scale_shape = {};
+        if (!fpga_p2_checked_scale_shape(rows, group_blocks, job.result_values, job.result_words, job.scale_bytes,
+                                         SPU_PARAM_BASE, &scale_shape)) {
+            LOGE(
+                "P2 scale shape rejected job=%u tile=%u rows=%d group_blocks=%d result_values=%u result_words=%u "
+                "scale_bytes=%zu spu_param=0x%08x action=no_write_no_dma_no_start",
+                job.job_id, job.tile_id, rows, group_blocks, job.result_values, job.result_words, job.scale_bytes,
+                SPU_PARAM_BASE);
+            return false;
+        }
+        // Check the complete P2 PARAM range once before the first volatile
+        // store.  Every live entry is written exactly once; only the 0..3
+        // unused lanes in the final 128-bit word are cleared.
+        volatile uint32_t * const scale_words = ddr_checked_u32_ptr(SPU_PARAM_BASE, job.scale_bytes);
         for (int row = 0; row < rows; ++row) {
             for (int gb = 0; gb < group_blocks; ++gb) {
-                const uint32_t       linear = (uint32_t) row * (uint32_t) group_blocks + (uint32_t) gb;
-                const uint32_t       word   = linear / (uint32_t) VPU_RESULT_PACK_LANES;
-                const uint32_t       lane   = linear % (uint32_t) VPU_RESULT_PACK_LANES;
+                const size_t         linear = (size_t) row * (size_t) group_blocks + (size_t) gb;
+                const size_t         word   = linear / (size_t) VPU_RESULT_PACK_LANES;
+                const size_t         lane   = linear % (size_t) VPU_RESULT_PACK_LANES;
                 uint16_t weight_d = 0U;
                 if (job.p2_residency_hit) {
                     if (!fpga_p2_resident_scale_bits(job.p2_residency_slot,
@@ -7642,10 +7801,16 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
                         weight_block_from_base(src0, weight_data_base, row0 + row, k_block0 + gb);
                     weight_d = (uint16_t) wb->d;
                 }
-                const uint32_t packed_scale = (uint32_t) act_group[gb].d | ((uint32_t) weight_d << 16);
-                ddr_write_u32(SPU_PARAM_BASE + word * 16U + lane * 4U, packed_scale);
+                const uint32_t packed_scale = fpga_p2_pack_scale_entry((uint16_t) act_group[gb].d, weight_d);
+                scale_words[word * (size_t) VPU_RESULT_PACK_LANES + lane] = packed_scale;
             }
         }
+        for (size_t linear = scale_shape.entries;
+             linear < scale_shape.words * (size_t) VPU_RESULT_PACK_LANES;
+             ++linear) {
+            scale_words[linear] = 0U;
+        }
+        mmio_fence();
     }
 
     const long long scale_pack_us = now_us() - scale_pack0;
@@ -9507,6 +9672,13 @@ int fpga_init(void) {
             dma_mapped ? 1 : 0, vpu_mapped ? 1 : 0, ddr_mapped ? 1 : 0);
     }
     g_init_verbose = env_flag_enabled("FPGA_INIT_VERBOSE");
+    // This checks the host-only P2 PARAM packing contract before any UIO,
+    // /dev/mem, DDR, VPU, or ZDMA mapping can be attempted.
+    if (!fpga_p2_scale_layout_self_test()) {
+        fpga_fatal("P2 scale layout self-test failed before hardware mapping; refusing FPGA initialization");
+    }
+    LOGINIT("P2_SCALE_LAYOUT_SELFTEST pass cases=8 modulo=0,1,2,3 odd_even_multirow=1 max_rows=256 max_group_blocks=64 "
+            "invalid_shape_rejected_before_mutation=1");
     if (getenv("FPGA_P2_HOST_PREPACK") || getenv("FPGA_P2_HOST_PREPACK_MB")) {
         fpga_fatal(
             "FPGA_P2_HOST_PREPACK and FPGA_P2_HOST_PREPACK_MB are retired after measured regression; remove both variables");
