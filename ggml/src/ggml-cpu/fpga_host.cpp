@@ -326,7 +326,7 @@ static_assert((WEIGHT_BASE % alignof(uint32_t)) == 0U, "WEIGHT_BASE must be 32-b
 static constexpr size_t   VPU_DEVMEM_COMPAT_MMAP = SPU_SCRATCH_END;
 static constexpr size_t   DDR_REQUIRED_BYTES     = SPU_SCRATCH_END;
 static constexpr uint32_t WEIGHT_CACHE_BASE      = 0x01000000;
-static constexpr uint32_t P2_WEIGHT_RESIDENCY_END = 0x02000000;
+static constexpr uint32_t P2_WEIGHT_RESIDENCY_END = 0x03000000;
 static constexpr size_t   WEIGHT_CACHE_ALIGN     = 4096;
 static_assert((DDR_BASE_PHYS & 0xFFFULL) == 0ULL, "DDR_BASE_PHYS must be page aligned");
 static_assert((DDR_REGION_SIZE & 0xFFFULL) == 0ULL, "DDR_REGION_SIZE must be page aligned");
@@ -345,7 +345,7 @@ static constexpr long long WEIGHT_CACHE_DEFAULT_MAX_MB    = 16;
 // P2 residency is deliberately a different experiment from the legacy
 // weight cache. It owns a fixed, non-evicting directory of sealed tiles and
 // never calls msync().
-static constexpr long long P2_WEIGHT_RESIDENCY_MAX_MB     = 16;
+static constexpr long long P2_WEIGHT_RESIDENCY_MAX_MB     = 32;
 // Protocol-2/VPU2 stores each beat as an adjacent even/odd row pair.  This
 // version is deliberately part of the sealed-residency identity: a v1 tile
 // is byte-valid but semantically row-major, and must never be reused by VPU2.
