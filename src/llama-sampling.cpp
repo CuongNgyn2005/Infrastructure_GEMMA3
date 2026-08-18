@@ -4,6 +4,10 @@
 #include "llama-vocab.h"
 #include "llama-grammar.h"
 
+#ifdef USE_FPGA
+#include "../ggml/src/ggml-cpu/fpga_host.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -16,12 +20,6 @@
 #include <random>
 #include <unordered_map>
 #include <stdexcept>
-
-#include <map>
-#include <string>
-#include <mutex>
-extern std::map<std::string, double> op_timings_ms; // <-- SỬA LẠI THÀNH double
-extern std::mutex timings_mutex;
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 template<typename T>
@@ -2668,52 +2666,55 @@ void llama_perf_sampler_print(const struct llama_sampler * chain) {
 
     LLAMA_LOG_INFO("%s:    sampling time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
             __func__, data.t_sample_ms, data.n_sample, data.t_sample_ms / data.n_sample, 1e3 / data.t_sample_ms * data.n_sample);
-            // --- BẮT ĐẦU CODE THÊM MỚI ---
-    // --- BẮT ĐẦU CODE THAY THẾ TRONG llama_perf_sampler_print ---
+#ifdef USE_FPGA
+    fpga_perf_decode_data fpga_perf = {};
+    if (fpga_perf_decode_get(&fpga_perf)) {
+        const long long transfer_us = fpga_perf.h2ip_dma_us + fpga_perf.output_transfer_us;
+        const long long service_us = fpga_perf.ip_compute_us + transfer_us;
+        const double ip_only_tokens_per_second = fpga_perf.ip_compute_us > 0 ?
+            (double) fpga_perf.decode_tokens * 1000000.0 / (double) fpga_perf.ip_compute_us : 0.0;
+        const double service_tokens_per_second = service_us > 0 ?
+            (double) fpga_perf.decode_tokens * 1000000.0 / (double) service_us : 0.0;
+        const double end_to_end_tokens_per_second = fpga_perf.decode_wall_us > 0 ?
+            (double) fpga_perf.decode_tokens * 1000000.0 / (double) fpga_perf.decode_wall_us : 0.0;
+        const double direct_weight_pack_pct = fpga_perf.preparation_us > 0 ?
+            100.0 * (double) fpga_perf.direct_weight_pack_us / (double) fpga_perf.preparation_us : 0.0;
 
-    // Khởi tạo map nếu cần (an toàn hơn khi làm ở đây và có khóa)
-    {
-         std::lock_guard<std::mutex> lock(timings_mutex); // Khóa trước khi kiểm tra/khởi tạo
-         if (op_timings_ms.find("Total_Attn_MHA") == op_timings_ms.end()) op_timings_ms["Total_Attn_MHA"] = 0.0;
-         if (op_timings_ms.find("Total_FFN") == op_timings_ms.end()) op_timings_ms["Total_FFN"] = 0.0;
-         if (op_timings_ms.find("Total_Norm") == op_timings_ms.end()) op_timings_ms["Total_Norm"] = 0.0;
-         if (op_timings_ms.find("Total_MoE_FFN") == op_timings_ms.end()) op_timings_ms["Total_MoE_FFN"] = 0.0;
-    } // Mở khóa
-
-    double total_op_time = 0;
-    std::map<std::string, double> timings_copy; // Tạo bản sao để tránh giữ khóa lâu
-
-    {
-        std::lock_guard<std::mutex> lock(timings_mutex); // Khóa để sao chép map
-        timings_copy = op_timings_ms;                  // Sao chép dữ liệu
-         // Tùy chọn: Reset map gốc ngay sau khi sao chép nếu muốn
-         // for (auto &pair : op_timings_ms) { pair.second = 0.0; }
-    } // Mở khóa
-
-    // Tính tổng từ bản sao (không cần khóa nữa)
-    for (auto const& pair : timings_copy) {
-        double val = pair.second;
-        if (val > 0) {
-            total_op_time += val;
-        }
+        printf("\n--- FPGA Decode Summary (within sampler print) ---\n");
+        printf("%s: %-25s = %10lld\n", __func__, "Decode tokens", (long long) fpga_perf.decode_tokens);
+        printf("%s: %-25s = %10.2f tokens/s\n", __func__, "End-to-end decode speed", end_to_end_tokens_per_second);
+        printf("%s: %-25s = %10.2f ms\n", __func__, "End-to-end decode time", (double) fpga_perf.decode_wall_us / 1000.0);
+        printf("%s: %-25s = %10lld\n", __func__, "FPGA matmul hooks", (long long) fpga_perf.fpga_matmuls);
+        printf("%s: %-25s = %10lld\n", __func__, "VPU runs", (long long) fpga_perf.vpu_runs);
+        printf("%s: %-25s = %10.2f ms\n", __func__, "IP-only compute time", (double) fpga_perf.ip_compute_us / 1000.0);
+        printf("%s: %-25s = %10.2f tokens/s\n", __func__, "IP-only compute speed", ip_only_tokens_per_second);
+        printf("%s: %-25s = %10.2f ms\n", __func__, "H2IP DMA time", (double) fpga_perf.h2ip_dma_us / 1000.0);
+        printf("%s: %-25s = %10.2f ms\n", __func__, "Output transfer time", (double) fpga_perf.output_transfer_us / 1000.0);
+        printf("%s: %-25s = %10.2f ms\n", __func__, "IP + transfer time", (double) service_us / 1000.0);
+        printf("%s: %-25s = %10.2f tokens/s\n", __func__, "IP + transfer speed", service_tokens_per_second);
+        printf("%s: %-25s = %10.2f ms\n", __func__, "CPU preparation time", (double) fpga_perf.preparation_us / 1000.0);
+        printf("%s: %-25s = %10.2f ms (%5.1f %%)\n", __func__, "Direct weight packing",
+               (double) fpga_perf.direct_weight_pack_us / 1000.0, direct_weight_pack_pct);
+        printf("%s: %-25s = %10.2f ms\n", __func__, "Scale-table packing", (double) fpga_perf.scale_pack_us / 1000.0);
+        printf("%s: %-25s = %10lld (%10.2f MiB)\n", __func__, "ZDMA descriptors",
+               (long long) fpga_perf.zdma_descriptors, (double) fpga_perf.zdma_bytes / (1024.0 * 1024.0));
+        printf("%s: %-25s = %10.2f ms, %lld overlap jobs\n", __func__, "Preloaded input DMA",
+               (double) fpga_perf.preload_dma_us / 1000.0, (long long) fpga_perf.preload_overlap_jobs);
+        printf("%s: %-25s = %10lld completed, %lld fallback, %lld reject\n", __func__, "FPGA GEMV coverage",
+               (long long) fpga_perf.run_fpga_gemvs, (long long) fpga_perf.run_q8_unavailable_cpu_fallbacks,
+               (long long) fpga_perf.run_rejects);
+        printf("%s: %-25s = %10lld drop, %lld error\n", __func__, "SPU stream status",
+               (long long) fpga_perf.run_stream_drops, (long long) fpga_perf.run_stream_errors);
+        printf("%s: %-25s = %10lld/%lld slots, %lld hit, %lld miss\n", __func__, "Weight residency",
+               (long long) fpga_perf.residency_slots_used, (long long) fpga_perf.residency_slots_total,
+               (long long) fpga_perf.residency_hits, (long long) fpga_perf.residency_misses);
+        printf("--------------------------------------------------------------------------------\n");
+    } else {
+        printf("\n--- FPGA Decode Performance (within sampler print) ---\n");
+        printf("%s: no completed FPGA decode-token timing was recorded\n", __func__);
+        printf("--------------------------------------------------------------------------------\n");
     }
-
-    printf("\n--- Detailed Function Profiling (within sampler print) ---\n");
-    // In từ bản sao (không cần khóa nữa)
-    for (auto const& pair : timings_copy) {
-         const std::string& key = pair.first;
-         double val = pair.second;
-
-         printf("%s: %-20s time = %10.2f ms (%6.2f %%)\n",
-                __func__,
-                key.c_str(),
-                val,
-                (total_op_time > 0) ? (val / total_op_time) * 100.0 : 0.0);
-    }
-     printf("%s: %-20s time = %10.2f ms\n", __func__, "Total Profiled", total_op_time);
-     printf("----------------------------------------------------------\n");
-
-    // --- KẾT THÚC CODE THAY THẾ ---
+#endif
 }
 
 void llama_perf_sampler_reset(struct llama_sampler * chain) {

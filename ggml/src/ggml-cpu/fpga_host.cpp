@@ -1324,6 +1324,9 @@ typedef struct {
 } fpga_token_timing_t;
 
 static fpga_token_timing_t g_token_timing = {};
+// These counters are exported to llama_perf_sampler_print(). They represent
+// only completed single-token decode evaluations, never prefill batches.
+static fpga_perf_decode_data g_fpga_perf_decode = {};
 
 static void fpga_p1_sched_summary_emit(const char * reason) {
     if (!g_p1_sched_summary_enabled || !g_p1_sched_summary.active) {
@@ -1480,6 +1483,20 @@ static bool fpga_token_timing_emit(int next_graph_seq,
     const char * scope = decode_token ? "decode_token" : (ubatch_tokens > 0 ? "prefill_or_ubatch" : "incomplete");
     if (decode_token) {
         ++g_summary_detail_decode_tokens;
+        ++g_fpga_perf_decode.decode_tokens;
+        g_fpga_perf_decode.decode_wall_us += token_wall_us;
+        g_fpga_perf_decode.fpga_matmuls += g_token_timing.matmuls;
+        g_fpga_perf_decode.vpu_runs += g_token_timing.vpu_runs;
+        g_fpga_perf_decode.ip_compute_us += g_token_timing.ip_compute_us;
+        g_fpga_perf_decode.h2ip_dma_us += h2ip_dma_us;
+        g_fpga_perf_decode.output_transfer_us += token_read_us;
+        g_fpga_perf_decode.preparation_us += g_token_timing.prep_us;
+        g_fpga_perf_decode.direct_weight_pack_us += g_token_timing.prep_direct_weight_pack_us;
+        g_fpga_perf_decode.scale_pack_us += g_token_timing.prep_scale_pack_us;
+        g_fpga_perf_decode.zdma_descriptors += g_token_timing.zdma_descriptors;
+        g_fpga_perf_decode.zdma_bytes += g_token_timing.zdma_bytes;
+        g_fpga_perf_decode.preload_dma_us += g_token_timing.preload_us;
+        g_fpga_perf_decode.preload_overlap_jobs += g_token_timing.scheduler_preload_overlap_jobs;
     }
     const bool sampled_detail = g_summary_detail_after_error ||
                                 (decode_token &&
@@ -10583,6 +10600,7 @@ int fpga_init(void) {
     fpga_token_timing_reset();
     g_summary_detail_decode_tokens = 0;
     g_summary_detail_after_error = false;
+    g_fpga_perf_decode = {};
     if (g_token_timing_collection_enabled) {
         LOGINIT(
             "TOKEN_TIMING_CONFIG enabled=1 pingpong_detail=%d bottleneck_summary=%d output=/tmp/fpga_debug.log "
@@ -11702,6 +11720,25 @@ void fpga_set_context(int layer_id, int seq_pos, int is_attn) {
 
 extern "C" int fpga_get_sequence_position(void) {
     return g_current_seq_pos;
+}
+
+extern "C" int fpga_perf_decode_get(fpga_perf_decode_data * data) {
+    if (!data) {
+        return 0;
+    }
+
+    *data = g_fpga_perf_decode;
+    data->run_fpga_gemvs = g_fpga_count;
+    data->run_q8_unavailable_cpu_fallbacks = g_q8_unavailable_cpu_fallback_calls.load(std::memory_order_relaxed);
+    data->run_rejects = g_reject_count;
+    data->run_stream_drops = g_pl_scale_stream_drops;
+    data->run_stream_errors = g_pl_scale_stream_errors;
+    data->residency_slots_used = (int64_t) g_p2_resident_tile_count;
+    data->residency_slots_total = (int64_t) g_p2_resident_tiles.size();
+    data->residency_hits = g_p2_residency_hits;
+    data->residency_misses = g_p2_residency_misses;
+    return data->decode_tokens > 0 &&
+           (data->ip_compute_us + data->h2ip_dma_us + data->output_transfer_us) > 0 ? 1 : 0;
 }
 
 extern "C" void fpga_advance_sequence_position(int n_tokens) {
