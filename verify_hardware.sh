@@ -1,125 +1,71 @@
 #!/bin/bash
-# Hardware Verification Checklist for ZCU104 FPGA Board
-# Run this FIRST on new board before building
+# ZCU104 host-side preflight for the current Infrastructure_GEMMA3 address map.
+# This checklist is observational only; it performs no MMIO or DDR writes.
 
-echo "╔════════════════════════════════════════════════════════════════╗"
-echo "║     HARDWARE VERIFICATION CHECKLIST - ZCU104 NEW BOARD         ║"
-echo "╚════════════════════════════════════════════════════════════════╝"
-echo ""
+set -u
 
-echo "📌 STEP 1: Check Linux Version"
-echo "════════════════════════════════════════════════════════════════"
+DDR_BASE=0x70000000
+DDR_END=0x80000000
+MY_IP_BASE=0xA0000000
+ZDMA_BASE=0xFD500000
+
+section() {
+    echo
+    echo "================================================================"
+    echo "$1"
+    echo "================================================================"
+}
+
+section "1. Linux / board"
 uname -a
-echo ""
 
-echo "📌 STEP 2: Check Total RAM"
-echo "════════════════════════════════════════════════════════════════"
-cat /proc/meminfo | head -3
-TOTAL_RAM=$(cat /proc/meminfo | grep MemTotal | awk '{print $2}')
-if [ $TOTAL_RAM -gt 2000000 ] && [ $TOTAL_RAM -lt 2100000 ]; then
-    echo "✓ RAM size is 2GB (acceptable)"
+section "2. Installed RAM"
+awk '/MemTotal|MemAvailable/ {print}' /proc/meminfo
+cat /proc/iomem | grep -E 'System RAM|reserved' || true
+
+echo
+printf 'Expected FPGA DDR carveout used by host: [0x%08X, 0x%08X)\n' "$((DDR_BASE))" "$((DDR_END))"
+printf 'Expected MY_IP/LMM base:             0x%08X\n' "$((MY_IP_BASE))"
+printf 'Expected ZDMA page base:             0x%08X\n' "$((ZDMA_BASE))"
+
+section "3. Current address-contract checker"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [[ -x "$SCRIPT_DIR/verify_fpga_addresses.sh" ]]; then
+    "$SCRIPT_DIR/verify_fpga_addresses.sh" || {
+        echo "Address-contract verification failed. Do not start FPGA inference." >&2
+        exit 1
+    }
 else
-    echo "⚠️  WARNING: RAM total is $TOTAL_RAM kB (expected ~2GB = 2036116 kB)"
+    echo "verify_fpga_addresses.sh is missing or not executable" >&2
+    exit 1
 fi
-echo ""
 
-echo "📌 STEP 3: Check DDR Memory Layout"
-echo "════════════════════════════════════════════════════════════════"
-cat /proc/iomem | grep "System RAM"
-echo ""
-
-echo "📌 STEP 4: Check CMA Region"
-echo "════════════════════════════════════════════════════════════════"
-dmesg | grep -i "cma:" | tail -3
-CMA_CHECK=$(dmesg | grep "cma: Reserved" | tail -1)
-if [[ $CMA_CHECK == *"0x000000006b800000"* ]]; then
-    echo "✓ CMA region matches expected layout"
+section "4. UIO inventory"
+if [[ -d /sys/class/uio ]]; then
+    for uio in /sys/class/uio/uio*; do
+        [[ -e "$uio" ]] || continue
+        echo "$(basename "$uio"): $(cat "$uio/name" 2>/dev/null || echo '?')"
+        for map in "$uio"/maps/map*; do
+            [[ -e "$map" ]] || continue
+            echo "  $(basename "$map") addr=$(cat "$map/addr" 2>/dev/null || echo '?') size=$(cat "$map/size" 2>/dev/null || echo '?')"
+        done
+    done
 else
-    echo "⚠️  WARNING: CMA region might be different"
-    echo "   Current: $CMA_CHECK"
-    echo "   Expected: cma: Reserved ... at 0x000000006b800000"
+    echo "WARN: /sys/class/uio not present"
 fi
-echo ""
 
-echo "📌 STEP 5: Check Bitstream Status"
-echo "════════════════════════════════════════════════════════════════"
-if command -v fpgautil &> /dev/null; then
-    echo "✓ fpgautil found"
-    fpgautil -d 2>/dev/null || echo "  (fpgautil -d to check device later)"
+section "5. FPGA programming utilities"
+if command -v fpgautil >/dev/null 2>&1; then
+    echo "fpgautil: $(command -v fpgautil)"
+    fpgautil -d 2>/dev/null || echo "INFO: fpgautil did not report a device state"
 else
-    echo "⚠️  fpgautil not found - may need to load bitstream manually"
+    echo "INFO: fpgautil not installed; verify the programmed bitstream using the board's normal flow"
 fi
-echo ""
 
-echo "📌 STEP 6: Check FPGA Control Space @ 0x400000000"
-echo "════════════════════════════════════════════════════════════════"
-# Try to read control register
-if [ -e /dev/mem ]; then
-    echo "✓ /dev/mem exists"
-
-    # Simple check: try to read 4 bytes from 0x400000000
-    # We'll use a simple bash/dd approach if available
-    if command -v /root/read_fpga_ctrl &> /dev/null 2>&1; then
-        REG_VALUE=$(/root/read_fpga_ctrl 0x400000000)
-        echo "  Kernel Control Register @ 0x400000000: $REG_VALUE"
-    else
-        echo "  (Will test control access when building)"
-    fi
-else
-    echo "❌ /dev/mem NOT found - cannot access FPGA control"
-    echo "   Need to: sudo modprobe uio_pdrv_genirq"
-fi
-echo ""
-
-echo "📌 STEP 7: Current Free Memory"
-echo "════════════════════════════════════════════════════════════════"
+section "6. Memory pressure"
 free -h
-echo ""
 
-echo "📌 STEP 8: Network Access (for bitstream download if needed)"
-echo "════════════════════════════════════════════════════════════════"
-if ping -c 1 8.8.8.8 &> /dev/null; then
-    echo "✓ Network accessible"
-else
-    echo "⚠️  No external network access"
-    echo "  (bitstream must be pre-loaded or on-board)"
-fi
-echo ""
-
-echo "╔════════════════════════════════════════════════════════════════╗"
-echo "║                    VERIFICATION SUMMARY                        ║"
-echo "╚════════════════════════════════════════════════════════════════╝"
-echo ""
-
-# Summary
-echo "CRITICAL CHECKS:"
-echo "  ✓ RAM: 2GB confirmed"
-echo "  ✓ CMA: Matches expected (0x6B800000-0x77800000)"
-echo "  ✓ /dev/mem: Accessible"
-echo ""
-
-echo "BEFORE PROCEEDING:"
-echo ""
-echo "1️⃣  Confirm bitstream is loaded:"
-echo "   $ sudo fpgautil -d"
-echo "   Should show: xclbin name, FPGA state=loaded"
-echo ""
-echo "2️⃣  If bitstream NOT loaded, load it:"
-echo "   $ sudo fpgautil -b DATN1_wrapper.bit"
-echo ""
-echo "3️⃣  Check FPGA is programmed:"
-echo "   $ sudo fpgautil -d"
-echo "   Should show PL programming state"
-echo ""
-echo "4️⃣  Run memory test again on new board:"
-echo "   $ bash check_fpga_memory.sh"
-echo "   Verify addresses match:"
-echo "   • CMA: 0x6B800000-0x77800000"
-echo "   • FPGA: 0x77C00000-0x7EC00000"
-echo ""
-echo "5️⃣  If addresses DON'T match:"
-echo "   ⚠️  Need to adjust fpga_host.cpp buffer addresses!"
-echo "   Contact me before building"
-echo ""
-echo "════════════════════════════════════════════════════════════════"
-echo ""
+section "7. Result"
+echo "Host-side static preflight passed."
+echo "This does NOT prove that the physical ranges are electrically accessible or that the loaded bitstream implements the expected VPU2/P2/P3 ABI."
+echo "Those properties must be proven by fpga_init() capability/identity checks and, where required, an on-board run."
