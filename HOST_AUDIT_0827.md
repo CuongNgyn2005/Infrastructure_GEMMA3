@@ -20,6 +20,19 @@ Target model: Gemma3-1B-INT8 / Q8_0 host path
 
 Observed runtime evidence supplied with the project shows approximately 2.59 s wall/token, ~0.349 s IP compute, ~1.81 s host preparation, ~1.486 s direct weight packing and ~0.308 s scale packing. The FPGA compute engine is therefore not the dominant decode cost.
 
+### P2 weight residency: `0/128` is not a cache-failure regression
+
+The current host deliberately keeps sealed P2 residency out of the normal production command. Admission requires both:
+
+- `FPGA_P2_WEIGHT_RESIDENCY=1`
+- `FPGA_P2_WEIGHT_RESIDENCY_DIAGNOSTIC=1`
+
+A lone `FPGA_P2_WEIGHT_RESIDENCY=1` request is explicitly suppressed as `low_coverage_not_production`. If neither option is supplied, `g_p2_weight_residency_enabled` remains false. Therefore a final summary such as `0/128 slots, 0 hit, 0 miss` is expected for the ordinary production run and must not be diagnosed as a failed lookup path.
+
+When the two diagnostic flags are admitted, the requested DDR mapping grows only to `WEIGHT_CACHE_BASE + residency_budget`, not to the whole model. With the current constants, residency begins at offset `0x01000000` inside the reserved `[0x70000000,0x80000000)` FPGA DDR carveout and is capped at 32 MiB. This is a bounded working-set experiment, but writing beyond the normal 4 MiB scratch aperture still requires on-board qualification.
+
+A reproducible launcher is provided as `run_p2_residency_qualification.sh`. It defaults to 8 MiB and permits 8/16/32 MiB graduated tests only after the non-destructive address preflight passes. It does not make residency a production default.
+
 ### Static weight scale
 
 P2 residency already stores immutable weight-scale bits in host metadata for a sealed resident tile. However, P2 hardware consumes a 32-bit entry containing both the dynamic activation scale and static weight scale. Therefore `SPU_PARAM` still requires `rows * group_blocks` combined entries for each job. Caching weight-scale bits alone cannot make the P2 parameter table static.
@@ -33,6 +46,8 @@ The repository already contains the architectural solution: P3 split-scale. P3 w
 3. After P2 residency was expanded from 16 MiB to 32 MiB, `P2_WEIGHT_RESIDENCY_END` became `0x03000000`, but one `static_assert` diagnostic string still describes the old `[0x01000000,0x02000000)` interval. This is diagnostic drift, not a runtime arithmetic error.
 4. `fpga_host.cpp` mixes production data-path code, qualification experiments, verbose diagnostics, telemetry, address mapping, residency, scheduler state and contract checks in one translation unit. This makes regression review difficult and increases the chance that diagnostic code changes production sequencing.
 
+`0/128 residency` is intentionally excluded from this regression list after re-auditing the option/admission path.
+
 ## Fixes already committed on this branch
 
 - Replaced the legacy address-probing script with a non-destructive address-contract checker synchronized to the current host map:
@@ -40,7 +55,24 @@ The repository already contains the architectural solution: P3 split-scale. P3 w
   - MY_IP/LMM `0xA0000000`
   - ZDMA page `0xFD500000`
 - Reworked `verify_hardware.sh` so it delegates to the synchronized checker, enumerates UIO mappings, and no longer claims hardware success without evidence.
-- Neither change modifies any physical address in `fpga_host.cpp`.
+- Added `run_p2_residency_qualification.sh` so the two required diagnostic flags and a graduated 8/16/32 MiB budget are explicit and reproducible.
+- None of these changes modifies any physical address in `fpga_host.cpp` or changes the production data path.
+
+## Residency qualification acceptance criteria
+
+Start with 8 MiB. Do not raise the budget until the previous run completes cleanly.
+
+A residency run is acceptable only if all of the following hold:
+
+- address/UIO preflight passes before inference;
+- `P2_RESIDENCY_ADMISSION pass` appears with the expected physical range and budget;
+- at least one slot is sealed successfully;
+- a later decode step produces at least one residency hit;
+- no metadata invalidation, poisoned slot, range failure, ZDMA error, SPU stream drop/error, or CPU fallback appears;
+- greedy generated token IDs remain identical to the no-residency baseline;
+- direct weight-pack bytes/time decrease by an amount consistent with the resident payload actually reused.
+
+Do not infer a large speedup from residency alone. With a small bounded cache, only the resident fraction of the model's repeatedly used Q8 tiles can avoid CPU pair-packing. The first objective is to prove safe reuse and measure the real hit/byte savings; only then decide whether the residency budget or replacement policy deserves further engineering.
 
 ## Required next host refactor
 
