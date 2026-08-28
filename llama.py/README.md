@@ -1,91 +1,43 @@
-# llama.py
+# Infrastructure Python API
 
-**llama.py** is a fork of [llama.cpp][1] which provides Python bindings to an
-inference runtime for [LLaMA][2] model in pure C/C++.
+This directory is a thin Python binding for the parent `Infrastructure_GEMMA3` runtime.
+It does not build or carry a second llama/ggml implementation. Python calls the same
+`llama` target used by the rest of Infrastructure, so GGML execution still reaches the
+existing FPGA interception and `fpga_host.cpp` path when Infrastructure is built with
+`USE_FPGA=ON`.
 
-## Description
+## Build
 
-The main goal is to run the model using 4-bit quantization on a laptop.
+From the repository root, reuse the existing build directory and enable the Python API:
 
-- Plain C/C++ implementation without dependencies.
-- Apple silicon first-class citizen - optimized via ARM NEON.
-- AVX2 support for x86 architectures.
-- Mixed F16 / F32 precision.
-- 4-bit quantization support.
-- Runs on the CPU.
-
-## Usage
-
-Build instruction follows.
-
-```shell
-cmake -S . -B build/release
-cmake --build build/release
-ln -s build/release/llama/cc/_llama.cpython-310-x86_64-linux-gnu.so llama
+```bash
+cmake -S . -B build_mem -DUSE_FPGA=ON -DLLAMA_BUILD_PYTHON=ON
+cmake --build build_mem --target _infrastructure -j4
 ```
 
-Obtain the original LLaMA model weights and place them in `data/model` directory.
+`pybind11` development files must be discoverable by CMake.
 
-```shell
-python -m llama pull -m data/model/7B -s 7B
+The package is emitted to `build_mem/python/llama`. Run it with:
+
+```bash
+PYTHONPATH=build_mem/python python3 - <<'PY'
+from llama import Llama
+
+llm = Llama(
+    "/home/debian/soc/models/gemma-3-1b-it-Q8_0.gguf",
+    n_ctx=4096,
+    n_batch=512,
+)
+
+print(llm.generate(
+    "Write a short overview of Vietnam.",
+    max_tokens=32,
+    temperature=0.0,
+    seed=1,
+))
+PY
 ```
 
-As model weights are successfully fetched, directory structure should look like below.
-
-```
-data/model
-├── 7B
-│   ├── checklist.chk
-│   ├── consolidated.00.pth
-│   └── params.json
-├── tokenizer_checklist.chk
-└── tokenizer.model
-```
-
-Then one should convert the 7B model to ggml FP16 format.
-
-```shell
-python -m llama convert data/model/7B
-```
-
-And quantize the model to 4-bits.
-
-```shell
-python -m llama quantize data/model/7B
-```
-
-Then one can start Python interpreter and play with naked bindings.
-
-```python
-from llama._llama import *
-
-nothreads = 8
-model = LLaMA.load('./data/model/7B/ggml-model-q4_0.bin', 512, GGMLType.F32)
-mem_per_token = model.estimate_mem_per_token(nothreads)
-logits = model.apply(context, context_size, mem_per_token, nothreads)
-
-token_id = sample_next_token(context, logits)
-
-tokenizer = model.get_tokenizer()
-tokenizer.decode(token_id)
-
-```
-
-Or run CLI interface.
-
-### Memory/Disk Requirements
-
-As the models are currently fully loaded into memory, you will need adequate
-disk space to save them and sufficient RAM to load them. At the moment, memory
-and disk requirements are the same.
-
-| model | original size | quantized size (4-bit) |
-|-------|---------------|------------------------|
-| 7B    | 13 GB         | 3.9 GB                 |
-| 13B   | 24 GB         | 7.8 GB                 |
-| 30B   | 60 GB         | 19.5 GB                |
-| 65B   | 120 GB        | 38.5 GB                |
-
-
-[1]: https://github.com/ggerganov/llama.cpp
-[2]: https://arxiv.org/abs/2302.13971
+`Llama.generate()` keeps the complete decode loop in C/C++; Python only enters at the
+high-level API boundary. `n_gpu_layers` defaults to `0` so the CPU GGML backend remains
+the execution path where this project intercepts supported matrix multiplications for FPGA.

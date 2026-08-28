@@ -1,54 +1,238 @@
-#include <llama/cc/llama.h>
-#include <llama/cc/quantization.h>
+#include "llama.h"
+
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-namespace {
-
-void InitializeF16Tables(void) {
-    struct ggml_init_params params = {0, nullptr};
-    struct ggml_context *ctx = ggml_init(params);
-    ggml_free(ctx);
-}
-
-} // namespace
+#include <algorithm>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace py = pybind11;
 
-PYBIND11_MODULE(_llama, m) {
-    InitializeF16Tables(); // This is pretty odd way to initialize global
-                           // states.
+namespace {
 
-    py::enum_<ggml_type>(m, "GGMLType")
-        .value("Q4_0", ggml_type::GGML_TYPE_Q4_0)
-        .value("Q4_1", ggml_type::GGML_TYPE_Q4_1)
-        .value("I8", ggml_type::GGML_TYPE_I8)
-        .value("I16", ggml_type::GGML_TYPE_I16)
-        .value("I32", ggml_type::GGML_TYPE_I32)
-        .value("F16", ggml_type::GGML_TYPE_F16)
-        .value("F32", ggml_type::GGML_TYPE_F32)
-        .export_values();
+struct ContextDeleter {
+    void operator()(llama_context * ctx) const {
+        if (ctx != nullptr) {
+            llama_free(ctx);
+        }
+    }
+};
 
-    py::class_<llama::Tokenizer>(m, "Tokenizer")
-        .def("decode", &llama::Tokenizer::Decode)
-        .def("encode", &llama::Tokenizer::Encode)
-        .def_static("load", &llama::Tokenizer::Load);
+struct SamplerDeleter {
+    void operator()(llama_sampler * sampler) const {
+        if (sampler != nullptr) {
+            llama_sampler_free(sampler);
+        }
+    }
+};
 
-    py::class_<llama::LLaMA>(m, "LLaMA")
-        .def("calc_perplexity", &llama::LLaMA::CalcPerplexity)
-        .def("estimate_mem_per_token", &llama::LLaMA::EstimateMemPerToken)
-        .def("eval", &llama::LLaMA::Eval)
-        .def("get_tokenizer", &llama::LLaMA::GetTokenizer)
-        .def_static("load", &llama::LLaMA::Load);
+using ContextPtr = std::unique_ptr<llama_context, ContextDeleter>;
+using SamplerPtr = std::unique_ptr<llama_sampler, SamplerDeleter>;
 
-    m.def("sample_next_token", &llama::SampleNextToken);
+void load_backends_once() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        ggml_backend_load_all();
+    });
+}
 
-    m.def(
-        "quantize_model", &llama::QuantizeModel,
-        "Quantize checkpoint in GGLM format..\n"
-        "\n"
-        ":param src: Path to original checkpoint.\n"
-        ":param dst: Path to quantized checkpoint.\n"
-        ":param dtype: FP-type code: GGML_TYPE_Q4_0 (2), GGML_TYPE_Q4_1 (3).\n",
-        py::arg("src"), py::arg("dst"), py::arg("dtype"));
+std::string token_to_piece(const llama_vocab * vocab, llama_token token) {
+    std::vector<char> buffer(256);
+    int32_t n = llama_token_to_piece(vocab, token, buffer.data(), static_cast<int32_t>(buffer.size()), 0, true);
+    if (n < 0) {
+        buffer.resize(static_cast<size_t>(-n));
+        n = llama_token_to_piece(vocab, token, buffer.data(), static_cast<int32_t>(buffer.size()), 0, true);
+    }
+    if (n < 0) {
+        throw std::runtime_error("llama_token_to_piece failed");
+    }
+    return std::string(buffer.data(), static_cast<size_t>(n));
+}
+
+class InfrastructureLlama {
+public:
+    InfrastructureLlama(
+            std::string model_path,
+            uint32_t n_ctx,
+            uint32_t n_batch,
+            int32_t n_gpu_layers)
+        : model_path_(std::move(model_path)),
+          n_ctx_(n_ctx),
+          n_batch_(n_batch) {
+        if (model_path_.empty()) {
+            throw std::invalid_argument("model_path must not be empty");
+        }
+        if (n_ctx_ == 0 || n_batch_ == 0) {
+            throw std::invalid_argument("n_ctx and n_batch must be greater than zero");
+        }
+
+        load_backends_once();
+
+        llama_model_params params = llama_model_default_params();
+        params.n_gpu_layers = n_gpu_layers;
+
+        model_ = llama_model_load_from_file(model_path_.c_str(), params);
+        if (model_ == nullptr) {
+            throw std::runtime_error("failed to load model: " + model_path_);
+        }
+
+        vocab_ = llama_model_get_vocab(model_);
+        if (vocab_ == nullptr) {
+            llama_model_free(model_);
+            model_ = nullptr;
+            throw std::runtime_error("model vocabulary is unavailable");
+        }
+    }
+
+    ~InfrastructureLlama() {
+        if (model_ != nullptr) {
+            llama_model_free(model_);
+        }
+    }
+
+    InfrastructureLlama(const InfrastructureLlama &) = delete;
+    InfrastructureLlama & operator=(const InfrastructureLlama &) = delete;
+
+    std::vector<llama_token> tokenize(
+            const std::string & text,
+            bool add_special,
+            bool parse_special) const {
+        const int32_t needed = -llama_tokenize(
+            vocab_, text.data(), static_cast<int32_t>(text.size()),
+            nullptr, 0, add_special, parse_special);
+
+        if (needed < 0) {
+            throw std::runtime_error("failed to determine token count");
+        }
+        if (needed == 0) {
+            return {};
+        }
+
+        std::vector<llama_token> tokens(static_cast<size_t>(needed));
+        const int32_t written = llama_tokenize(
+            vocab_, text.data(), static_cast<int32_t>(text.size()),
+            tokens.data(), static_cast<int32_t>(tokens.size()),
+            add_special, parse_special);
+        if (written < 0) {
+            throw std::runtime_error("llama_tokenize failed");
+        }
+        tokens.resize(static_cast<size_t>(written));
+        return tokens;
+    }
+
+    std::string generate(
+            const std::string & prompt,
+            int32_t max_tokens,
+            float temperature,
+            uint32_t seed) const {
+        if (max_tokens < 0) {
+            throw std::invalid_argument("max_tokens must be non-negative");
+        }
+
+        std::vector<llama_token> prompt_tokens = tokenize(prompt, true, true);
+        if (prompt_tokens.empty()) {
+            throw std::runtime_error("prompt produced no tokens");
+        }
+        if (prompt_tokens.size() + static_cast<size_t>(max_tokens) > n_ctx_) {
+            throw std::runtime_error("prompt + max_tokens exceeds configured n_ctx");
+        }
+
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx = n_ctx_;
+        ctx_params.n_batch = std::min<uint32_t>(
+            n_ctx_,
+            std::max<uint32_t>(n_batch_, static_cast<uint32_t>(prompt_tokens.size())));
+        ctx_params.no_perf = false;
+
+        ContextPtr ctx(llama_init_from_model(model_, ctx_params));
+        if (!ctx) {
+            throw std::runtime_error("failed to create llama_context");
+        }
+
+        SamplerPtr sampler(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        if (!sampler) {
+            throw std::runtime_error("failed to create sampler");
+        }
+
+        if (temperature <= 0.0f) {
+            llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
+        } else {
+            llama_sampler_chain_add(sampler.get(), llama_sampler_init_temp(temperature));
+            llama_sampler_chain_add(sampler.get(), llama_sampler_init_dist(seed));
+        }
+
+        llama_batch batch = llama_batch_get_one(
+            prompt_tokens.data(), static_cast<int32_t>(prompt_tokens.size()));
+
+        std::string output;
+        llama_token next_token = LLAMA_TOKEN_NULL;
+
+        for (int32_t i = 0; i < max_tokens; ++i) {
+            const int decode_status = llama_decode(ctx.get(), batch);
+            if (decode_status != 0) {
+                throw std::runtime_error("llama_decode failed with code " + std::to_string(decode_status));
+            }
+
+            next_token = llama_sampler_sample(sampler.get(), ctx.get(), -1);
+            if (llama_vocab_is_eog(vocab_, next_token)) {
+                break;
+            }
+
+            output += token_to_piece(vocab_, next_token);
+            batch = llama_batch_get_one(&next_token, 1);
+        }
+
+        return output;
+    }
+
+    const std::string & model_path() const {
+        return model_path_;
+    }
+
+    uint32_t n_ctx() const {
+        return n_ctx_;
+    }
+
+    uint32_t n_batch() const {
+        return n_batch_;
+    }
+
+private:
+    std::string model_path_;
+    uint32_t n_ctx_;
+    uint32_t n_batch_;
+    llama_model * model_ = nullptr;
+    const llama_vocab * vocab_ = nullptr;
+};
+
+} // namespace
+
+PYBIND11_MODULE(_infrastructure, m) {
+    m.doc() = "Python API for the Infrastructure_GEMMA3 llama.cpp runtime";
+
+    py::class_<InfrastructureLlama>(m, "Llama")
+        .def(py::init<std::string, uint32_t, uint32_t, int32_t>(),
+             py::arg("model_path"),
+             py::arg("n_ctx") = 4096,
+             py::arg("n_batch") = 512,
+             py::arg("n_gpu_layers") = 0)
+        .def("generate", &InfrastructureLlama::generate,
+             py::arg("prompt"),
+             py::arg("max_tokens") = 128,
+             py::arg("temperature") = 0.0f,
+             py::arg("seed") = 1,
+             py::call_guard<py::gil_scoped_release>())
+        .def("tokenize", &InfrastructureLlama::tokenize,
+             py::arg("text"),
+             py::arg("add_special") = true,
+             py::arg("parse_special") = true)
+        .def_property_readonly("model_path", &InfrastructureLlama::model_path)
+        .def_property_readonly("n_ctx", &InfrastructureLlama::n_ctx)
+        .def_property_readonly("n_batch", &InfrastructureLlama::n_batch);
 }
