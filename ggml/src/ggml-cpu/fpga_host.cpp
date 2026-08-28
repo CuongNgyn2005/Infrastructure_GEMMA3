@@ -852,8 +852,8 @@ typedef struct {
 
 static fpga_weight_path_bench_trace_t g_weight_path_bench = {};
 // This is set by the mapper that created g_ddr, not inferred later from a
-// display string or the O_SYNC open flag.  P2's no-msync policy is legal only
-// for the bounded physical UIO mapping it has admitted.
+// display string or the O_SYNC open flag.  P2's no-msync policy is legal for an admitted bounded physical
+// mapping: exact UIO is preferred, with /dev/mem compatibility using O_SYNC.
 static fpga_mapping_kind                      g_ddr_mapping_kind = fpga_mapping_kind::UNKNOWN;
 static pthread_mutex_t                        g_mutex            = PTHREAD_MUTEX_INITIALIZER;
 static fpga_scratch_t                         g_scratch;
@@ -3310,7 +3310,7 @@ static bool map_region_prefer_uio(const char *        uio_name,
 }
 
 static bool map_registers_dma_ddr(void) {
-    fpga_p2_init_breadcrumb("phase=mapping_zdma begin policy=uio_only");
+    fpga_p2_init_breadcrumb("phase=mapping_zdma begin policy=uio_preferred");
     if (!map_region_prefer_uio("dma-controller", "FPGA_DMA_UIO", DMA_BASE_PHYS, DMA_MMAP_SIZE, sizeof(dma_ctrl), sizeof(dma_ctrl), "ZDMA",
                                0, g_allow_devmem_fallback, "uio_required", &g_dma_map_base, &g_dma_map_size, nullptr,
                                &g_dma_map_source, nullptr)) {
@@ -3323,7 +3323,7 @@ static bool map_registers_dma_ddr(void) {
     // driver uses only the established 4 MiB register/local-memory ABI, so
     // never turn an advertised UIO size into a larger process mapping.
     fpga_p2_init_breadcrumb(
-        "phase=mapping_my_ip begin required_phys=0x%llx required_offset=0 required_size=0x%zx policy=uio_only",
+        "phase=mapping_my_ip begin required_phys=0x%llx required_offset=0 required_size=0x%zx policy=uio_preferred",
         (unsigned long long) REG_BASE_PHYS, VPU_DEVMEM_COMPAT_MMAP);
     if (!map_region_prefer_uio("MY_IP", "FPGA_VPU_UIO", REG_BASE_PHYS, VPU_DEVMEM_COMPAT_MMAP, VPU_DEVMEM_COMPAT_MMAP, VPU_DEVMEM_COMPAT_MMAP,
                                "MY_IP/VPU", VPU_DEVMEM_COMPAT_MMAP,
@@ -3337,7 +3337,7 @@ static bool map_registers_dma_ddr(void) {
                             g_vpu_map_source.c_str(), (unsigned long long) REG_BASE_PHYS, g_vpu_map_size);
 
     fpga_p2_init_breadcrumb(
-        "phase=mapping_ddr begin policy=uio_only "
+        "phase=mapping_ddr begin policy=uio_preferred "
         "phys=[0x%llx,0x%llx) required_size=0x%zx",
         (unsigned long long) DDR_BASE_PHYS, (unsigned long long) DDR_END_EXCLUSIVE, DDR_REQUIRED_BYTES);
     if (!fpga_ddr_iomem_preflight()) {
@@ -3638,11 +3638,13 @@ static bool msync_ddr_range(uint32_t off, size_t bytes, bool invalidate, const c
 }
 
 // Defined with the staging helpers below.  P2 uses this exact bounded
-// first/last-word readback after CPU writes to a physical UIO DDR aperture.
+// first/last-word readback after CPU writes to an admitted physical DDR aperture.
 static void fpga_ddr_staging_readback_commit(uint32_t off, size_t bytes);
 
-static bool p2_uio_ddr_mapping_active(void) {
-    return g_p2_init_requested && g_ddr_mapping_kind == fpga_mapping_kind::UIO_PHYSICAL;
+static bool p2_physical_ddr_mapping_active(void) {
+    return g_p2_init_requested &&
+           (g_ddr_mapping_kind == fpga_mapping_kind::UIO_PHYSICAL ||
+            (g_allow_devmem_fallback && g_ddr_mapping_kind == fpga_mapping_kind::DEVMEM_PHYSICAL));
 }
 
 static bool p2_msync_or_stress_requested(void) {
@@ -3675,10 +3677,9 @@ static void fpga_p2_ddr_sync_breadcrumb(const char * tag,
 // `msync()` is a file-backed writeback primitive, not a DMA-coherency
 // primitive for the physical pages exposed by generic-uio.  The owner trace
 // proves this syscall can hang before the first ZDMA descriptor is touched.
-// P2 admits only the explicit UIO mapping class and uses a bounded volatile
-// readback plus DSB for CPU-to-device, or a DSB before CPU consumption after a
-// completed device-to-CPU transfer.  Raw v52/C0 continues through the legacy
-// msync path unchanged.
+// P2 prefers the explicit UIO mapping class. For the fixed board contract,
+// bounded /dev/mem(O_SYNC) compatibility uses the same volatile readback + DSB
+// ordering and still avoids msync. Raw v52/C0 keeps the legacy msync path.
 static bool fpga_p2_ddr_sync(uint32_t off, size_t bytes, bool device_to_cpu, const char * tag) {
     if (!g_p2_init_requested) {
         return msync_ddr_range(off, bytes, device_to_cpu, tag);
@@ -3688,16 +3689,16 @@ static bool fpga_p2_ddr_sync(uint32_t off, size_t bytes, bool device_to_cpu, con
              g_ddr_map_size);
         return false;
     }
-    if (!p2_uio_ddr_mapping_active()) {
+    if (!p2_physical_ddr_mapping_active()) {
         LOGE(
-            "P2 DDR sync requires an explicit physical UIO fpga_ddr_low mapping tag=%s map_kind=%s; refusing before "
+            "P2 DDR sync requires an admitted physical fpga_ddr_low mapping tag=%s map_kind=%s; refusing before "
             "data-plane transfer",
             tag ? tag : "?", fpga_mapping_kind_name(g_ddr_mapping_kind));
         return false;
     }
     if (p2_msync_or_stress_requested()) {
         LOGE(
-            "P2 rejects FPGA_STRICT_COHERENCY/FPGA_STRICT_MSYNC/FPGA_COHERENCY_STRESS for physical UIO fpga_ddr_low "
+            "P2 rejects FPGA_STRICT_COHERENCY/FPGA_STRICT_MSYNC/FPGA_COHERENCY_STRESS for admitted physical fpga_ddr_low "
             "tag=%s; no msync syscall or data-plane transfer was issued",
             tag ? tag : "?");
         return false;
@@ -10730,13 +10731,16 @@ int fpga_init(void) {
     g_allow_vpu_devmem_compat =
         !env_flag_enabled("FPGA_VPU_UIO_REQUIRED") && !env_flag_disabled("FPGA_VPU_DEVMEM_COMPAT");
     if (g_p2_init_requested) {
-        // P2 owns SPU_PARAM/SPU_OUT and must not use a compatibility MY_IP
-        // mapping.  This also rejects a diagnostic all-resource /dev/mem
-        // policy instead of permitting P2 to inherit it from raw v52.
-        g_allow_devmem_fallback   = false;
+        // Prefer exact UIO resources when Linux exposes them. If they are
+        // absent, the fixed ZCU104 board contract may use bounded /dev/mem
+        // mappings. DDR still passes the /proc/iomem System RAM overlap
+        // preflight before any direct mapping or data-plane transfer.
+        const bool p2_devmem_compat = !env_flag_disabled("FPGA_P2_DEVMEM_COMPAT");
+        g_allow_devmem_fallback = g_allow_devmem_fallback || p2_devmem_compat;
         g_allow_vpu_devmem_compat = false;
         fpga_p2_init_breadcrumb(
-            "phase=config_loader_gate policy=p2_uio_only my_ip_phys=0x%llx my_ip_offset=0 my_ip_required_size=0x%zx",
+            "phase=config_loader_gate policy=%s my_ip_phys=0x%llx my_ip_offset=0 my_ip_required_size=0x%zx",
+            g_allow_devmem_fallback ? "p2_uio_preferred_devmem_compat" : "p2_uio_only",
             (unsigned long long) REG_BASE_PHYS, VPU_DEVMEM_COMPAT_MMAP);
         if (g_weight_cache_enabled) {
             fpga_fatal(
@@ -11015,10 +11019,12 @@ int fpga_init(void) {
     if (!map_registers_dma_ddr()) {
         fpga_fatal("ZDMA DDR-to-IP FPGA init failed; refusing CPU fallback");
     }
-    if (g_p2_init_requested && g_ddr_mapping_kind != fpga_mapping_kind::UIO_PHYSICAL) {
+    if (g_p2_init_requested &&
+        g_ddr_mapping_kind != fpga_mapping_kind::UIO_PHYSICAL &&
+        !(g_allow_devmem_fallback && g_ddr_mapping_kind == fpga_mapping_kind::DEVMEM_PHYSICAL)) {
         fpga_fatal(
-            "P2 requires the verified physical UIO fpga_ddr_low mapping; map_kind=%s. No ZDMA initialization or data-plane "
-            "transfer was issued",
+            "P2 requires a verified physical UIO mapping or admitted bounded /dev/mem mapping; map_kind=%s. "
+            "No ZDMA initialization or data-plane transfer was issued",
             fpga_mapping_kind_name(g_ddr_mapping_kind));
     }
     fpga_p2_init_breadcrumb("phase=mapping pass my_ip_source=%s my_ip_size=0x%zx", g_vpu_map_source.c_str(),
