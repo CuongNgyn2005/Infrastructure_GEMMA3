@@ -1,0 +1,114 @@
+name: Apply P2 devmem compatibility patch
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/patch-p2-devmem-compat.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Patch fpga_host.cpp
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('ggml/src/ggml-cpu/fpga_host.cpp')
+          text = path.read_text()
+
+          def sub_once(pattern, replacement, label, flags=0):
+              global text
+              text, count = re.subn(pattern, replacement, text, count=1, flags=flags)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected exactly one replacement, got {count}')
+
+          sub_once(
+              r'''static bool p2_uio_ddr_mapping_active\(void\) \{\n    return g_p2_init_requested && g_ddr_mapping_kind == fpga_mapping_kind::UIO_PHYSICAL;\n\}''',
+              '''static bool p2_physical_ddr_mapping_active(void) {
+    return g_p2_init_requested &&
+           (g_ddr_mapping_kind == fpga_mapping_kind::UIO_PHYSICAL ||
+            (g_allow_devmem_fallback && g_ddr_mapping_kind == fpga_mapping_kind::DEVMEM_PHYSICAL));
+}''',
+              'P2 DDR mapping admission helper')
+
+          sub_once(
+              r'''    if \(g_p2_init_requested\) \{\n        // P2 owns SPU_PARAM/SPU_OUT and must not use a compatibility MY_IP\n        // mapping\.  This also rejects a diagnostic all-resource /dev/mem\n        // policy instead of permitting P2 to inherit it from raw v52\.\n        g_allow_devmem_fallback   = false;\n        g_allow_vpu_devmem_compat = false;\n        fpga_p2_init_breadcrumb\(\n            "phase=config_loader_gate policy=p2_uio_only my_ip_phys=0x%llx my_ip_offset=0 my_ip_required_size=0x%zx",\n            \(unsigned long long\) REG_BASE_PHYS, VPU_DEVMEM_COMPAT_MMAP\);''',
+              '''    if (g_p2_init_requested) {
+        // Prefer exact UIO resources when Linux exposes them.  If they are
+        // absent, the fixed ZCU104 board contract may use bounded /dev/mem
+        // mappings.  DDR still passes the /proc/iomem System RAM overlap
+        // preflight before any direct mapping or data-plane transfer.
+        const bool p2_devmem_compat = !env_flag_disabled("FPGA_P2_DEVMEM_COMPAT");
+        g_allow_devmem_fallback = g_allow_devmem_fallback || p2_devmem_compat;
+        g_allow_vpu_devmem_compat = false;
+        fpga_p2_init_breadcrumb(
+            "phase=config_loader_gate policy=%s my_ip_phys=0x%llx my_ip_offset=0 my_ip_required_size=0x%zx",
+            g_allow_devmem_fallback ? "p2_uio_preferred_devmem_compat" : "p2_uio_only",
+            (unsigned long long) REG_BASE_PHYS, VPU_DEVMEM_COMPAT_MMAP);''',
+              'P2 mapping policy')
+
+          sub_once(
+              r'''    if \(g_p2_init_requested && g_ddr_mapping_kind != fpga_mapping_kind::UIO_PHYSICAL\) \{\n        fpga_fatal\(\n            "P2 requires the verified physical UIO fpga_ddr_low mapping; map_kind=%s\. No ZDMA initialization or data-plane "\n            "transfer was issued",\n            fpga_mapping_kind_name\(g_ddr_mapping_kind\)\);\n    \}''',
+              '''    if (g_p2_init_requested &&
+        g_ddr_mapping_kind != fpga_mapping_kind::UIO_PHYSICAL &&
+        !(g_allow_devmem_fallback && g_ddr_mapping_kind == fpga_mapping_kind::DEVMEM_PHYSICAL)) {
+        fpga_fatal(
+            "P2 requires a verified physical UIO mapping or admitted bounded /dev/mem mapping; map_kind=%s. "
+            "No ZDMA initialization or data-plane transfer was issued",
+            fpga_mapping_kind_name(g_ddr_mapping_kind));
+    }''',
+              'P2 post-map admission')
+
+          replacements = {
+              'if (!p2_uio_ddr_mapping_active()) {': 'if (!p2_physical_ddr_mapping_active()) {',
+              'P2 DDR sync requires an explicit physical UIO fpga_ddr_low mapping tag=%s map_kind=%s; refusing before ': 'P2 DDR sync requires an admitted physical fpga_ddr_low mapping tag=%s map_kind=%s; refusing before ',
+              'P2 rejects FPGA_STRICT_COHERENCY/FPGA_STRICT_MSYNC/FPGA_COHERENCY_STRESS for physical UIO fpga_ddr_low ': 'P2 rejects FPGA_STRICT_COHERENCY/FPGA_STRICT_MSYNC/FPGA_COHERENCY_STRESS for admitted physical fpga_ddr_low ',
+              'phase=mapping_zdma begin policy=uio_only': 'phase=mapping_zdma begin policy=uio_preferred',
+              'required_size=0x%zx policy=uio_only': 'required_size=0x%zx policy=uio_preferred',
+              'phase=mapping_ddr begin policy=uio_only ': 'phase=mapping_ddr begin policy=uio_preferred ',
+              "P2's no-msync policy is legal only\n// for the bounded physical UIO mapping it has admitted.": "P2's no-msync policy is legal for an admitted bounded physical\n// mapping: exact UIO is preferred, with /dev/mem compatibility using O_SYNC.",
+              '// first/last-word readback after CPU writes to a physical UIO DDR aperture.': '// first/last-word readback after CPU writes to an admitted physical DDR aperture.',
+              '// P2 admits only the explicit UIO mapping class and uses a bounded volatile\n// readback plus DSB for CPU-to-device, or a DSB before CPU consumption after a\n// completed device-to-CPU transfer.  Raw v52/C0 continues through the legacy\n// msync path unchanged.': '// P2 prefers the explicit UIO mapping class.  For the fixed board contract,\n// bounded /dev/mem(O_SYNC) compatibility uses the same volatile readback + DSB\n// ordering and still avoids msync.  Raw v52/C0 keeps the legacy msync path.',
+          }
+
+          for old, new in replacements.items():
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'literal replacement expected once, got {count}: {old!r}')
+              text = text.replace(old, new, 1)
+
+          path.write_text(text)
+          PY
+
+      - name: Validate patch
+        shell: bash
+        run: |
+          git diff --check
+          grep -q 'static bool p2_physical_ddr_mapping_active' ggml/src/ggml-cpu/fpga_host.cpp
+          grep -q 'FPGA_P2_DEVMEM_COMPAT' ggml/src/ggml-cpu/fpga_host.cpp
+          grep -q 'fpga_mapping_kind::DEVMEM_PHYSICAL' ggml/src/ggml-cpu/fpga_host.cpp
+          if grep -q 'g_allow_devmem_fallback   = false;' ggml/src/ggml-cpu/fpga_host.cpp; then
+            echo 'old forced P2 devmem disable is still present' >&2
+            exit 1
+          fi
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add ggml/src/ggml-cpu/fpga_host.cpp
+          git commit -m 'fpga: allow bounded P2 devmem compatibility'
+          git push origin HEAD:main
