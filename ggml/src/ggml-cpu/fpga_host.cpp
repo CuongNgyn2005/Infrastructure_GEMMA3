@@ -1023,7 +1023,7 @@ static long long         g_p2_pack_serial_threshold_skips              = 0;
 static long long         g_p2_pack_main_us                             = 0;
 static long long         g_p2_pack_helper_service_us                   = 0;
 static long long         g_p2_pack_caller_wait_us                      = 0;
-static constexpr size_t  FPGA_P2_PACK_PARALLEL_MIN_BYTES               = 512U * 1024U;
+static constexpr size_t  FPGA_P2_PACK_PARALLEL_MIN_BYTES               = 256U * 1024U;
 
 // A task has no device ownership: it is a prevalidated, disjoint range of
 // volatile WEIGHT words in the already-admitted DDR mapping.  The caller owns
