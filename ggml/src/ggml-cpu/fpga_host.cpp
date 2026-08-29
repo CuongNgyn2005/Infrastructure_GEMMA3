@@ -9417,4 +9417,4 @@ extern "C" void fpga_reset_kv_cache(void) {
 }
 
 // Diagnostic implementation: deliberately outside the production flow above.
-#include "fpga_telemetry.cpp"
+#include "fpga_log.h"
