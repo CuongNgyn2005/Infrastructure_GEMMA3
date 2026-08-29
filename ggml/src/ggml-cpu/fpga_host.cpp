@@ -361,7 +361,7 @@ static_assert(P2_WEIGHT_RESIDENCY_INDEX_BUCKETS >= P2_WEIGHT_RESIDENCY_SLOT_CAPA
               "P2 residency index must not be smaller than its sealed-slot directory");
 static_assert((uint64_t) P2_WEIGHT_RESIDENCY_END - (uint64_t) WEIGHT_CACHE_BASE ==
                   (uint64_t) P2_WEIGHT_RESIDENCY_MAX_MB * 1024ULL * 1024ULL,
-              "P2 residency budget must remain inside [0x01000000,0x02000000)");
+              "P2 residency budget must remain inside [0x01000000,0x03000000)");
 // Avoid a repeated, unsupported msync only for cache payloads large enough to
 // make the call itself disruptive.  Per-tile scratch transfers retain v16's
 // conservative msync attempt even after a UIO driver reports EINVAL.
@@ -3477,8 +3477,7 @@ static bool configure_ddr_mapping_policy(void) {
     g_p2_weight_residency_budget_mb = 0;
     g_ddr_requested_map_size = align_up_size(DDR_REQUIRED_BYTES, (size_t) page_size);
     if (g_p2_weight_residency_requested) {
-        const long long residency_mb =
-            env_int64_value("FPGA_P2_WEIGHT_RESIDENCY_MB", P2_WEIGHT_RESIDENCY_MAX_MB, 1, P2_WEIGHT_RESIDENCY_MAX_MB);
+        const long long residency_mb = P2_WEIGHT_RESIDENCY_MAX_MB;
         const uint64_t required_bytes = (uint64_t) WEIGHT_CACHE_BASE + (uint64_t) residency_mb * 1024ULL * 1024ULL;
         if (required_bytes > DDR_REGION_SIZE) {
             LOGE("P2 residency range exceeds reserved DDR: budget_mb=%lld required=0x%llx region=0x%zx", residency_mb,
@@ -10663,25 +10662,19 @@ int fpga_init(void) {
     g_status_stderr        = env_flag_enabled("FPGA_STATUS_STDERR");
     g_trace_data_enabled   = env_flag_enabled("FPGA_TRACE_DATA");
     g_weight_cache_enabled = env_flag_enabled("FPGA_WEIGHT_CACHE");
-    const bool p2_weight_residency_env_requested = env_flag_enabled("FPGA_P2_WEIGHT_RESIDENCY");
+    const bool p2_weight_residency_env_requested = true;
     g_p2_weight_residency_diagnostic = env_flag_enabled("FPGA_P2_WEIGHT_RESIDENCY_DIAGNOSTIC");
     g_p2_weight_residency_env_requested = p2_weight_residency_env_requested;
-    // Residency has only low-coverage board evidence.  A lone request must
-    // not enlarge the physical UIO map or change normal 4 MiB direct staging.
-    // The diagnostic flag is intentionally separate so accidental deployment
-    // of an old residency environment remains production-safe.
-    g_p2_weight_residency_requested = p2_weight_residency_env_requested && g_p2_weight_residency_diagnostic;
+    // Board-qualified production policy: P2 residency is always requested.
+    // FPGA_P2_WEIGHT_RESIDENCY_DIAGNOSTIC remains an independent opt-in for
+    // qualification/diagnostic behavior and does not gate residency admission.
+    g_p2_weight_residency_requested = true;
     if (g_p3_split_scale_requested && p2_weight_residency_env_requested) {
         fpga_fatal("FPGA_P3_SPLIT_SCALE=1 forbids FPGA_P2_WEIGHT_RESIDENCY; v79 has no immutable PL-bank scale cache");
     }
     g_p2_weight_residency_enabled   = false;
     g_p2_residency_trace_enabled    = env_flag_enabled("FPGA_P2_RESIDENCY_TRACE");
     g_p2_residency_verify_metadata  = env_flag_enabled("FPGA_P2_RESIDENCY_VERIFY_METADATA");
-    if (p2_weight_residency_env_requested && !g_p2_weight_residency_diagnostic) {
-        LOGINIT(
-            "P2_RESIDENCY_DISABLED reason=low_coverage_not_production requested=1 diagnostic=0 "
-            "action=direct_staging_4MiB_map");
-    }
     g_p2_resident_tiles.fill({});
     g_p2_residency_index.fill(P2_WEIGHT_RESIDENCY_NO_SLOT);
     g_p2_resident_tile_count = 0;
@@ -11227,9 +11220,10 @@ int fpga_init(void) {
         }
         g_p2_weight_residency_enabled = true;
         LOGINIT(
-            "P2_RESIDENCY_ADMISSION pass diagnostic=1 verify_metadata=%d epoch=%llu base_off=0x%08x range=[0x%llx,0x%llx) map_kind=%s slots=%zu index_buckets=%zu "
+            "P2_RESIDENCY_ADMISSION pass diagnostic=%d verify_metadata=%d epoch=%llu base_off=0x%08x range=[0x%llx,0x%llx) map_kind=%s slots=%zu index_buckets=%zu "
             "protocol=0x%08x bitstream_id=0x%08x p2_abi=0x%08x",
-            g_p2_residency_verify_metadata ? 1 : 0, (unsigned long long) g_p2_weight_residency_epoch, WEIGHT_CACHE_BASE,
+            g_p2_weight_residency_diagnostic ? 1 : 0, g_p2_residency_verify_metadata ? 1 : 0,
+            (unsigned long long) g_p2_weight_residency_epoch, WEIGHT_CACHE_BASE,
             (unsigned long long) (DDR_BASE_PHYS + WEIGHT_CACHE_BASE),
             (unsigned long long) (DDR_BASE_PHYS + expected_map), fpga_mapping_kind_name(g_ddr_mapping_kind),
             P2_WEIGHT_RESIDENCY_SLOT_CAPACITY, P2_WEIGHT_RESIDENCY_INDEX_BUCKETS,
