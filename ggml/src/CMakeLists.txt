@@ -422,6 +422,8 @@ if (USE_FPGA)
     target_compile_definitions(ggml-cpu PRIVATE USE_FPGA)
     target_sources(ggml-cpu PRIVATE
         ggml-cpu/fpga_host.cpp
+        ggml-cpu/fpga_q8_layout.cpp
+        ggml-cpu/fpga_q8_pack.cpp
     )
     target_link_libraries(ggml-cpu PRIVATE pthread)
 endif()

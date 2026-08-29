@@ -59,17 +59,6 @@ int fpga_contract_check_requested(void);
 void fpga_mark_model_tensor_validation_passed(void);
 int  fpga_model_tensor_validation_passed(void);
 
-// Legacy low-level API kept for link compatibility. The current DATN_RTL
-// bitstream uses the ggml tensor hook below.
-int fpga_run_matmul(
-    const float *    A,
-    const uint16_t * B_d,
-    const int8_t *   B_qs,
-    float *          C,
-    int M,
-    int K,
-    int N,
-    int ith);
 
 void fpga_set_context(int layer_id, int seq_pos, int is_attn);
 int  fpga_get_sequence_position(void);
