@@ -1,4 +1,5 @@
 #include "fpga_host.h"
+#include "fpga_log.h"
 #include "fpga_q8_layout.h"
 #include "fpga_q8_pack.h"
 
@@ -32,7 +33,6 @@
 #include <string>
 #include <vector>
 
-#define FPGA_LOG_FILE           "/tmp/fpga_debug.log"
 #define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v88-compact-telemetry"
 
 // Phase 6 is an intentionally small, line-oriented diagnostic capture.  This
@@ -58,7 +58,6 @@ static constexpr size_t   DDR_REGION_SIZE   = 0x0000000010000000ULL;  // 256 MiB
 static constexpr uint64_t DDR_END_EXCLUSIVE = DDR_BASE_PHYS + (uint64_t) DDR_REGION_SIZE;
 
 static int                g_log_flush_every                   = 256;
-static int                g_log_pending_lines                 = 0;
 // P2 has a separate MY_IP/SPU ABI and its initialization must be observable
 // on the terminal even when the file log is unavailable or buffered.
 static bool               g_p2_init_requested                 = false;
@@ -126,8 +125,6 @@ static bool               g_p2_first_act_dma_trace_done   = false;
 
 static void fpga_p2_init_breadcrumb(const char * fmt, ...);
 
-static FILE * fpga_log_fp(void);
-
 // A board stop can lose buffered /tmp/fpga_debug.log output.  P2 boundary
 // diagnostics therefore write the same marker to the debug log and terminal,
 // flushing both sinks before any following MMIO or DDR operation.
@@ -138,8 +135,6 @@ static void fpga_p2_dma_breadcrumb(const char * fmt, ...);
 static unsigned long long fpga_ptr_addr(const volatile void * ptr) {
     return (unsigned long long) reinterpret_cast<uintptr_t>(ptr);
 }
-
-static void fpga_log_finish_line(FILE * fp, bool force_flush);
 
 static void fpga_log_line(bool enabled, const char * tag, bool force_flush, const char * fmt, ...);
 
@@ -7899,6 +7894,7 @@ int fpga_init(void) {
         "v53 loader gate: FPGA_CONTRACT_CHECK and FPGA_PL_SCALE_CONTRACT_CHECK require a completed upstream GGUF "
         "tensor-validation handshake before this host maps MY_IP/ZDMA/DDRHIGH or launches a model VPU transfer.");
     g_log_flush_every               = env_int_value("FPGA_LOG_FLUSH_EVERY", 256, 1, 1000000);
+    fpga_log_set_flush_every(g_log_flush_every);
     g_profile_every                 = env_int_value("FPGA_PROFILE_EVERY", FPGA_DEFAULT_PROFILE_EVERY, 0, 1000000);
     g_ip_status_every               = env_int_value("FPGA_IP_STATUS_EVERY", FPGA_DEFAULT_STATUS_EVERY, 0, 1000000);
     g_detail_every                  = env_int_value("FPGA_DETAIL_EVERY", FPGA_DEFAULT_DETAIL_EVERY, 0, 1000000);
@@ -8978,6 +8974,7 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
         if (!g_q8_source_audit_mode_logged) {
             g_q8_source_audit_only = true;
             g_log_flush_every      = env_int_value("FPGA_LOG_FLUSH_EVERY", 256, 1, 1000000);
+            fpga_log_set_flush_every(g_log_flush_every);
             LOGI(
                 "Q8_SOURCE_AUDIT_MODE version=%s host_hardware_init=skipped board_mmio=not_mapped "
                 "zdma_selftests=not_run action=validate_q8_source_then_cpu_matmul",
@@ -9415,6 +9412,3 @@ extern "C" void fpga_reset_kv_cache(void) {
     g_current_seq_pos                = 0;
     g_scratch.activation_cache_valid = false;
 }
-
-// Diagnostic implementation: deliberately outside the production flow above.
-#include "fpga_log.h"

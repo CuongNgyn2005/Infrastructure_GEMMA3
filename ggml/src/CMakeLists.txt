@@ -422,8 +422,18 @@ if (USE_FPGA)
     target_compile_definitions(ggml-cpu PRIVATE USE_FPGA)
     target_sources(ggml-cpu PRIVATE
         ggml-cpu/fpga_host.cpp
+        ggml-cpu/fpga_log.cpp
         ggml-cpu/fpga_q8_layout.cpp
         ggml-cpu/fpga_q8_pack.cpp
+    )
+    set_target_properties(ggml-cpu PROPERTIES
+        UNITY_BUILD ON
+        UNITY_BUILD_MODE GROUP
+    )
+    set_source_files_properties(
+        ggml-cpu/fpga_host.cpp
+        ggml-cpu/fpga_log.cpp
+        PROPERTIES UNITY_GROUP fpga_host
     )
     target_link_libraries(ggml-cpu PRIVATE pthread)
 endif()
