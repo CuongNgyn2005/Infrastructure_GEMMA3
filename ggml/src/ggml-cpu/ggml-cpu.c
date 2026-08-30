@@ -53,7 +53,6 @@
 //#include "fpga_host.h"
 // XÓA DÒNG: #include "log.h" 
 // Thay thế macro log bằng fprintf để tránh lỗi
-#define FPGA_LOG_WARN(fmt, ...) fprintf(stderr, "[FPGA WARN] " fmt "\n", ##__VA_ARGS__)
 #endif
 // ===================================================================
 

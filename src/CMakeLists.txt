@@ -2,6 +2,7 @@ llama_add_compile_flags()
 
 # Option to enable the Linux /dev/mem FPGA host path from CMake command line.
 option(USE_FPGA "Enable FPGA host hooks via ggml-cpu /dev/mem" OFF)
+option(LLAMA_BUILD_PYTHON "Build the Infrastructure Python API" OFF)
 
 #
 # libraries
@@ -52,7 +53,12 @@ if (BUILD_SHARED_LIBS)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
 
-
 if (USE_FPGA)
     target_compile_definitions(llama PUBLIC USE_FPGA)
+endif()
+
+if (LLAMA_BUILD_PYTHON)
+    add_subdirectory(
+        "${CMAKE_CURRENT_SOURCE_DIR}/../llama.py"
+        "${CMAKE_CURRENT_BINARY_DIR}/llama-python")
 endif()
