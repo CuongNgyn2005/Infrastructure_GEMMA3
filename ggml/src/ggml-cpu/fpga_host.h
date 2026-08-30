@@ -24,7 +24,14 @@ struct fpga_perf_decode_data {
     int64_t scale_pack_us;
     int64_t zdma_descriptors;
     uint64_t zdma_bytes;
+    int64_t zdma_elapsed_us;
+    int64_t pingpong_handoffs;
+    int64_t pingpong_bank_jobs[2];
+    int64_t pingpong_prepare_overlap_us;
+    int64_t pingpong_prepare_late_us;
+    int64_t pingpong_prepare_late_jobs;
     int64_t preload_dma_us;
+    int64_t preload_overlap_us;
     int64_t preload_overlap_jobs;
     int64_t run_fpga_gemvs;
     int64_t run_q8_unavailable_cpu_fallbacks;

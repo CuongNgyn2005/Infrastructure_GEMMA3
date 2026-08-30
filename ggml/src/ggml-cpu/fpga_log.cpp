@@ -989,7 +989,15 @@ static bool fpga_token_timing_emit(int next_graph_seq,
         g_fpga_perf_decode.scale_pack_us += g_token_timing.prep_scale_pack_us;
         g_fpga_perf_decode.zdma_descriptors += g_token_timing.zdma_descriptors;
         g_fpga_perf_decode.zdma_bytes += g_token_timing.zdma_bytes;
+        g_fpga_perf_decode.zdma_elapsed_us += g_token_timing.zdma_elapsed_us;
+        g_fpga_perf_decode.pingpong_handoffs += g_token_timing.scheduler_handoffs;
+        g_fpga_perf_decode.pingpong_bank_jobs[0] += g_token_timing.bank_jobs[0];
+        g_fpga_perf_decode.pingpong_bank_jobs[1] += g_token_timing.bank_jobs[1];
+        g_fpga_perf_decode.pingpong_prepare_overlap_us += g_token_timing.scheduler_prepare_overlap_us;
+        g_fpga_perf_decode.pingpong_prepare_late_us += g_token_timing.scheduler_prepare_late_us;
+        g_fpga_perf_decode.pingpong_prepare_late_jobs += g_token_timing.scheduler_prepare_late_jobs;
         g_fpga_perf_decode.preload_dma_us += g_token_timing.preload_us;
+        g_fpga_perf_decode.preload_overlap_us += g_token_timing.scheduler_preload_overlap_us;
         g_fpga_perf_decode.preload_overlap_jobs += g_token_timing.scheduler_preload_overlap_jobs;
     }
     const bool sampled_detail = g_summary_detail_after_error ||

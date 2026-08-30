@@ -2766,13 +2766,24 @@ void llama_perf_context_print(const llama_context * ctx) {
 
     const double t_end_ms = 1e-3 * ggml_time_us();
 
-    LLAMA_LOG_INFO("%s:        load time = %10.2f ms\n", __func__, data.t_load_ms);
-    LLAMA_LOG_INFO("%s: prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
-            __func__, data.t_p_eval_ms, data.n_p_eval, data.t_p_eval_ms / data.n_p_eval, 1e3 / data.t_p_eval_ms * data.n_p_eval);
-    LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
-            __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
-    LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
-    LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+    LLAMA_LOG_INFO("\n--- Runtime Summary ---\n");
+    LLAMA_LOG_INFO("\n[Model]\n");
+    LLAMA_LOG_INFO("%-28s = %10.2f s\n", "Load time", data.t_load_ms / 1000.0);
+
+    LLAMA_LOG_INFO("\n[Prompt]\n");
+    LLAMA_LOG_INFO("%-28s = %10d\n", "Tokens", data.n_p_eval);
+    LLAMA_LOG_INFO("%-28s = %10.2f s\n", "Evaluation time", data.t_p_eval_ms / 1000.0);
+    LLAMA_LOG_INFO("%-28s = %10.2f tokens/s\n", "Evaluation speed", 1e3 / data.t_p_eval_ms * data.n_p_eval);
+
+    LLAMA_LOG_INFO("\n[Decode]\n");
+    LLAMA_LOG_INFO("%-28s = %10d\n", "Runs", data.n_eval);
+    LLAMA_LOG_INFO("%-28s = %10.2f s\n", "Evaluation time", data.t_eval_ms / 1000.0);
+    LLAMA_LOG_INFO("%-28s = %10.2f tokens/s\n", "Evaluation speed", 1e3 / data.t_eval_ms * data.n_eval);
+
+    LLAMA_LOG_INFO("\n[Overall]\n");
+    LLAMA_LOG_INFO("%-28s = %10.2f s\n", "Total time", (t_end_ms - data.t_start_ms) / 1000.0);
+    LLAMA_LOG_INFO("%-28s = %10d\n", "Total tokens", data.n_p_eval + data.n_eval);
+    LLAMA_LOG_INFO("%-28s = %10d\n", "Graphs reused", data.n_reused);
 }
 
 void llama_perf_context_reset(llama_context * ctx) {
