@@ -46,9 +46,29 @@ int g_pending_lines = 0;
 FILE * fpga_log_fp() {
     static FILE * fp = nullptr;
     if (!fp) {
-        fp = fopen(FPGA_LOG_FILE, "a");
+        // Opening an existing file with fopen("a") includes O_CREAT. Linux
+        // fs.protected_regular can reject that operation in sticky /tmp when
+        // root runs llama-cli against a log owned by the debian user. Open the
+        // existing file without O_CREAT first, then create it only if absent.
+        int fd = open(FPGA_LOG_FILE, O_WRONLY | O_APPEND | O_CLOEXEC);
+        if (fd < 0 && errno == ENOENT) {
+            fd = open(FPGA_LOG_FILE, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+        }
+        if (fd >= 0) {
+            fp = fdopen(fd, "a");
+            if (!fp) {
+                close(fd);
+            }
+        }
         if (!fp) {
-            fp = stderr;
+            const int open_errno = errno;
+            fprintf(stderr,
+                    "[FPGA][ERROR] cannot open %s; detailed FPGA telemetry is disabled: errno=%d (%s)\n",
+                    FPGA_LOG_FILE, open_errno, strerror(open_errno));
+            fp = fopen("/dev/null", "w");
+            if (!fp) {
+                fp = stderr;
+            }
         }
 
         const time_t now = time(nullptr);
