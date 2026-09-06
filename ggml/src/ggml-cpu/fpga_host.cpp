@@ -842,8 +842,8 @@ static bool     g_p2_input_preload_enabled      = false;
 // opt-in because even a host timestamp belongs outside the production fast
 // path unless the owner is actively measuring scheduler behavior.
 static bool     g_p1_sched_summary_enabled      = false;
-// FPGA_TOKEN_TIMING controls TOKEN_TIMING records. Aggregate collection stays
-// active when BOTTLENECK_SUMMARY or PINGPONG_TIMING needs the same counters.
+// FPGA_TOKEN_TIMING controls TIMING records. Aggregate collection stays active
+// when BREAKDOWN or PINGPONG_TIMING needs the same counters.
 static bool     g_token_timing_enabled           = false;
 static bool     g_token_timing_collection_enabled = false;
 static bool     g_pingpong_timing_enabled        = false;
@@ -3337,11 +3337,11 @@ static bool fpga_dma_copy_one(uint64_t src_phys, uint64_t dst_phys, size_t bytes
     }
 
     LOGDMA(
-        "tag=%s src=0x%llx dst=0x%llx bytes=%zu units=bytes ms=%.3f MiB/s=%.1f "
+        "tag=%s src=0x%llx dst=0x%llx bytes=%zu units=bytes ms=%.3f GB/s=%.3f "
         "completion=isr_ack_then_dma_done_and_ctrl2_en_clear status=0x%08x state=%u isr=0x%08x",
         tag ? tag : "?", (unsigned long long) src_phys, (unsigned long long) dst_phys, bytes,
         (double) (t1 - t0) / 1000.0,
-        (t1 > t0) ? (double) bytes * 1000000.0 / ((double) (t1 - t0) * 1024.0 * 1024.0) : 0.0, status, state, isr);
+        (t1 > t0) ? (double) bytes / ((double) (t1 - t0) * 1000.0) : 0.0, status, state, isr);
     return true;
 }
 
@@ -4113,7 +4113,7 @@ static void * fpga_p2_pack_worker_main(void *) {
         size_t written_words = 0U;
         const bool range_success = fpga_pack_direct_weight_pair_range(
             task.dst_words, task.src0, task.weight_data_base, task.row0, task.k_block0, task.rows,
-            task.group_blocks, task.group_beats, task.pair_begin, task.pair_end, &written_words);
+            task.group_blocks, task.group_beats, task.pair_begin, task.pair_end, true, &written_words);
         const bool success = range_success && written_words == task.expected_words;
         // Completion is never published before all volatile WEIGHT stores are
         // globally observed.  The caller performs its own DSB before DMA.
@@ -5013,10 +5013,10 @@ static bool fpga_weight_path_bench_host_self_test(void) {
     fpga_weight_path_bench_job_t job = {&tensor, blocks.data(), 64, 3, tensor.nb[0], tensor.nb[1],
                                         3 * 2 * sizeof(block_q8_0_t), 0, 3, 0, 2, 2 * VPU_BLOCK_BEATS, payload_bytes};
     std::vector<uint32_t> cached(payload_bytes / sizeof(uint32_t));
-    std::vector<uint32_t> direct(payload_bytes / sizeof(uint32_t));
+    std::vector<uint64_t> direct(payload_bytes / sizeof(uint64_t));
     size_t direct_words = 0U;
     const bool direct_ok = fpga_pack_direct_weight_pair_range((volatile uint32_t *) direct.data(), &tensor, blocks.data(),
-                                                               0, 0, 3, 2, 2 * VPU_BLOCK_BEATS, 0, 2, &direct_words);
+                                                               0, 0, 3, 2, 2 * VPU_BLOCK_BEATS, 0, 2, true, &direct_words);
     fpga_weight_path_bench_trace_t trace = {};
     trace.enabled                         = true;
     trace.graph_seq                       = 7;
@@ -5031,7 +5031,8 @@ static bool fpga_weight_path_bench_host_self_test(void) {
                                           trace.jobs.size() == 1U && trace.payload_bytes == 64U;
     const bool stale_sequence_resets = fpga_weight_path_bench_reset_required(trace, 8, 1) &&
                                        fpga_weight_path_bench_prepare_capture(&trace, 8, &lifecycle_reason, false);
-    return fpga_weight_path_bench_pack_cached(job, cached) && direct_ok && direct_words == direct.size() &&
+    return fpga_weight_path_bench_pack_cached(job, cached) && direct_ok &&
+           direct_words == payload_bytes / sizeof(uint32_t) &&
            memcmp(cached.data(), direct.data(), payload_bytes) == 0 && same_sequence_aggregates &&
            stale_sequence_resets && trace.graph_seq == 8 && trace.jobs.empty() && trace.payload_bytes == 0U &&
            trace.cached_payload.empty();
@@ -7635,7 +7636,7 @@ int fpga_init(void) {
             "cached_direct_bytes=identical "
             "stale_sequence_reset=1 same_sequence_aggregation=1");
         LOGINIT("WEIGHT_PATH_BENCH_MODE enabled=1 route=capture_m1_tiler_then_native_cpu replay_boundary=fpga_advance_sequence_position(1) "
-                "timing=one_warmup_plus_five_full_replays metrics=median_min_max_mib_s_bytes_jobs "
+                "timing=one_warmup_plus_five_full_replays metrics=median_min_max_gb_s_bytes_jobs "
                 "zdma=not_mapped dma_init=not_run register_writes=none dst_access=none");
         pthread_mutex_unlock(&g_mutex);
         return 0;
@@ -7718,15 +7719,15 @@ int fpga_init(void) {
     g_fpga_perf_decode = {};
     if (g_token_timing_collection_enabled) {
         LOGINIT(
-            "TOKEN_TIMING_CONFIG enabled=1 pingpong_detail=%d bottleneck_summary=%d output=/tmp/fpga_debug.log "
-            "token_boundary=fpga_advance_sequence_position host_to_ip=ACT_plus_WEIGHT_plus_SCALE "
-            "token_read=SPU_OUT_DMA_plus_host_result_read token_log=%d detail_every=%d",
+            "TIMING_CONFIG enabled=1 pingpong_detail=%d breakdown=%d output=/tmp/fpga_debug.log "
+            "graph_boundary=fpga_advance_sequence_position host_to_ip=ACT_plus_WEIGHT_plus_SCALE "
+            "result_read=SPU_OUT_DMA_plus_host_result_read graph_log=%d detail_every=%d",
             g_pingpong_timing_enabled ? 1 : 0, g_bottleneck_summary_enabled ? 1 : 0,
             g_token_timing_enabled ? 1 : 0, g_summary_detail_every);
     }
     if (g_bottleneck_summary_enabled) {
         LOGINIT(
-            "BOTTLENECK_SUMMARY_CONFIG enabled=1 mode=aggregate_per_graph_sequence per_tile_logs=0 "
+            "BREAKDOWN_CONFIG enabled=1 mode=aggregate_per_sequence per_tile_logs=0 "
             "metrics=prep_decomposition+scheduler_handoff+actual_preload_overlap+tensor_category+zdma_descriptors");
     }
     if (g_p3_split_scale_requested && p2_input_preload_enable_env) {
@@ -8711,10 +8712,10 @@ void fpga_cleanup(void) {
     const uint64_t p2_residency_remaining_bytes = p2_residency_allocated_bytes <= p2_residency_budget_bytes ?
                                                      p2_residency_budget_bytes - p2_residency_allocated_bytes :
                                                      0ULL;
-    const double p2_direct_weight_pack_mib_s =
+    const double p2_direct_weight_pack_gb_s =
         g_p2_residency_direct_weight_pack_us > 0 ?
-            (double) g_p2_residency_direct_weight_pack_bytes * 1000000.0 /
-                ((double) g_p2_residency_direct_weight_pack_us * 1024.0 * 1024.0) :
+            (double) g_p2_residency_direct_weight_pack_bytes /
+                ((double) g_p2_residency_direct_weight_pack_us * 1000.0) :
             0.0;
     LOGPROOF(
         "FPGA_GEMV_COVERAGE hook_calls=%lld q8_candidates=%lld q8_expected_fpga=%lld q8_hw_completed=%lld "
@@ -8755,7 +8756,7 @@ void fpga_cleanup(void) {
             "P2_RESIDENCY_SUMMARY forced=1 enabled=%d diagnostic=%d trace=%d verify_metadata=%d slots=%zu/%zu index_buckets=%zu max_probes=%zu probes=%lld "
             "probe_exhausted_direct_stage=%lld hits=%lld misses=%lld host_metadata_hits=%lld host_metadata_invalidations=%lld "
             "volatile_ddr_reads=%lld build_us=%lld select_us=%lld metadata_validate_us=%lld resident_param_us=%lld "
-            "direct_weight_pack_us=%lld direct_weight_pack_bytes=%llu direct_weight_pack_MiB_s=%.3f "
+            "direct_weight_pack_us=%lld direct_weight_pack_bytes=%llu direct_weight_pack_GB_s=%.3f "
             "avoided_cpu_pack_bytes=%lld avoided_ddr_to_ip_bytes=%lld "
             "miss_alignment=%lld miss_shape=%lld miss_collision=%lld miss_poison=%lld miss_stale=%lld miss_mismatch=%lld "
             "miss_capacity=%lld miss_quiescence=%lld miss_range=%lld miss_verify=%lld builds=%lld build_failures=%lld logical_bytes=%lld "
@@ -8768,7 +8769,7 @@ void fpga_cleanup(void) {
             g_p2_residency_volatile_ddr_reads, g_p2_residency_build_us, g_p2_residency_select_us,
             g_p2_residency_metadata_validate_us, g_p2_residency_resident_param_us,
             g_p2_residency_direct_weight_pack_us, (unsigned long long) g_p2_residency_direct_weight_pack_bytes,
-            p2_direct_weight_pack_mib_s, g_p2_residency_avoided_cpu_pack_bytes,
+            p2_direct_weight_pack_gb_s, g_p2_residency_avoided_cpu_pack_bytes,
             g_p2_residency_avoided_ddr_to_ip_bytes,
             g_p2_residency_miss_alignment, g_p2_residency_miss_shape, g_p2_residency_miss_collision,
             g_p2_residency_miss_poison, g_p2_residency_miss_stale, g_p2_residency_miss_mismatch,
@@ -8791,7 +8792,7 @@ void fpga_cleanup(void) {
         "p2_stream_errors=%lld p2_residency_enabled=%d p2_residency_slots=%zu/%zu p2_residency_builds=%lld "
         "p2_residency_hits=%lld p2_residency_direct_stage_misses=%lld p2_residency_build_failures=%lld "
         "p2_residency_logical_bytes=%lld p2_residency_allocated_bytes=%llu p2_residency_remaining_bytes=%llu "
-        "p2_direct_weight_pack_bytes=%llu p2_direct_weight_pack_ms=%.3f p2_direct_weight_pack_MiB_s=%.3f",
+        "p2_direct_weight_pack_bytes=%llu p2_direct_weight_pack_ms=%.3f p2_direct_weight_pack_GB_s=%.3f",
         g_fpga_count, g_fpga_vpu_runs, g_reject_count, g_attention_bypass_count, g_vocab_projection_bypass_count,
         g_legacy_raw_cpu_bypass_count, elapsed_us > 0 ? (double) elapsed_us / 1000000.0 : 0.0,
         g_vpu_pingpong_supported ? 1 : 0, g_vpu_descriptor_supported ? 1 : 0, g_pingpong_scheduler_enabled ? 1 : 0,
@@ -8809,7 +8810,7 @@ void fpga_cleanup(void) {
         g_p2_residency_misses, g_p2_residency_build_failures, g_p2_residency_logical_bytes,
         (unsigned long long) p2_residency_allocated_bytes, (unsigned long long) p2_residency_remaining_bytes,
         (unsigned long long) g_p2_residency_direct_weight_pack_bytes,
-        (double) g_p2_residency_direct_weight_pack_us / 1000.0, p2_direct_weight_pack_mib_s);
+        (double) g_p2_residency_direct_weight_pack_us / 1000.0, p2_direct_weight_pack_gb_s);
     fflush(fpga_log_fp());
     pthread_mutex_unlock(&g_mutex);
 }
@@ -9363,7 +9364,7 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
     const size_t effective_bytes =
         totals.activation_bytes + totals.weight_bytes + totals.scale_bytes + totals.result_bytes;
     const double gmac_s = total_ms > 0.0 ? (double) macs / (total_ms * 1000000.0) : 0.0;
-    const double mib_s  = total_ms > 0.0 ? (double) effective_bytes * 1000.0 / (total_ms * 1024.0 * 1024.0) : 0.0;
+    const double gb_s   = total_ms > 0.0 ? (double) effective_bytes / (total_ms * 1000000.0) : 0.0;
     const double cycles_per_run = (g_fpga_clock_mhz > 0.0 && totals.vpu_runs > 0) ?
                                       ((double) totals.ip_compute_us * g_fpga_clock_mhz / (double) totals.vpu_runs) :
                                       0.0;
@@ -9375,7 +9376,7 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
             "activation_scale_fp16_overflows=%lld dma_input_ms=%.3f act_dma_ms=%.3f weight_dma_ms=%.3f "
             "scale_dma_ms=%.3f ip_compute_ms=%.3f dma_output_ms=%.3f host_result_ms=%.3f host_accum_ms=%.3f "
             "p1_input_preload=%d p1_preload_jobs=%lld p1_preload_ms=%.3f p1_free_to_start_ms=%.3f "
-            "total_ms=%.3f dominant=%s pl_scale=%d raw_accum_fused=%d effective_GMAC/s=%.3f effective_MiB/s=%.1f "
+            "total_ms=%.3f dominant=%s pl_scale=%d raw_accum_fused=%d effective_GMAC/s=%.3f effective_GB/s=%.3f "
             "act_bytes=%zu weight_bytes=%zu scale_bytes=%zu result_bytes=%zu weight_cache_hits=%lld "
             "weight_cache_misses=%lld cycles_per_run=%.1f",
             tensor_name, effective_layer_id, seq_pos, decode_or_prefill(m), (long long) k, (long long) n, (long long) m,
@@ -9383,7 +9384,7 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
             prep_ms, cache_lookup_ms, cache_crc_ms, weight_pack_ms, totals.activation_scale_fp16_overflows, dma_in_ms,
             dma_act_ms, dma_weight_ms, dma_scale_ms, ip_ms, dma_out_ms, host_result_ms, host_accum_ms,
             g_p2_input_preload_enabled ? 1 : 0, totals.input_preload_jobs, preload_ms, preload_bubble_ms, total_ms,
-            dominant, g_spu_q8_scale_stream_supported ? 1 : 0, g_fuse_raw_result_accum ? 1 : 0, gmac_s, mib_s,
+            dominant, g_spu_q8_scale_stream_supported ? 1 : 0, g_fuse_raw_result_accum ? 1 : 0, gmac_s, gb_s,
             totals.activation_bytes, totals.weight_bytes, totals.scale_bytes, totals.result_bytes,
             totals.weight_cache_hits, totals.weight_cache_misses, cycles_per_run);
     }

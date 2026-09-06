@@ -19,4 +19,5 @@ bool fpga_pack_direct_weight_pair_range(
     int                        group_beats,
     size_t                     pair_begin,
     size_t                     pair_end,
+    bool                       wide_stores,
     size_t *                   written_words);

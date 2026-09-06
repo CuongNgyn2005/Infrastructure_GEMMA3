@@ -689,7 +689,7 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
             size_t main_words = 0U;
             const bool main_ok = fpga_pack_direct_weight_pair_range(
                 direct_weight_words, src0, weight_data_base, row0, k_block0, rows, group_blocks, group_beats,
-                0U, main_pair_end, &main_words);
+                0U, main_pair_end, true, &main_words);
             const long long main_pack_us = now_us() - main_pack0;
             // The caller publishes its prefix before it waits for the helper
             // and performs the existing full-WEIGHT coherency sequence.
@@ -720,7 +720,8 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
                 g_p2_pack_serial_threshold_skips++;
             }
             if (!fpga_pack_direct_weight_pair_range(direct_weight_words, src0, weight_data_base, row0, k_block0,
-                                                     rows, group_blocks, group_beats, 0U, pair_count, &written_words)) {
+                                                     rows, group_blocks, group_beats, 0U, pair_count, true,
+                                                     &written_words)) {
                 fpga_fatal(
                     "P2 direct WEIGHT serial pair-range pack failed job=%u tile=%u action=no_dma_no_start",
                     job.job_id, job.tile_id);
@@ -1029,9 +1030,9 @@ static bool fpga_token_timing_emit(int next_graph_seq,
 
     if (g_token_timing_enabled) {
         fpga_log_line(
-            true, "TOKEN_TIMING", force_flush,
+            true, "TIMING", force_flush,
             "graph_seq=%d next_graph_seq=%d ubatch_tokens=%lld scope=%s reason=%s matmuls=%lld vpu_runs=%lld "
-            "token_wall_ms=%.3f device_first_start_to_last_output_ready_ms=%.3f fpga_matmul_wall_sum_ms=%.3f "
+            "graph_wall_ms=%.3f device_first_start_to_last_output_ready_ms=%.3f fpga_matmul_wall_sum_ms=%.3f "
             "host_to_ip_dma_ms=%.3f act_dma_ms=%.3f weight_dma_ms=%.3f scale_dma_ms=%.3f preload_dma_ms=%.3f "
             "ping_h2ip_ms=%.3f pong_h2ip_ms=%.3f ping_jobs=%lld pong_jobs=%lld "
             "ip_compute_sum_ms=%.3f ping_compute_ms=%.3f pong_compute_ms=%.3f "
@@ -1076,8 +1077,8 @@ static bool fpga_token_timing_emit(int next_graph_seq,
                        0.0, 100.0) :
             0.0;
         fpga_log_line(
-            true, "BOTTLENECK_SUMMARY", force_flush,
-            "graph_seq=%d next_graph_seq=%d scope=%s token_wall_ms=%.3f matmul_wall_ms=%.3f "
+            true, "BREAKDOWN", force_flush,
+            "graph_seq=%d next_graph_seq=%d scope=%s graph_wall_ms=%.3f matmul_wall_ms=%.3f "
             "outside_matmul_ms=%.3f device_span_ms=%.3f ip_compute_ms=%.3f device_noncompute_ms=%.3f "
             "compute_util_pct=%.2f prep_total_ms=%.3f prep_weight_select_ms=%.3f "
             "prep_direct_weight_pack_ms=%.3f prep_scale_pack_ms=%.3f prep_act_pack_ms=%.3f prep_other_ms=%.3f "
@@ -1103,7 +1104,7 @@ static bool fpga_token_timing_emit(int next_graph_seq,
 
         if (sampled_detail) {
             fpga_log_line(
-                true, "BOTTLENECK_CATEGORY", force_flush,
+                true, "CATEGORY", force_flush,
                 "graph_seq=%d scope=%s "
                 "attn_matmuls=%lld attn_runs=%lld attn_wall_ms=%.3f attn_prep_ms=%.3f attn_compute_ms=%.3f attn_dma_ms=%.3f "
                 "gate_matmuls=%lld gate_runs=%lld gate_wall_ms=%.3f gate_prep_ms=%.3f gate_compute_ms=%.3f gate_dma_ms=%.3f "
@@ -1141,7 +1142,7 @@ static bool fpga_token_timing_emit(int next_graph_seq,
                                            (double) g_token_timing.zdma_elapsed_us / (double) g_token_timing.zdma_descriptors :
                                            0.0;
             fpga_log_line(
-                true, "BOTTLENECK_ZDMA", force_flush,
+                true, "ZDMA", force_flush,
                 "graph_seq=%d scope=%s descriptors=%lld bytes=%zu elapsed_ms=%.3f avg_descriptor_us=%.3f polls=%lld "
                 "zero_poll_descriptors=%lld saw_enabled_descriptors=%lld act_desc=%lld weight_desc=%lld scale_desc=%lld "
                 "result_desc=%lld other_desc=%lld max_descriptor_bytes=%zu",
@@ -2904,7 +2905,7 @@ static bool fpga_weight_path_bench_pack_cached(const fpga_weight_path_bench_job_
     size_t written_words = 0U;
     return fpga_pack_direct_weight_pair_range((volatile uint32_t *) cached_words.data(), job.src0, job.weight_data_base,
                                               job.row0, job.k_block0, job.rows, job.group_blocks, job.group_beats, 0U,
-                                              ((size_t) job.rows + 1U) / 2U, &written_words) &&
+                                              ((size_t) job.rows + 1U) / 2U, false, &written_words) &&
            written_words == job.payload_bytes / sizeof(uint32_t);
 }
 
@@ -2947,7 +2948,7 @@ static bool fpga_weight_path_bench_pack_uio(const fpga_weight_path_bench_job_t &
     size_t written_words = 0U;
     if (!fpga_pack_direct_weight_pair_range(dst, job.src0, job.weight_data_base, job.row0, job.k_block0, job.rows,
                                              job.group_blocks, job.group_beats, 0U, ((size_t) job.rows + 1U) / 2U,
-                                             &written_words) ||
+                                             true, &written_words) ||
         written_words != job.payload_bytes / sizeof(uint32_t)) {
         return false;
     }
@@ -3159,14 +3160,14 @@ static bool fpga_weight_path_bench_emit_phase(const char * name, fpga_weight_pat
     if (!fpga_weight_path_bench_stats(samples, &min_us, &median_us, &max_us)) {
         return false;
     }
-    const double mib_s = median_us > 0 ? (double) g_weight_path_bench.payload_bytes * 1000000.0 /
-                                             ((double) median_us * 1024.0 * 1024.0) :
-                                         0.0;
+    const double gb_s = median_us > 0 ?
+                            (double) g_weight_path_bench.payload_bytes / ((double) median_us * 1000.0) :
+                            0.0;
     LOGPROOF("WEIGHT_PATH_BENCH name=%s warmup=1 timed_replays=5 timing_scope=%s median_us=%lld min_us=%lld max_us=%lld "
-             "MiB_s=%.3f bytes=%llu jobs=%zu route=host_only_no_zdma_no_vpu_no_dst",
+             "GB_s=%.3f bytes=%llu jobs=%zu route=host_only_no_zdma_no_vpu_no_dst",
              name, phase == fpga_weight_path_bench_phase::STORE_UIO ? "sum_per_job_store_intervals_prepack_excluded" :
                                                                        "full_replay_elapsed",
-             median_us, min_us, max_us, mib_s, (unsigned long long) g_weight_path_bench.payload_bytes,
+             median_us, min_us, max_us, gb_s, (unsigned long long) g_weight_path_bench.payload_bytes,
              g_weight_path_bench.jobs.size());
     return true;
 }

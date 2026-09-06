@@ -20,7 +20,17 @@ static inline uint32_t pack_i8x4_le(const int8_t * lanes) {
            ((uint32_t) (uint8_t) lanes[3] << 24U);
 }
 
-static inline void store_i8x16_words(volatile uint32_t * dst, const int8_t * lanes) {
+static inline uint64_t pack_i8x8_le(const int8_t * lanes) {
+    return (uint64_t) pack_i8x4_le(lanes) | ((uint64_t) pack_i8x4_le(lanes + 4) << 32U);
+}
+
+static inline void store_i8x16_words(volatile uint32_t * dst, const int8_t * lanes, bool wide_stores) {
+    if (wide_stores) {
+        volatile uint64_t * const dst_u64 = reinterpret_cast<volatile uint64_t *>(dst);
+        dst_u64[0] = pack_i8x8_le(lanes + 0);
+        dst_u64[1] = pack_i8x8_le(lanes + 8);
+        return;
+    }
     dst[0] = pack_i8x4_le(lanes + 0);
     dst[1] = pack_i8x4_le(lanes + 4);
     dst[2] = pack_i8x4_le(lanes + 8);
@@ -49,8 +59,10 @@ bool fpga_pack_direct_weight_pair_range(
     int                        group_beats,
     size_t                     pair_begin,
     size_t                     pair_end,
+    bool                       wide_stores,
     size_t *                   written_words) {
-    if (!dst_words || !src0 || !weight_data_base || !written_words || rows <= 0 || group_blocks <= 0 ||
+    if (!dst_words || (wide_stores && ((uintptr_t) dst_words & (alignof(uint64_t) - 1U)) != 0U) || !src0 ||
+        !weight_data_base || !written_words || rows <= 0 || group_blocks <= 0 ||
         group_beats != group_blocks * kBlockBeats || pair_begin > pair_end ||
         pair_end > ((size_t) rows + 1U) / 2U) {
         return false;
@@ -80,11 +92,11 @@ bool fpga_pack_direct_weight_pair_range(
                                                   nullptr;
 
             for (int beat = 0; beat < kBlockBeats; ++beat) {
-                store_i8x16_words(out, even_wb->qs + beat * kNumLanes);
+                store_i8x16_words(out, even_wb->qs + beat * kNumLanes, wide_stores);
                 out += 4;
                 words += 4U;
 
-                store_i8x16_words(out, odd_wb ? odd_wb->qs + beat * kNumLanes : zero_i8x16);
+                store_i8x16_words(out, odd_wb ? odd_wb->qs + beat * kNumLanes : zero_i8x16, wide_stores);
                 out += 4;
                 words += 4U;
             }
