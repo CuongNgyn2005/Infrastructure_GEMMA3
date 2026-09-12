@@ -9397,27 +9397,31 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
     // store.  Every live entry is written exactly once; only the 0..3
     // unused lanes in the final 128-bit word are cleared.
     volatile uint32_t * const scale_words = ddr_checked_u32_ptr(SPU_PARAM_BASE, job.scale_bytes);
-    for (int row = 0; row < rows; ++row) {
-        for (int gb = 0; gb < group_blocks; ++gb) {
-            const size_t         linear = (size_t) row * (size_t) group_blocks + (size_t) gb;
-            const size_t         word   = linear / (size_t) VPU_RESULT_PACK_LANES;
-            const size_t         lane   = linear % (size_t) VPU_RESULT_PACK_LANES;
-            uint16_t weight_d = 0U;
-            if (job.p2_residency_hit) {
-                if (!fpga_p2_resident_scale_bits(job.p2_residency_slot,
-                                                 (size_t) row * (size_t) group_blocks + (size_t) gb, &weight_d)) {
-                    fpga_p2_residency_poison_slot(job.p2_residency_slot, "param_host_scale_read_invalid");
-                    LOGE("P2_RESIDENCY_HOST_METADATA_FAIL job=%u tile=%u slot=%u action=no_dma_no_start", job.job_id,
-                         job.tile_id, job.p2_residency_slot);
-                    return false;
-                }
-            } else {
-                const block_q8_0_t * wb =
-                    weight_block_from_base(src0, weight_data_base, row0 + row, k_block0 + gb);
-                weight_d = (uint16_t) wb->d;
+    volatile uint32_t * scale_out = scale_words;
+    if (job.p2_residency_hit) {
+        // The matmul lock keeps resident metadata stable throughout preparation.
+        // Validate the entire source before writing any scale entries.
+        if (job.p2_residency_slot >= g_p2_resident_tiles.size() ||
+            !fpga_p2_residency_host_metadata_shape_valid(g_p2_resident_tiles[job.p2_residency_slot]) ||
+            g_p2_resident_tiles[job.p2_residency_slot].scale_count != scale_shape.entries) {
+            fpga_p2_residency_poison_slot(job.p2_residency_slot, "param_host_scale_read_invalid");
+            LOGE("P2_RESIDENCY_HOST_METADATA_FAIL job=%u tile=%u slot=%u action=no_dma_no_start", job.job_id,
+                 job.tile_id, job.p2_residency_slot);
+            return false;
+        }
+        const uint16_t * weight_scale = g_p2_resident_tiles[job.p2_residency_slot].scale_bits.data();
+        for (int row = 0; row < rows; ++row) {
+            for (int gb = 0; gb < group_blocks; ++gb) {
+                *scale_out++ = fpga_p2_pack_scale_entry((uint16_t) act_group[gb].d, *weight_scale++);
             }
-            const uint32_t packed_scale = fpga_p2_pack_scale_entry((uint16_t) act_group[gb].d, weight_d);
-            scale_words[word * (size_t) VPU_RESULT_PACK_LANES + lane] = packed_scale;
+        }
+    } else {
+        for (int row = 0; row < rows; ++row) {
+            const block_q8_0_t * weight_row =
+                weight_block_from_base(src0, weight_data_base, row0 + row, k_block0);
+            for (int gb = 0; gb < group_blocks; ++gb) {
+                *scale_out++ = fpga_p2_pack_scale_entry((uint16_t) act_group[gb].d, (uint16_t) weight_row[gb].d);
+            }
         }
     }
     for (size_t linear = scale_shape.entries;
