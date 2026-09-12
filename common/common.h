@@ -612,6 +612,12 @@ struct common_init_result {
     llama_model_ptr   model;
     llama_context_ptr context;
 
+    // Non-overlapping initialization intervals, separate from llama's load
+    // statistic (which can include the first evaluation).
+    int64_t model_load_us = 0;
+    int64_t context_init_us = 0;
+    int64_t warmup_us = 0;
+
     std::vector<llama_adapter_lora_ptr> lora;
 };
 

@@ -5626,6 +5626,22 @@ static void p2_trace_set_job_context(const fpga_tile_job_t & job);
 
 static bool p2_trace_this_tile();
 
+// Owned by one row/block tile's prompt-column loop, never by a ping/pong
+// job slot. Only the direct WEIGHT_BASE payload is retained; ACT/PARAM and
+// all device transfers still belong to each individual job.
+struct fpga_prompt_weight_staging_t {
+    bool valid = false;
+    const ggml_tensor * src0 = nullptr;
+    const void * data = nullptr;
+    const void * ddr = nullptr;
+    int64_t row0 = 0;
+    int64_t k_block0 = 0;
+    int rows = 0;
+    int group_blocks = 0;
+    size_t bytes = 0;
+    uint64_t epoch = 0;
+};
+
 static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
                                      const struct ggml_tensor *        src0,
                                      const void *                      weight_data_base,
@@ -5639,7 +5655,8 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
                                      const fpga_weight_cache_entry_t * weight_cache,
                                      uint32_t                          tile_id,
                                      int                               bank,
-                                     fpga_stage_totals_t *             totals);
+                                     fpga_stage_totals_t *             totals,
+                                     fpga_prompt_weight_staging_t *    staging = nullptr);
 
 static void p2_trace_first_tile(const fpga_tile_job_t & job, const char * stage, const char * edge) {
     if (!p2_trace_this_tile()) {
@@ -6783,6 +6800,11 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
             const int group_blocks     = packed_q8_group_blocks_for_rows(rows, remaining_blocks);
             const int group_beats      = group_blocks * VPU_BLOCK_BEATS;
 
+            // No staging identity survives a tile/tensor transition or an
+            // error return. Submit completes source DMA before next prepare;
+            // drain only writes the disjoint result window. Contract/restage
+            // diagnostics use the separate single-bank path, not this loop.
+            fpga_prompt_weight_staging_t staging;
             for (int64_t col = 0; col < m; ++col) {
                 const int            bank      = (int) (tile_id & 1U);
                 fpga_tile_job_t &    prepared  = slots[bank];
@@ -6797,7 +6819,8 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                 }
 
                 if (!fpga_prepare_q8_tile_job(prepared, src0, src0->data, act_group, row0, rows, ib0, group_blocks, col,
-                                              weight_tile_index, weight_cache, tile_id, bank, totals)) {
+                                              weight_tile_index, weight_cache, tile_id, bank, totals,
+                                              m > 1 ? &staging : nullptr)) {
                     return false;
                 }
 
@@ -9082,7 +9105,17 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
                                      const fpga_weight_cache_entry_t * weight_cache,
                                      uint32_t                          tile_id,
                                      int                               bank,
-                                     fpga_stage_totals_t *             totals) {
+                                     fpga_stage_totals_t *             totals,
+                                     fpga_prompt_weight_staging_t *    staging) {
+    const bool reuse_direct_weight = staging && staging->valid &&
+        staging->src0 == src0 && staging->data == weight_data_base && staging->ddr == g_ddr &&
+        staging->row0 == row0 && staging->rows == rows && staging->k_block0 == k_block0 &&
+        staging->group_blocks == group_blocks && staging->epoch == g_p2_weight_residency_epoch;
+    if (staging) {
+        // Every early return leaves reuse invalid. Publish only after the
+        // pack helper and the existing final publication fence complete.
+        staging->valid = false;
+    }
     if (rows <= 0 || rows > g_vpu_max_rows || group_blocks <= 0) {
         LOGE("unsupported DMA-to-IP tiling case: rows=%d max_rows=%d group_blocks=%d", rows, g_vpu_max_rows,
              group_blocks);
@@ -9224,8 +9257,10 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
         totals->prep_weight_select_us += weight_select_us;
     }
 
-    const long long direct_weight_pack0 = !job.weight_cache_hit && !job.p2_residency_hit ? now_us() : 0;
-    if (!job.weight_cache_hit && !job.p2_residency_hit) {
+    const bool direct_source = !job.weight_cache_hit && !job.p2_residency_hit;
+    const bool direct_reused = direct_source && reuse_direct_weight && staging->bytes == weight_bytes;
+    const long long direct_weight_pack0 = direct_source && !direct_reused ? now_us() : 0;
+    if (direct_source && !direct_reused) {
         size_t direct_payload_bytes = 0;
         const size_t pair_count       = ((size_t) rows + 1U) / 2U;
         const size_t group_beats_size = (size_t) group_beats;
@@ -9424,6 +9459,18 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
         }
     }
     p2_event_trace(job, "PREP_DONE", event_prep_done, "prep_us", event_prep_done - event_prep0);
+    if (staging && direct_source) {
+        staging->src0 = src0;
+        staging->data = weight_data_base;
+        staging->ddr = g_ddr;
+        staging->row0 = row0;
+        staging->rows = rows;
+        staging->k_block0 = k_block0;
+        staging->group_blocks = group_blocks;
+        staging->bytes = weight_bytes;
+        staging->epoch = g_p2_weight_residency_epoch;
+        staging->valid = true;
+    }
     return true;
 }
 

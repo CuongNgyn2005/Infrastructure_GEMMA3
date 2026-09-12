@@ -9,6 +9,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "../ggml/src/ggml-cpu/fpga_log.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -108,7 +109,9 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
     model.t_start_us = tm.t_start_us;
 
     try {
+        fpga_log_load_checkpoint("metadata_begin");
         llama_model_loader ml(fname, splits, params.use_mmap, params.check_tensors, params.kv_overrides, params.tensor_buft_overrides);
+        fpga_log_load_checkpoint("metadata_done");
 
         ml.print_info();
 
@@ -125,7 +128,9 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
         try {
+            fpga_log_load_checkpoint("vocab_begin");
             model.load_vocab(ml);
+            fpga_log_load_checkpoint("vocab_done");
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
         }
@@ -138,10 +143,14 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
             return 0;
         }
 
+        fpga_log_load_checkpoint("tensors_begin");
         if (!model.load_tensors(ml)) {
+            fpga_log_load_checkpoint("tensors_cancelled");
             return -2;
         }
+        fpga_log_load_checkpoint("tensors_done");
     } catch (const std::exception & err) {
+        fpga_log_load_checkpoint("load_error");
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
         return -1;
     }

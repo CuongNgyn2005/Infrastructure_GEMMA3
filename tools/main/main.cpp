@@ -7,6 +7,7 @@
 #include "chat.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +21,9 @@
 
 #ifdef USE_FPGA
 #include "../../ggml/src/ggml-cpu/fpga_host.h"
+#include "../../ggml/src/ggml-cpu/fpga_log.h"
+#else
+static void fpga_log_latency(const char *, ...) {}
 #endif
 
 
@@ -223,6 +227,12 @@ static void sigint_handler(int signo) {
 #endif
 
 int main(int argc, char ** argv) {
+    // Independent of GGML timer initialization. Excludes process creation.
+    const auto timing_us = []() -> int64_t {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    const int64_t main_start_us = timing_us();
     common_params params;
     g_params = &params;
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_MAIN, print_usage)) {
@@ -280,6 +290,7 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: load the model and apply lora adapter, if any\n", __func__);
 
 
+    const int64_t fpga_init_start_us = timing_us();
 #ifdef USE_FPGA
     {
         // Đường dẫn này giờ vô nghĩa với code mới, nhưng cần để hàm ko lỗi
@@ -296,8 +307,15 @@ int main(int argc, char ** argv) {
         }
     }
 #endif
-   
+    const int64_t fpga_init_elapsed_us = timing_us() - fpga_init_start_us;
+
     common_init_result llama_init = common_init_from_params(params);
+
+    fpga_log_latency("[STARTUP_TIMING] fpga_init_call_ms=%.3f model_load_ms=%.3f context_init_ms=%.3f "
+            "warmup_ms=%.3f warmup_enabled=%d main_to_init_done_ms=%.3f",
+            fpga_init_elapsed_us / 1000.0, llama_init.model_load_us / 1000.0,
+            llama_init.context_init_us / 1000.0, llama_init.warmup_us / 1000.0,
+            params.warmup ? 1 : 0, (timing_us() - main_start_us) / 1000.0);
 
     model = llama_init.model.get();
     ctx = llama_init.context.get();
@@ -738,7 +756,18 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // Initial prompt timing starts with prepared input. Interactive timing
+    // starts after readline completes, excluding the user's typing time.
+    int64_t response_start_us = timing_us();
+    int64_t response_eval_us = 0;
+    int64_t first_sample_us = 0;
+    int64_t first_sample_call_us = 0;
+    int response_id = 0;
+    bool waiting_for_first_text = true;
+    const char * response_origin = "prepared_initial_prompt";
+
     if (llama_model_has_encoder(model)) {
+        const int64_t encode_start_us = timing_us();
         int enc_input_size = embd_inp.size();
         llama_token * enc_input_buf = embd_inp.data();
 
@@ -746,6 +775,7 @@ int main(int argc, char ** argv) {
             LOG_ERR("%s : failed to eval\n", __func__);
             return 1;
         }
+        response_eval_us += timing_us() - encode_start_us;
 
         llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
         if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
@@ -757,6 +787,7 @@ int main(int argc, char ** argv) {
     }
 
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
+        bool sampled_this_iteration = false;
         // predict
         if (!embd.empty()) {
             // Note: (n_ctx - 4) here is to match the logic for commandline prompt handling via
@@ -862,9 +893,13 @@ int main(int argc, char ** argv) {
 
                 LOG_DBG("eval: %s\n", string_from(ctx, embd).c_str());
 
+                const int64_t eval_start_us = first_sample_us == 0 ? timing_us() : 0;
                 if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
                     LOG_ERR("%s : failed to eval\n", __func__);
                     return 1;
+                }
+                if (first_sample_us == 0) {
+                    response_eval_us += timing_us() - eval_start_us;
                 }
 
                 n_past += n_eval;
@@ -897,7 +932,19 @@ int main(int argc, char ** argv) {
                 logit_trace_before_sample(ctx, vocab);
             }
 
+            const int64_t sample_start_us = first_sample_us == 0 ? timing_us() : 0;
             const llama_token id = common_sampler_sample(smpl, ctx, -1);
+            sampled_this_iteration = true;
+            if (first_sample_us == 0) {
+                first_sample_us = timing_us();
+                first_sample_call_us = first_sample_us - sample_start_us;
+                if (llama_vocab_is_eog(vocab, id)) {
+                    fpga_log_latency("[FIRST_RESPONSE_TIMING] response=%d origin=%s request_to_sample_ms=%.3f "
+                            "eval_calls_ms=%.3f sample_call_ms=%.3f first_sample_eog=1",
+                            response_id, response_origin, (first_sample_us - response_start_us) / 1000.0,
+                            response_eval_us / 1000.0, first_sample_call_us / 1000.0);
+                }
+            }
 
             if (logit_trace_enabled) {
                 LOG_INF("[LOGIT_TRACE] sampled id=%d eog=%d piece=%s\n",
@@ -943,6 +990,23 @@ int main(int argc, char ** argv) {
 
                 // Console/Stream Output
                 LOG("%s", token_str.c_str());
+
+                // Prompt echo (including one-token prompts) is not an answer.
+                // An empty/EOG piece is not the first response text either.
+                if (sampled_this_iteration && waiting_for_first_text &&
+                    !token_str.empty() && !llama_vocab_is_eog(vocab, id)) {
+                    const int64_t enqueue_done_us = timing_us();
+                    fpga_log_latency("[FIRST_RESPONSE_TIMING] response=%d origin=%s request_to_sample_ms=%.3f "
+                            "eval_calls_ms=%.3f sample_call_ms=%.3f request_to_enqueue_ms=%.3f "
+                            "first_sample_to_enqueue_ms=%.3f main_to_enqueue_ms=%.3f "
+                            "terminal_visible=not_measured",
+                            response_id, response_origin, (first_sample_us - response_start_us) / 1000.0,
+                            response_eval_us / 1000.0, first_sample_call_us / 1000.0,
+                            (enqueue_done_us - response_start_us) / 1000.0,
+                            (enqueue_done_us - first_sample_us) / 1000.0,
+                            (enqueue_done_us - main_start_us) / 1000.0);
+                    waiting_for_first_text = false;
+                }
 
                 // Record Displayed Tokens To Log
                 // Note: Generated tokens are created one by one hence this check
@@ -1068,6 +1132,14 @@ int main(int argc, char ** argv) {
                     another_line = console::readline(line, params.multiline_input);
                     buffer += line;
                 } while (another_line);
+
+                response_start_us = timing_us();
+                response_eval_us = 0;
+                first_sample_us = 0;
+                first_sample_call_us = 0;
+                waiting_for_first_text = true;
+                response_origin = "readline_complete";
+                ++response_id;
 
                 // done taking input, reset color
                 console::set_display(console::reset);

@@ -10,6 +10,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -896,10 +897,16 @@ std::string fs_get_cache_file(const std::string & filename) {
 //
 
 struct common_init_result common_init_from_params(common_params & params) {
+    const auto timing_us = []() -> int64_t {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
     common_init_result iparams;
     auto mparams = common_model_params_to_llama(params);
 
+    const int64_t model_load_start_us = timing_us();
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    iparams.model_load_us = timing_us() - model_load_start_us;
     if (model == NULL) {
         LOG_ERR("%s: failed to load model '%s', try reducing --n-gpu-layers if you're running out of VRAM\n",
             __func__, params.model.path.c_str());
@@ -910,7 +917,9 @@ struct common_init_result common_init_from_params(common_params & params) {
 
     auto cparams = common_context_params_to_llama(params);
 
+    const int64_t context_init_start_us = timing_us();
     llama_context * lctx = llama_init_from_model(model, cparams);
+    iparams.context_init_us = timing_us() - context_init_start_us;
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s', try reducing --n-gpu-layers if you're running out of VRAM\n",
             __func__, params.model.path.c_str());
@@ -1036,6 +1045,7 @@ struct common_init_result common_init_from_params(common_params & params) {
     if (params.warmup) {
         LOG_WRN("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
 
+        const int64_t warmup_start_us = timing_us();
         llama_set_warmup(lctx, true);
 
         std::vector<llama_token> tmp;
@@ -1069,6 +1079,7 @@ struct common_init_result common_init_from_params(common_params & params) {
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
         llama_set_warmup(lctx, false);
+        iparams.warmup_us = timing_us() - warmup_start_us;
     }
 
     iparams.model.reset(model);

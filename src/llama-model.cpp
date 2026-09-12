@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "../ggml/src/ggml-cpu/fpga_log.h"
 
 #include "llama-impl.h"
 #include "llama-mmap.h"
@@ -5865,7 +5866,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
 
+    fpga_log_load_checkpoint("mapping_begin");
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    fpga_log_load_checkpoint("mapping_done");
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -5952,6 +5955,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         ctx_bufs.emplace_back(ctx, buf_map);
     }
 
+    fpga_log_load_checkpoint("buffers_done");
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
 
@@ -5979,6 +5983,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
+    fpga_log_load_checkpoint("tensor_data_begin");
     for (auto & it : ctx_bufs) {
         ggml_context * ctx = it.first;
         auto & bufs = it.second;
@@ -5987,6 +5992,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    fpga_log_load_checkpoint("tensor_data_done");
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));

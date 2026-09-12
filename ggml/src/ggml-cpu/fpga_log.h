@@ -9,3 +9,10 @@ FILE * fpga_log_fp();
 void   fpga_log_set_flush_every(int flush_every);
 void   fpga_log_finish_line(FILE * fp, bool force_flush);
 void   fpga_log_vline(const char * tag, bool force_flush, const char * fmt, va_list ap);
+// Coarse CLI latency records are file-only, even if the sink failed to open.
+void   fpga_log_latency(const char * fmt, ...);
+#ifdef USE_FPGA
+void   fpga_log_load_checkpoint(const char * phase);
+#else
+inline void fpga_log_load_checkpoint(const char *) {}
+#endif

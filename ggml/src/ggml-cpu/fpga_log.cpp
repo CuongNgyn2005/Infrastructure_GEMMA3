@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/resource.h>
 
 namespace {
 
@@ -72,3 +74,42 @@ void fpga_log_vline(const char * tag, bool force_flush, const char * fmt, va_lis
     fputc('\n', fp);
     fpga_log_finish_line(fp, force_flush);
 }
+
+void fpga_log_latency(const char * fmt, ...) {
+    if (fpga_log_fp() == stderr) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    fpga_log_vline("LATENCY", true, fmt, ap);
+    va_end(ap);
+}
+
+#ifdef USE_FPGA
+void fpga_log_load_checkpoint(const char * phase) {
+    // Startup-only snapshots. Counters are process cumulative; subtract
+    // adjacent records for a phase. No per-tensor/per-token instrumentation.
+    const auto now = std::chrono::steady_clock::now();
+    static const auto origin = now;
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(now - origin).count();
+    struct rusage usage = {};
+    const bool usage_ok = getrusage(RUSAGE_SELF, &usage) == 0;
+    const double user_ms = usage_ok ? usage.ru_utime.tv_sec * 1000.0 + usage.ru_utime.tv_usec / 1000.0 : -1;
+    const double system_ms = usage_ok ? usage.ru_stime.tv_sec * 1000.0 + usage.ru_stime.tv_usec / 1000.0 : -1;
+    long long read_bytes = -1;
+    FILE * io = fopen("/proc/self/io", "r");
+    if (io) {
+        char line[128];
+        while (fgets(line, sizeof(line), io)) {
+            if (sscanf(line, "read_bytes: %lld", &read_bytes) == 1) break;
+        }
+        fclose(io);
+    }
+    fpga_log_latency("[MODEL_LOAD_DETAIL] phase=%s elapsed_ms=%.3f user_cpu_ms=%.3f system_cpu_ms=%.3f "
+                     "minor_faults=%ld major_faults=%ld block_inputs=%ld read_bytes=%lld "
+                     "max_rss_kib=%ld counters=process_cumulative unavailable=-1",
+                     phase, elapsed_ms, user_ms, system_ms,
+                     usage_ok ? usage.ru_minflt : -1L, usage_ok ? usage.ru_majflt : -1L,
+                     usage_ok ? usage.ru_inblock : -1L, read_bytes, usage_ok ? usage.ru_maxrss : -1L);
+}
+#endif
