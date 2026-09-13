@@ -227,6 +227,21 @@ static void sigint_handler(int signo) {
 #endif
 
 int main(int argc, char ** argv) {
+#if defined(USE_FPGA) && defined(__linux__)
+    // OpenMP may read its environment in a shared-library constructor before
+    // main. Re-exec once so the FPGA default is present when the runtime loads.
+    // Do this before parsing, model loading, thread creation, or hardware access.
+    // An explicit owner policy is preserved and also prevents a restart loop.
+    if (std::getenv("OMP_WAIT_POLICY") == nullptr) {
+        if (setenv("OMP_WAIT_POLICY", "PASSIVE", 0) != 0) {
+            std::perror("llama-cli: cannot set default OMP_WAIT_POLICY");
+            return EXIT_FAILURE;
+        }
+        execv("/proc/self/exe", argv);
+        std::perror("llama-cli: cannot restart with passive OpenMP waiting");
+        return EXIT_FAILURE;
+    }
+#endif
     // Independent of GGML timer initialization. Excludes process creation.
     const auto timing_us = []() -> int64_t {
         return std::chrono::duration_cast<std::chrono::microseconds>(
