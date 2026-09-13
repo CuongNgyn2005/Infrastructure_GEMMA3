@@ -85,6 +85,28 @@ void fpga_log_latency(const char * fmt, ...) {
     va_end(ap);
 }
 
+void fpga_log_pack_breakdown(const char * scope, int graph_seq, long long tokens,
+                             const fpga_pack_breakdown_log_t & data) {
+    const long long other_us = data.total_us - data.serial_pack_us - data.dispatch_us -
+        data.main_pack_us - data.caller_fence_us - data.caller_wait_us;
+    const long long dispatch_other_us = data.dispatch_us - data.reserve_lock_us - data.reserve_body_us -
+        data.reserve_unlock_us - data.submit_lock_us - data.submit_publish_us -
+        data.submit_signal_us - data.submit_unlock_us;
+    fpga_log_latency(
+        "P2_PACK_BREAKDOWN scope=%s graph_seq=%d tokens=%lld total_us=%lld serial_pack_us=%lld "
+        "dispatch_us=%lld main_pack_us=%lld caller_fence_us=%lld caller_wait_us=%lld "
+        "other_us=%lld helper_service_overlap_us=%lld serial_jobs=%lld parallel_jobs=%lld "
+        "reserve_lock_us=%lld reserve_body_us=%lld reserve_unlock_us=%lld "
+        "submit_lock_us=%lld submit_publish_us=%lld submit_signal_us=%lld submit_unlock_us=%lld "
+        "dispatch_other_us=%lld dispatch_detail=subsets_of_dispatch_wall_time submit_notify_order=unlock_then_signal "
+        "measurement=instrumented_successful_direct_preparation",
+        scope, graph_seq, tokens, data.total_us, data.serial_pack_us, data.dispatch_us,
+        data.main_pack_us, data.caller_fence_us, data.caller_wait_us, other_us, data.helper_service_us,
+        data.serial_jobs, data.parallel_jobs, data.reserve_lock_us, data.reserve_body_us,
+        data.reserve_unlock_us, data.submit_lock_us, data.submit_publish_us, data.submit_signal_us,
+        data.submit_unlock_us, dispatch_other_us);
+}
+
 #ifdef USE_FPGA
 void fpga_log_load_checkpoint(const char * phase) {
     // Startup-only snapshots. Counters are process cumulative; subtract

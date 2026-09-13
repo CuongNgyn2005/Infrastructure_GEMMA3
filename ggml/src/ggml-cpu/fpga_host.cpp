@@ -849,6 +849,23 @@ static long long         g_p2_pack_serial_threshold_skips              = 0;
 static long long         g_p2_pack_main_us                             = 0;
 static long long         g_p2_pack_helper_service_us                   = 0;
 static long long         g_p2_pack_caller_wait_us                      = 0;
+enum fpga_pack_detail_field {
+    PACK_TOTAL, PACK_SERIAL, PACK_DISPATCH, PACK_MAIN, PACK_FENCE, PACK_WAIT,
+    PACK_HELPER, PACK_SERIAL_JOBS, PACK_PARALLEL_JOBS,
+    PACK_RESERVE_LOCK, PACK_RESERVE_BODY, PACK_RESERVE_UNLOCK,
+    PACK_SUBMIT_LOCK, PACK_SUBMIT_BODY, PACK_SUBMIT_SIGNAL, PACK_SUBMIT_UNLOCK, PACK_DETAIL_COUNT
+};
+// Caller-owned counters; helper service is overlapping, not an additive phase.
+static std::array<long long, PACK_DETAIL_COUNT> g_pack_detail = {};
+static std::array<long long, PACK_DETAIL_COUNT> g_pack_detail_snapshot = {};
+static std::array<long long, PACK_DETAIL_COUNT> g_pack_detail_decode = {};
+static fpga_pack_breakdown_log_t fpga_pack_detail_record(
+        const std::array<long long, PACK_DETAIL_COUNT> & d) {
+    return {d[PACK_TOTAL], d[PACK_SERIAL], d[PACK_DISPATCH], d[PACK_MAIN], d[PACK_FENCE], d[PACK_WAIT],
+            d[PACK_HELPER], d[PACK_SERIAL_JOBS], d[PACK_PARALLEL_JOBS], d[PACK_RESERVE_LOCK],
+            d[PACK_RESERVE_BODY], d[PACK_RESERVE_UNLOCK], d[PACK_SUBMIT_LOCK], d[PACK_SUBMIT_BODY],
+            d[PACK_SUBMIT_SIGNAL], d[PACK_SUBMIT_UNLOCK]};
+}
 static constexpr size_t  FPGA_P2_PACK_PARALLEL_MIN_BYTES               = 256U * 1024U;
 
 // A task has no device ownership: it is a prevalidated, disjoint range of
@@ -3904,19 +3921,30 @@ static bool fpga_p2_pack_worker_next_generation(uint64_t * generation) {
     if (!generation) {
         return false;
     }
+    const long long lock0 = now_us();
     pthread_mutex_lock(&g_p2_pack_worker_mutex);
+    const long long locked = now_us();
     const bool ready = g_p2_pack_worker_created && !g_p2_pack_worker_stop_requested &&
                        !g_p2_pack_worker_task_pending && !g_p2_pack_worker_busy &&
                        g_p2_pack_worker_next_generation != UINT64_MAX;
     if (ready) {
         *generation = ++g_p2_pack_worker_next_generation;
     }
+    const long long unlock0 = now_us();
     pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+    const long long unlocked = now_us();
+    if (ready) {
+        g_pack_detail[PACK_RESERVE_LOCK] += locked - lock0;
+        g_pack_detail[PACK_RESERVE_BODY] += unlock0 - locked;
+        g_pack_detail[PACK_RESERVE_UNLOCK] += unlocked - unlock0;
+    }
     return ready;
 }
 
 static bool fpga_p2_pack_worker_submit(const fpga_p2_pack_worker_task_t & task) {
+    const long long lock0 = now_us();
     pthread_mutex_lock(&g_p2_pack_worker_mutex);
+    const long long locked = now_us();
     if (!g_p2_pack_worker_created || g_p2_pack_worker_stop_requested || g_p2_pack_worker_task_pending ||
         g_p2_pack_worker_busy || task.generation == 0U) {
         pthread_mutex_unlock(&g_p2_pack_worker_mutex);
@@ -3924,8 +3952,21 @@ static bool fpga_p2_pack_worker_submit(const fpga_p2_pack_worker_task_t & task) 
     }
     g_p2_pack_worker_task = task;
     g_p2_pack_worker_task_pending = true;
-    pthread_cond_signal(&g_p2_pack_worker_task_cv);
+    const long long unlock0 = now_us();
     pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+    const long long unlocked = now_us();
+    // Publish the predicate before notifying so the awakened helper need not
+    // contend with this caller for the mutex. The helper tests task_pending
+    // under the same mutex before waiting, so an early notification cannot
+    // lose a task. Submission and cleanup are serialized by the owning g_mutex;
+    // the static condition variable remains alive throughout notification.
+    pthread_cond_signal(&g_p2_pack_worker_task_cv);
+    const long long signaled = now_us();
+    // Elapsed intervals may include OS descheduling; these are not CPU-only costs.
+    g_pack_detail[PACK_SUBMIT_LOCK] += locked - lock0;
+    g_pack_detail[PACK_SUBMIT_BODY] += unlock0 - locked;
+    g_pack_detail[PACK_SUBMIT_SIGNAL] += signaled - unlocked;
+    g_pack_detail[PACK_SUBMIT_UNLOCK] += unlocked - unlock0;
     return true;
 }
 
@@ -7370,6 +7411,9 @@ int fpga_init(void) {
     g_p2_pack_main_us = 0;
     g_p2_pack_helper_service_us = 0;
     g_p2_pack_caller_wait_us = 0;
+    g_pack_detail.fill(0);
+    g_pack_detail_snapshot.fill(0);
+    g_pack_detail_decode.fill(0);
 
     fpga_p2_init_breadcrumb("phase=config_loader_gate begin pl_scale=1");
 
@@ -8189,6 +8233,10 @@ void fpga_cleanup(void) {
         g_p2_pack_workers_requested, g_p2_pack_workers_active, g_p2_pack_worker_created ? 0 : 1,
         FPGA_P2_PACK_PARALLEL_MIN_BYTES, g_p2_pack_parallel_jobs, (unsigned long long) g_p2_pack_parallel_bytes,
         g_p2_pack_serial_threshold_skips, g_p2_pack_main_us, g_p2_pack_helper_service_us, g_p2_pack_caller_wait_us);
+    fpga_log_pack_breakdown("decode_total", -1, g_fpga_perf_decode.decode_tokens,
+                            fpga_pack_detail_record(g_pack_detail_decode));
+    fpga_log_pack_breakdown("process_total_including_startup", -1, -1,
+                            fpga_pack_detail_record(g_pack_detail));
     if (fpga_p2_residency_has_reportable_activity()) {
         LOGPROOF(
             "P2_RESIDENCY_SUMMARY forced=1 enabled=%d diagnostic=%d trace=%d verify_metadata=%d slots=%zu/%zu index_buckets=%zu max_probes=%zu probes=%lld "
@@ -9297,6 +9345,7 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
         const bool use_parallel_pack = g_p2_pack_workers_requested == 2 && pair_count >= 2U &&
                                        direct_payload_bytes >= FPGA_P2_PACK_PARALLEL_MIN_BYTES;
         if (use_parallel_pack) {
+            const long long dispatch0 = now_us();
             const size_t main_pair_end = pair_count / 2U;
             const size_t helper_words = (pair_count - main_pair_end) * words_per_pair;
             if (main_pair_end == 0U || helper_words == 0U || direct_payload_bytes > UINT64_MAX - g_p2_pack_parallel_bytes) {
@@ -9323,14 +9372,18 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
             }
 
             const long long main_pack0 = now_us();
+            g_pack_detail[PACK_DISPATCH] += main_pack0 - dispatch0;
             size_t main_words = 0U;
             const bool main_ok = fpga_pack_direct_weight_pair_range(
                 direct_weight_words, src0, weight_data_base, row0, k_block0, rows, group_blocks, group_beats,
                 0U, main_pair_end, true, &main_words);
-            const long long main_pack_us = now_us() - main_pack0;
+            const long long main_pack_end = now_us();
+            const long long main_pack_us = main_pack_end - main_pack0;
             // The caller publishes its prefix before it waits for the helper
             // and performs the existing full-WEIGHT coherency sequence.
             mmio_fence();
+            const long long caller_fence_end = now_us();
+            g_pack_detail[PACK_FENCE] += caller_fence_end - main_pack_end;
             size_t helper_written_words = 0U;
             long long helper_service_us = 0;
             long long caller_wait_us = 0;
@@ -9352,10 +9405,15 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
             g_p2_pack_main_us += main_pack_us;
             g_p2_pack_helper_service_us += helper_service_us;
             g_p2_pack_caller_wait_us += caller_wait_us;
+            g_pack_detail[PACK_MAIN] += main_pack_us;
+            g_pack_detail[PACK_WAIT] += caller_wait_us;
+            g_pack_detail[PACK_HELPER] += helper_service_us;
+            g_pack_detail[PACK_PARALLEL_JOBS]++;
         } else {
             if (g_p2_pack_workers_requested == 2) {
                 g_p2_pack_serial_threshold_skips++;
             }
+            const long long serial0 = now_us();
             if (!fpga_pack_direct_weight_pair_range(direct_weight_words, src0, weight_data_base, row0, k_block0,
                                                      rows, group_blocks, group_beats, 0U, pair_count, true,
                                                      &written_words)) {
@@ -9363,6 +9421,8 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
                     "P2 direct WEIGHT serial pair-range pack failed job=%u tile=%u action=no_dma_no_start",
                     job.job_id, job.tile_id);
             }
+            g_pack_detail[PACK_SERIAL] += now_us() - serial0;
+            g_pack_detail[PACK_SERIAL_JOBS]++;
         }
         if (written_words != expected_words) {
             fpga_fatal(
@@ -9375,6 +9435,7 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
     if (direct_weight_pack0 != 0) {
         const long long direct_weight_pack_us = now_us() - direct_weight_pack0;
         g_p2_residency_direct_weight_pack_us += direct_weight_pack_us;
+        g_pack_detail[PACK_TOTAL] += direct_weight_pack_us;
         if (totals) {
             totals->prep_direct_weight_pack_us += direct_weight_pack_us;
         }
@@ -9596,6 +9657,18 @@ static bool fpga_token_timing_emit(int next_graph_seq,
             0;
     const bool decode_token = ubatch_tokens == 1 && g_token_timing.first_m == 1;
     const char * scope = decode_token ? "decode_token" : (ubatch_tokens > 0 ? "prefill_or_ubatch" : "incomplete");
+    std::array<long long, PACK_DETAIL_COUNT> pack_delta = {};
+    for (size_t i = 0; i < pack_delta.size(); ++i) {
+        pack_delta[i] = g_pack_detail[i] - g_pack_detail_snapshot[i];
+        if (decode_token) {
+            g_pack_detail_decode[i] += pack_delta[i];
+        }
+    }
+    g_pack_detail_snapshot = g_pack_detail;
+    if (!decode_token) {
+        fpga_log_pack_breakdown(scope, g_token_timing.graph_seq, ubatch_tokens,
+                                fpga_pack_detail_record(pack_delta));
+    }
     if (decode_token) {
         ++g_summary_detail_decode_tokens;
         ++g_fpga_perf_decode.decode_tokens;
