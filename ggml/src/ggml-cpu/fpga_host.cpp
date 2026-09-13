@@ -1863,6 +1863,24 @@ static int64_t ddr_read_spu_q16_row(uint32_t off, uint16_t * row_id, bool trace_
         fpga_fatal("DDR SPU row read requires 32-bit alignment off=0x%08x", off);
     }
     const volatile uint32_t * src = (volatile const uint32_t *) ddr_ptr(off, 16U);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    // Normal SPU rows are 16-byte aligned. Keep the scalar reader for tracing
+    // and callers that satisfy only the existing 32-bit alignment contract.
+    if (!trace_q16_verifier_row0 && (reinterpret_cast<uintptr_t>(src) & 7U) == 0U) {
+        const volatile uint64_t * wide = reinterpret_cast<const volatile uint64_t *>(src);
+        const uint64_t low = wide[0];
+        const uint64_t high = wide[1];
+        if (row_id) {
+            *row_id = static_cast<uint16_t>(low & 0xffffU);
+        }
+        // Bits 15:0 hold the row ID; bits 79:16 hold the signed accumulator.
+        // Unsigned shifts discard padding bits 127:80 without sign extension.
+        const uint64_t accum_bits = (low >> 16U) | (high << 48U);
+        int64_t accum;
+        memcpy(&accum, &accum_bits, sizeof(accum));
+        return accum;
+    }
+#endif
     if (trace_q16_verifier_row0) {
         fpga_p2_boundary_marker("P2_Q16_DDR_READ edge=before row=0 word=0 off=0x%08x", off);
     }
