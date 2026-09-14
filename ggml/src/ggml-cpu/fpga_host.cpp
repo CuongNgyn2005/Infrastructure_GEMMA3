@@ -581,7 +581,9 @@ typedef struct {
     uint32_t                          spu_stream_out_before;
     uint32_t                          spu_stream_drop_before;
     uint32_t                          spu_stream_error_before;
-    // An input preload transfers only ACT and WEIGHT into an inactive bank.
+    // Valid only within the pipelined scheduler's current weight-tile column loop.
+    bool                              weight_bank_reused;
+    // An input preload establishes ACT and WEIGHT in an inactive bank.
     // This snapshot is redundant by design: deferred launch proves it owns
     // the exact staged tile, rather than a same-shaped slot reuse.
     bool                              input_preloaded;
@@ -5971,13 +5973,14 @@ static bool fpga_preload_q8_tile_inputs(fpga_tile_job_t &       job,
     if ((vpu_rd32(REG_BANK) & 0x3U) != expected_bank) {
         return poison("inactive_bank_reselect_readback_mismatch");
     }
-    if (!fpga_dma_copy(DDR_BASE_PHYS + (uint64_t) job.weight_src_off, LMM_BASE_PHYS + (uint64_t) WEIGHT_BASE,
+    if (!job.weight_bank_reused &&
+        !fpga_dma_copy(DDR_BASE_PHYS + (uint64_t) job.weight_src_off, LMM_BASE_PHYS + (uint64_t) WEIGHT_BASE,
                        job.weight_bytes, "P1_WEIGHT")) {
         return poison("weight_dma_failed");
     }
     if (g_p1_sched_summary_enabled) {
-        // ACT and WEIGHT have both completed into the inactive bank while
-        // the admitted running job was still observed active.
+        // ACT is transferred and WEIGHT is transferred or already retained
+        // in the inactive bank after admission against an active running job.
         g_p1_sched_summary.preload_admitted_while_active++;
     }
     if (job.p2_residency_hit) {
@@ -6016,7 +6019,8 @@ static bool fpga_preload_q8_tile_inputs(fpga_tile_job_t &       job,
     p2_event_trace(job, "P1_INPUT_PRELOAD_DONE", event_done, "preload_us", event_done - event0);
     fpga_p1_preload_breadcrumb(false,
                                "event=success job=%u running_job=%u bank=%d act_bytes=%zu weight_bytes=%zu preload_us=%lld",
-                               job.job_id, running.job_id, job.bank & 1, job.act_bytes, job.weight_bytes,
+                               job.job_id, running.job_id, job.bank & 1, job.act_bytes,
+                               job.weight_bank_reused ? 0 : job.weight_bytes,
                                job.input_preload_us);
     return true;
 }
@@ -6130,17 +6134,17 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
 
     const long long dma_weight0       = now_us();
     const long long event_dma_weight0 = p2_event_now_us();
-    if (!job.input_preloaded) {
+    if (!job.input_preloaded && !job.weight_bank_reused) {
         p2_trace_first_tile(job, "WEIGHT_DMA", "before");
     }
     vpu_select_banks(job.bank, job.bank);
-    if (!job.input_preloaded &&
+    if (!job.input_preloaded && !job.weight_bank_reused &&
         !fpga_dma_copy(DDR_BASE_PHYS + (uint64_t) job.weight_src_off, LMM_BASE_PHYS + (uint64_t) WEIGHT_BASE,
                        job.weight_bytes, "WEIGHT")) {
         return false;
     }
     const long long event_dma_weight_done = p2_event_now_us();
-    if (!job.input_preloaded) {
+    if (!job.input_preloaded && !job.weight_bank_reused) {
         p2_trace_first_tile(job, "WEIGHT_DMA", "after");
         p2_event_trace(job, "WEIGHT_DMA_DONE", event_dma_weight_done, "weight_dma_us",
                        event_dma_weight_done - event_dma_weight0);
@@ -6167,7 +6171,7 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
     const long long dma_scale1 = now_us();
 
     job.dma_act_us              = job.input_preloaded ? 0 : dma_act1 - dma_act0;
-    job.dma_weight_us           = job.input_preloaded ? 0 : dma_weight1 - dma_weight0;
+    job.dma_weight_us           = (job.input_preloaded || job.weight_bank_reused) ? 0 : dma_weight1 - dma_weight0;
     job.dma_scale_us            = dma_scale1 - dma_scale0;
     job.spu_stream_count_before = vpu_rd32(REG_SPU_STREAM_COUNT);
     job.spu_stream_done_before  = vpu_rd32(REG_SPU_STREAM_DONE);
@@ -6184,7 +6188,7 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
         totals->bank_h2ip_us[bank_index] += h2ip_us;
         totals->bank_jobs[bank_index]++;
         totals->activation_bytes += job.act_bytes;
-        totals->weight_bytes += job.weight_bytes;
+        totals->weight_bytes += job.weight_bank_reused ? 0 : job.weight_bytes;
         totals->scale_bytes += job.scale_bytes;
         totals->result_bytes += job.spu_result_bytes;
         totals->vpu_runs++;
@@ -6199,7 +6203,7 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
             p2_bank_label(bank_index), job.input_preloaded ? 1 : 0, (double) h2ip_us / 1000.0,
             (double) job.dma_act_us / 1000.0, (double) job.dma_weight_us / 1000.0,
             (double) job.dma_scale_us / 1000.0, (double) job.input_preload_us / 1000.0, job.act_bytes,
-            job.weight_bytes, job.scale_bytes);
+            job.weight_bank_reused ? 0 : job.weight_bytes, job.scale_bytes);
     }
 
     vpu_write_tile_descriptor(job, FPGA_SLOT_COMPUTING, FPGA_SLOT_FREE, 0x00000101U);
@@ -6848,6 +6852,8 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
     uint32_t        tile_id           = 0;
     uint32_t        weight_tile_index = 0;
     fpga_tile_job_t slots[2]          = {};
+    long long reused_jobs = 0;
+    uint64_t avoided_weight_bytes = 0;
 
     for (int64_t row0 = 0; row0 < n; row0 += g_vpu_max_rows) {
         const int rows = (int) std::min<int64_t>(g_vpu_max_rows, n - row0);
@@ -6864,6 +6870,10 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
             // drain only writes the disjoint result window. Contract/restage
             // diagnostics use the separate single-bank path, not this loop.
             fpga_prompt_weight_staging_t staging;
+            // Both banks start unknown for every row/K tile. Only this column
+            // loop writes their weights; ACT, scales, and result retirement
+            // do not modify weight RAM. No validity survives a return/retry.
+            bool weight_bank_loaded[2] = { false, false };
             for (int64_t col = 0; col < m; ++col) {
                 const int            bank      = (int) (tile_id & 1U);
                 fpga_tile_job_t &    prepared  = slots[bank];
@@ -6882,6 +6892,8 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                                               m > 1 ? &staging : nullptr)) {
                     return false;
                 }
+
+                prepared.weight_bank_reused = m > 1 && weight_bank_loaded[bank];
 
                 if (running) {
                     if (g_p1_sched_summary_enabled) {
@@ -6947,6 +6959,13 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                     running = &prepared;
                 }
 
+                // Submit has completed all required DMA and launched this job.
+                // A failed preload/drain/submit returns before publishing validity.
+                weight_bank_loaded[bank] = true;
+                if (prepared.weight_bank_reused) {
+                    ++reused_jobs;
+                    avoided_weight_bytes += prepared.weight_bytes;
+                }
                 tile_id++;
             }
 
@@ -6973,6 +6992,9 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
         if (totals) {
             totals->host_accum_us += now_us() - store0;
         }
+    }
+    if (m > 1) {
+        fpga_log_prompt_weight_reuse(tensor_name, m, reused_jobs, avoided_weight_bytes);
     }
     return true;
 }
@@ -9477,6 +9499,16 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
     // unused lanes in the final 128-bit word are cleared.
     volatile uint32_t * const scale_words = ddr_checked_u32_ptr(SPU_PARAM_BASE, job.scale_bytes);
     volatile uint32_t * scale_out = scale_words;
+    const auto store_scale_pair = [](volatile uint32_t * dst, uint32_t first, uint32_t second) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        // Callers align the pair before entering their two-entry loop.
+        *reinterpret_cast<volatile uint64_t *>(dst) =
+            static_cast<uint64_t>(first) | (static_cast<uint64_t>(second) << 32U);
+#else
+        dst[0] = first;
+        dst[1] = second;
+#endif
+    };
     if (job.p2_residency_hit) {
         // The matmul lock keeps resident metadata stable throughout preparation.
         // Validate the entire source before writing any scale entries.
@@ -9490,7 +9522,19 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
         }
         const uint16_t * weight_scale = g_p2_resident_tiles[job.p2_residency_slot].scale_bits.data();
         for (int row = 0; row < rows; ++row) {
-            for (int gb = 0; gb < group_blocks; ++gb) {
+            int gb = 0;
+            // An odd preceding row can leave the next row only 4-byte aligned.
+            if ((reinterpret_cast<uintptr_t>(scale_out) & 7U) != 0U) {
+                *scale_out++ = fpga_p2_pack_scale_entry((uint16_t) act_group[gb++].d, *weight_scale++);
+            }
+            for (; gb + 1 < group_blocks; gb += 2) {
+                const uint32_t first = fpga_p2_pack_scale_entry((uint16_t) act_group[gb].d, weight_scale[0]);
+                const uint32_t second = fpga_p2_pack_scale_entry((uint16_t) act_group[gb + 1].d, weight_scale[1]);
+                store_scale_pair(scale_out, first, second);
+                scale_out += 2;
+                weight_scale += 2;
+            }
+            if (gb < group_blocks) {
                 *scale_out++ = fpga_p2_pack_scale_entry((uint16_t) act_group[gb].d, *weight_scale++);
             }
         }
@@ -9498,7 +9542,18 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
         for (int row = 0; row < rows; ++row) {
             const block_q8_0_t * weight_row =
                 weight_block_from_base(src0, weight_data_base, row0 + row, k_block0);
-            for (int gb = 0; gb < group_blocks; ++gb) {
+            int gb = 0;
+            if ((reinterpret_cast<uintptr_t>(scale_out) & 7U) != 0U) {
+                *scale_out++ = fpga_p2_pack_scale_entry((uint16_t) act_group[gb].d, (uint16_t) weight_row[gb].d);
+                ++gb;
+            }
+            for (; gb + 1 < group_blocks; gb += 2) {
+                const uint32_t first = fpga_p2_pack_scale_entry((uint16_t) act_group[gb].d, (uint16_t) weight_row[gb].d);
+                const uint32_t second = fpga_p2_pack_scale_entry((uint16_t) act_group[gb + 1].d, (uint16_t) weight_row[gb + 1].d);
+                store_scale_pair(scale_out, first, second);
+                scale_out += 2;
+            }
+            if (gb < group_blocks) {
                 *scale_out++ = fpga_p2_pack_scale_entry((uint16_t) act_group[gb].d, (uint16_t) weight_row[gb].d);
             }
         }

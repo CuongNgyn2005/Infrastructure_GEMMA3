@@ -36,3 +36,13 @@ void   fpga_log_load_checkpoint(const char * phase);
 #else
 inline void fpga_log_load_checkpoint(const char *) {}
 #endif
+
+#ifdef USE_FPGA
+struct fpga_perf_decode_data;
+void fpga_log_decode_diagnostics(const fpga_perf_decode_data & fpga_perf);
+void fpga_log_runtime_summary(double load_ms, double prompt_ms, int prompt_tokens,
+                              double decode_ms, int decode_runs);
+#endif
+
+void fpga_log_prompt_weight_reuse(const char * tensor, long long columns, long long jobs,
+                                  unsigned long long avoided_bytes);

@@ -6,6 +6,7 @@
 
 #ifdef USE_FPGA
 #include "../ggml/src/ggml-cpu/fpga_host.h"
+#include "../ggml/src/ggml-cpu/fpga_log.h"
 #endif
 
 #include <algorithm>
@@ -2679,9 +2680,6 @@ void llama_perf_sampler_print(const struct llama_sampler * chain) {
             (double) fpga_perf.decode_tokens * 1000000.0 / (double) fpga_perf.decode_wall_us : 0.0;
         const double direct_weight_pack_pct = fpga_perf.preparation_us > 0 ?
             100.0 * (double) fpga_perf.direct_weight_pack_us / (double) fpga_perf.preparation_us : 0.0;
-        const double external_bandwidth_gb_s = fpga_perf.zdma_elapsed_us > 0 ?
-            (double) fpga_perf.zdma_bytes / ((double) fpga_perf.zdma_elapsed_us * 1000.0) : 0.0;
-        const double zdma_traffic_gib = (double) fpga_perf.zdma_bytes / (1024.0 * 1024.0 * 1024.0);
 
         printf("\n--- Summary ---\n");
         printf("\n[Decode]\n");
@@ -2689,7 +2687,7 @@ void llama_perf_sampler_print(const struct llama_sampler * chain) {
         printf("%-28s = %10.2f tokens/s\n", "End-to-end speed", end_to_end_tokens_per_second);
         printf("%-28s = %10lld\n", "FPGA matmul hooks", (long long) fpga_perf.fpga_matmuls);
 
-        printf("\n[Accelerator]\n");
+        printf("\n[IP]\n");
         printf("%-28s = %10.2f tokens/s\n", "IP-only compute speed", ip_only_tokens_per_second);
         printf("%-28s = %10.2f tokens/s\n", "IP + transfer speed", service_tokens_per_second);
 
@@ -2699,37 +2697,7 @@ void llama_perf_sampler_print(const struct llama_sampler * chain) {
                (double) fpga_perf.direct_weight_pack_us / 1000000.0, direct_weight_pack_pct);
         printf("%-28s = %10.2f s\n", "Scale-table packing", (double) fpga_perf.scale_pack_us / 1000000.0);
 
-        printf("\n[External Transfer]\n");
-        printf("%-28s = %10.2f GB/s\n", "External bandwidth", external_bandwidth_gb_s);
-        printf("%-28s = %10.2f GiB\n", "ZDMA traffic", zdma_traffic_gib);
-        printf("%-28s = %10lld\n", "ZDMA descriptors", (long long) fpga_perf.zdma_descriptors);
-
-        printf("\n[Ping-Pong]\n");
-        printf("%-28s = %10lld / %lld\n", "Bank 0 / Bank 1 jobs",
-               (long long) fpga_perf.pingpong_bank_jobs[0], (long long) fpga_perf.pingpong_bank_jobs[1]);
-        printf("%-28s = %10lld\n", "Scheduler handoffs", (long long) fpga_perf.pingpong_handoffs);
-        printf("%-28s = %10.2f s\n", "Preparation overlap",
-               (double) fpga_perf.pingpong_prepare_overlap_us / 1000000.0);
-        printf("%-28s = %10.2f s (%lld jobs)\n", "Preparation late",
-               (double) fpga_perf.pingpong_prepare_late_us / 1000000.0,
-               (long long) fpga_perf.pingpong_prepare_late_jobs);
-
-        printf("\n[Preload]\n");
-        printf("%-28s = %10.2f s\n", "Input DMA", (double) fpga_perf.preload_dma_us / 1000000.0);
-        printf("%-28s = %10.2f s (%lld jobs)\n", "Compute overlap",
-               (double) fpga_perf.preload_overlap_us / 1000000.0,
-               (long long) fpga_perf.preload_overlap_jobs);
-
-        printf("\n[Coverage and Health]\n");
-        printf("%-28s = %10lld completed, %lld fallback, %lld reject\n", "FPGA GEMV",
-               (long long) fpga_perf.run_fpga_gemvs, (long long) fpga_perf.run_q8_unavailable_cpu_fallbacks,
-               (long long) fpga_perf.run_rejects);
-        printf("%-28s = %10lld drop, %lld error\n", "SPU stream",
-               (long long) fpga_perf.run_stream_drops, (long long) fpga_perf.run_stream_errors);
-        printf("%-28s = %10lld/%lld slots, %lld hit, %lld miss\n", "Weight residency",
-               (long long) fpga_perf.residency_slots_used, (long long) fpga_perf.residency_slots_total,
-               (long long) fpga_perf.residency_hits, (long long) fpga_perf.residency_misses);
-        printf("--------------------------------------------------------------------------------\n");
+        fpga_log_decode_diagnostics(fpga_perf);
     } else {
         printf("\n--- Summary ---\n");
         printf("No completed FPGA decode-token timing was recorded.\n");

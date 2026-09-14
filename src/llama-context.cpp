@@ -12,6 +12,7 @@
 #include <limits>
 #include <stdexcept>
 #ifdef USE_FPGA
+#include "../ggml/src/ggml-cpu/fpga_log.h"
 extern "C" void fpga_reset_kv_cache(void);
 extern "C" void fpga_advance_sequence_position(int n_tokens);
 #endif
@@ -2766,6 +2767,16 @@ void llama_perf_context_print(const llama_context * ctx) {
 
     const double t_end_ms = 1e-3 * ggml_time_us();
 
+#ifdef USE_FPGA
+    fpga_log_runtime_summary(data.t_load_ms, data.t_p_eval_ms, data.n_p_eval,
+                             data.t_eval_ms, data.n_eval);
+    // Use the sampler's stdout stream to preserve redirected section order.
+    printf("\n[Overall]\n");
+    printf("%-28s = %10.2f s\n", "Total time", (t_end_ms - data.t_start_ms) / 1000.0);
+    printf("%-28s = %10d\n", "Total tokens", data.n_p_eval + data.n_eval);
+    printf("%-28s = %10d\n", "Graphs reused", data.n_reused);
+    printf("--------------------------------------------------------------------------------\n");
+#else
     LLAMA_LOG_INFO("\n--- Runtime Summary ---\n");
     LLAMA_LOG_INFO("\n[Model]\n");
     LLAMA_LOG_INFO("%-28s = %10.2f s\n", "Load time", data.t_load_ms / 1000.0);
@@ -2784,6 +2795,7 @@ void llama_perf_context_print(const llama_context * ctx) {
     LLAMA_LOG_INFO("%-28s = %10.2f s\n", "Total time", (t_end_ms - data.t_start_ms) / 1000.0);
     LLAMA_LOG_INFO("%-28s = %10d\n", "Total tokens", data.n_p_eval + data.n_eval);
     LLAMA_LOG_INFO("%-28s = %10d\n", "Graphs reused", data.n_reused);
+#endif
 }
 
 void llama_perf_context_reset(llama_context * ctx) {

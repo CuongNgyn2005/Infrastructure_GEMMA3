@@ -135,3 +135,62 @@ void fpga_log_load_checkpoint(const char * phase) {
                      usage_ok ? usage.ru_inblock : -1L, read_bytes, usage_ok ? usage.ru_maxrss : -1L);
 }
 #endif
+
+#ifdef USE_FPGA
+#include "fpga_host.h"
+
+void fpga_log_decode_diagnostics(const fpga_perf_decode_data & fpga_perf) {
+    FILE * fp = fpga_log_fp();
+    if (fp == stderr) return;
+    fprintf(fp, "\n[FPGA][SUMMARY] scope=decode; health_and_residency=run\n");
+    const double external_bandwidth_gb_s = fpga_perf.zdma_elapsed_us > 0 ?
+        (double) fpga_perf.zdma_bytes / ((double) fpga_perf.zdma_elapsed_us * 1000.0) : 0.0;
+    const double zdma_traffic_gib = (double) fpga_perf.zdma_bytes / (1024.0 * 1024.0 * 1024.0);
+    fprintf(fp, "\n[External Transfer]\n");
+    fprintf(fp, "%-28s = %10.2f GB/s\n", "External bandwidth", external_bandwidth_gb_s);
+    fprintf(fp, "%-28s = %10.2f GiB\n", "ZDMA traffic", zdma_traffic_gib);
+    fprintf(fp, "%-28s = %10lld\n", "ZDMA descriptors", (long long) fpga_perf.zdma_descriptors);
+
+    fprintf(fp, "\n[Ping-Pong]\n");
+    fprintf(fp, "%-28s = %10lld / %lld\n", "Bank 0 / Bank 1 jobs",
+           (long long) fpga_perf.pingpong_bank_jobs[0], (long long) fpga_perf.pingpong_bank_jobs[1]);
+    fprintf(fp, "%-28s = %10lld\n", "Scheduler handoffs", (long long) fpga_perf.pingpong_handoffs);
+    fprintf(fp, "%-28s = %10.2f s\n", "Preparation overlap",
+           (double) fpga_perf.pingpong_prepare_overlap_us / 1000000.0);
+    fprintf(fp, "%-28s = %10.2f s (%lld jobs)\n", "Preparation late",
+           (double) fpga_perf.pingpong_prepare_late_us / 1000000.0,
+           (long long) fpga_perf.pingpong_prepare_late_jobs);
+
+    fprintf(fp, "\n[Preload]\n");
+    fprintf(fp, "%-28s = %10.2f s\n", "Input DMA", (double) fpga_perf.preload_dma_us / 1000000.0);
+    fprintf(fp, "%-28s = %10.2f s (%lld jobs)\n", "Compute overlap",
+           (double) fpga_perf.preload_overlap_us / 1000000.0,
+           (long long) fpga_perf.preload_overlap_jobs);
+
+    fprintf(fp, "\n[Coverage and Health]\n");
+    fprintf(fp, "%-28s = %10lld completed, %lld fallback, %lld reject\n", "FPGA GEMV",
+           (long long) fpga_perf.run_fpga_gemvs, (long long) fpga_perf.run_q8_unavailable_cpu_fallbacks,
+           (long long) fpga_perf.run_rejects);
+    fprintf(fp, "%-28s = %10lld drop, %lld error\n", "SPU stream",
+           (long long) fpga_perf.run_stream_drops, (long long) fpga_perf.run_stream_errors);
+    fprintf(fp, "%-28s = %10lld/%lld slots, %lld hit, %lld miss\n", "Weight residency",
+           (long long) fpga_perf.residency_slots_used, (long long) fpga_perf.residency_slots_total,
+           (long long) fpga_perf.residency_hits, (long long) fpga_perf.residency_misses);
+    fpga_log_finish_line(fp, true);
+}
+
+void fpga_log_runtime_summary(double load_ms, double prompt_ms, int prompt_tokens,
+                              double decode_ms, int decode_runs) {
+    fpga_log_latency("RUNTIME_SUMMARY load_ms=%.2f prompt_tokens=%d prompt_ms=%.2f prompt_tokens_s=%.2f "
+                     "decode_runs=%d decode_ms=%.2f decode_tokens_s=%.2f",
+                     load_ms, prompt_tokens, prompt_ms, prompt_ms > 0 ? 1000.0 * prompt_tokens / prompt_ms : 0.0,
+                     decode_runs, decode_ms, decode_ms > 0 ? 1000.0 * decode_runs / decode_ms : 0.0);
+}
+#endif
+
+void fpga_log_prompt_weight_reuse(const char * tensor, long long columns, long long jobs,
+                                  unsigned long long avoided_bytes) {
+    fpga_log_latency("PROMPT_WEIGHT_BANK_REUSE tensor=%s columns=%lld reused_jobs=%lld "
+                     "avoided_weight_dma_bytes=%llu scope=completed_matmul",
+                     tensor ? tensor : "?", columns, jobs, avoided_bytes);
+}
