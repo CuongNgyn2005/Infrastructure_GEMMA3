@@ -13,7 +13,12 @@ scheduler = source[start:source.index("static bool fpga_hw_q8_0_matmul_dma_to_ip
 fields = set(re.findall(r"(?:prepared\.|running->)(\w+)", scheduler))
 fields.update(["bank", "row0", "rows", "col", "k_block0", "group_blocks", "weight_bytes", "job_id"])
 fields.add("weight_src_off")
+release_start = source.index("static bool fpga_release_pl_scaled_q8_tile_job(")
+helpers = source[release_start:source.index("// The P2 contract is a tile-level", release_start)]
+fields.update(re.findall(r"job\.(\w+)", helpers))
+fields.add("output_dma_ready")
 totals = set(re.findall(r"totals->(\w+)", scheduler))
+totals.update(re.findall(r"totals->(\w+)", helpers))
 harness = r'''
 #include <algorithm>
 #include <cassert>
@@ -28,20 +33,35 @@ struct fpga_prompt_weight_staging_t {};
 constexpr int VPU_BLOCK_BEATS = 4;
 int g_vpu_max_rows = 3;
 bool g_p2_input_preload_enabled, g_p1_sched_summary_enabled = true;
+bool g_p2_result_overlap_enabled, g_vpu_descriptor_supported = true;
+bool g_pingpong_timing_enabled = false;
+constexpr unsigned ACT_END=16, WEIGHT_END=32, SPU_OUT_BASE=64, SPU_OUT_END=128, SPU_PARAM_BASE=128;
+constexpr int FPGA_SLOT_FREE=0;
+void LOGE(const char *, ...) {}
+template<class... Args> void fpga_log_line(Args...) {}
+const char *p2_bank_label(int) { return "test"; }
 struct { int pingpong_pairs, serial_submit_after_no_preload; } g_p1_sched_summary;
 bool should_log_detail_run(unsigned) { return false; }
 void LOGSTAGE(const char *, ...) {}
 long long now_us() { return 100; }
 int packed_q8_group_blocks_for_rows(int, int remaining) { return std::min(2, remaining); }
-void store_dst_value(const ggml_tensor *, int64_t, int64_t, float) {}
+void store_dst_value(const ggml_tensor *, int64_t row, int64_t col, float value) {
+    // Three K groups start at 0, 2, 4. The mocked raw result preserves
+    // distinct row/column identities, so reordered or skipped sums fail.
+    assert(value == float(3 * (row * 100 + col * 10) + 9));
+}
 '''
-harness += "struct fpga_tile_job_t { " + " ".join(f"long long {f} = 0;" for f in sorted(fields)) + " };\n"
-harness += "struct fpga_stage_totals_t { " + " ".join(f"long long {f} = 0;" for f in sorted(totals)) + " };\n"
+fields.discard("tensor_name")
+harness += "struct fpga_tile_job_t { const char *tensor_name = nullptr; " + " ".join(f"long long {f} = 0;" for f in sorted(fields)) + " };\n"
+bank_fields = {f for f in totals if f.startswith("bank_")}
+harness += "struct fpga_stage_totals_t { " + " ".join(f"long long {f}{'[2]' if f in bank_fields else ''} = {{}};" for f in sorted(totals)) + " };\n"
 harness += r'''
 using Key = std::tuple<long long, long long, long long, long long>;
 Key banks[2];
 bool valid[2];
 int active = -1, loads, activations, scales, launches, reused, operations, fail_at;
+int pending_result = -1, consumed_jobs, overlap_reads, release_writes;
+fpga_tile_job_t returned;
 long long logged_jobs;
 unsigned long long logged_bytes;
 bool step() { return ++operations != fail_at; }
@@ -95,12 +115,29 @@ bool fpga_preload_q8_tile_inputs(fpga_tile_job_t & j, const fpga_tile_job_t & ru
 }
 template<class... Args> bool fpga_wait_and_drain_q8_tile_job(fpga_tile_job_t & j, Args...) {
     if (!step()) return false;
-    assert(active == j.bank); return true;
+    assert(active == j.bank);
+    // Any premature next output DMA would destroy A's unread DDR data.
+    assert(pending_result == -1);
+    pending_result = j.job_id; returned = j; j.output_dma_ready = true;
+    return true;
 }
-bool fpga_accumulate_pl_scaled_q8_tile_job(fpga_tile_job_t & j, std::vector<float> &,
-                                         fpga_stage_totals_t *) {
+bool fpga_write_post_spu_descriptor(fpga_tile_job_t & j, int, int, unsigned, const char *, bool, bool force) {
     if (!step()) return false;
-    assert(active == j.bank); active = -1; return true;
+    assert(active == j.bank); // Catch stale A descriptor writes after B starts.
+    assert(j.output_dma_ready);
+    if (!j.result_consumed) assert(force);
+    ++release_writes; active = -1; return true;
+}
+int64_t ddr_read_spu_q16_row(unsigned off, uint16_t *row_id) {
+    assert(pending_result == returned.job_id);
+    const unsigned row = (off - SPU_OUT_BASE) / 16;
+    assert(row < (unsigned) returned.rows);
+    *row_id = row;
+    if (!step()) *row_id = 0xffff; // Inject a real row validation failure.
+    if (row == 0 && active != returned.bank && active != -1) ++overlap_reads;
+    const int64_t value = (returned.row0 + row) * 100 + returned.col * 10 + returned.k_block0 + 1;
+    if (row + 1 == (unsigned) returned.rows) { pending_result = -1; ++consumed_jobs; }
+    return value * 65536;
 }
 template<class... Args> bool fpga_submit_q8_tile_job(fpga_tile_job_t & j, Args...) {
     if (!step()) return false;
@@ -115,13 +152,16 @@ void fpga_log_prompt_weight_reuse(const char *, long long, long long jobs,
     logged_jobs = jobs; logged_bytes = bytes;
 }
 '''
+harness += helpers
 harness += scheduler
 harness += r'''
-bool run(int columns, bool preload, int failure) {
+bool run(int columns, bool preload, bool overlap, int failure) {
     active = -1; valid[0] = valid[1] = false;
     loads = activations = scales = launches = reused = operations = 0;
     fail_at = failure; logged_jobs = -1; logged_bytes = 0;
+    pending_result = -1; consumed_jobs = overlap_reads = release_writes = 0;
     g_p2_input_preload_enabled = preload;
+    g_p2_result_overlap_enabled = overlap;
     ggml_tensor t = {};
     std::vector<block_q8_0_t> act(columns * 5);
     std::vector<float> values;
@@ -131,6 +171,9 @@ bool run(int columns, bool preload, int failure) {
     if (ok) {
         // 3 row tiles x 3 K tiles, including partial final tiles.
         assert(active == -1);
+        assert(pending_result == -1 && consumed_jobs == launches && release_writes == launches);
+        assert(overlap_reads == (overlap && g_vpu_descriptor_supported ? launches - 3 : 0));
+        assert(totals.result_overlap_jobs == overlap_reads);
         assert(loads == 9 * std::min(columns, 2));
         assert(launches == 9 * columns && scales == launches && activations == launches);
         assert(reused == 9 * std::max(columns - 2, 0));
@@ -152,15 +195,17 @@ int main() {
         dma_success = true;
     }
     int cases = 0;
+    for (bool descriptors : {false, true}) for (bool overlap : {false, true})
     for (int columns : {1, 2, 3, 4, 5, 46}) for (bool preload : {false, true}) {
-        assert(run(columns, preload, 0)); ++cases;
+        g_vpu_descriptor_supported = descriptors;
+        assert(run(columns, preload, overlap, 0)); ++cases;
         const int count = operations;
         for (int fail = 1; fail <= count; ++fail) {
-            assert(!run(columns, preload, fail)); ++cases;
+            assert(!run(columns, preload, overlap, fail)); ++cases;
         }
-        assert(run(columns, preload, 0)); ++cases;
+        assert(run(columns, preload, overlap, 0)); ++cases;
     }
-    printf("PASS: %d scheduler cases, both preload modes, every failure boundary, fresh retries\n", cases);
+    printf("PASS: %d scheduler cases; overlap/preload/descriptor modes, no unread-result overwrite or stale release, row failures, fresh retries\n", cases);
 }
 '''
 with tempfile.TemporaryDirectory(prefix="fpga-bank-reuse-") as directory:

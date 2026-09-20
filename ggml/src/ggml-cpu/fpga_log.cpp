@@ -38,7 +38,7 @@ FILE * fpga_log_fp() {
         if (!fp) {
             const int open_errno = errno;
             fprintf(stderr,
-                    "[FPGA][ERROR] cannot open %s; detailed FPGA telemetry is disabled: errno=%d (%s)\n",
+                    "[ERROR] cannot open %s; detailed FPGA telemetry is disabled: errno=%d (%s)\n",
                     FPGA_LOG_FILE, open_errno, strerror(open_errno));
             fp = fopen("/dev/null", "w");
             if (!fp) {
@@ -48,7 +48,7 @@ FILE * fpga_log_fp() {
 
         const time_t now = time(nullptr);
         fprintf(fp, "\n============================================================\n");
-        fprintf(fp, "[FPGA] ZDMA DDR-to-IP log started at %ld\n", (long) now);
+        fprintf(fp, "ZDMA DDR-to-IP log started at %ld\n", (long) now);
         fprintf(fp, "============================================================\n");
         fflush(fp);
     }
@@ -69,7 +69,7 @@ void fpga_log_finish_line(FILE * fp, bool force_flush) {
 
 void fpga_log_vline(const char * tag, bool force_flush, const char * fmt, va_list ap) {
     FILE * fp = fpga_log_fp();
-    fprintf(fp, "[FPGA][%s] ", tag ? tag : "INFO");
+    fprintf(fp, "[%s] ", tag ? tag : "INFO");
     vfprintf(fp, fmt, ap);
     fputc('\n', fp);
     fpga_log_finish_line(fp, force_flush);
@@ -82,6 +82,27 @@ void fpga_log_latency(const char * fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     fpga_log_vline("LATENCY", true, fmt, ap);
+    va_end(ap);
+}
+
+void fpga_log_result_overlap(int graph_seq, bool enabled, long long jobs, long long host_us) {
+    if (fpga_log_fp() == stderr) {
+        return;
+    }
+    FILE * fp = fpga_log_fp();
+    fprintf(fp, "[RESULT_OVERLAP] graph_seq=%d enabled=%d jobs=%lld host_after_next_launch_ms=%.3f "
+                "scope=decode_token actual_hidden_time=not_measured\n",
+            graph_seq, enabled ? 1 : 0, jobs, (double) host_us / 1000.0);
+    fpga_log_finish_line(fp, false);
+}
+
+void fpga_log_q16_audit(const char * fmt, ...) {
+    if (fpga_log_fp() == stderr) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    fpga_log_vline("Q16_AUDIT", true, fmt, ap);
     va_end(ap);
 }
 
@@ -137,47 +158,6 @@ void fpga_log_load_checkpoint(const char * phase) {
 #endif
 
 #ifdef USE_FPGA
-#include "fpga_host.h"
-
-void fpga_log_decode_diagnostics(const fpga_perf_decode_data & fpga_perf) {
-    FILE * fp = fpga_log_fp();
-    if (fp == stderr) return;
-    fprintf(fp, "\n[FPGA][SUMMARY] scope=decode; health_and_residency=run\n");
-    const double external_bandwidth_gb_s = fpga_perf.zdma_elapsed_us > 0 ?
-        (double) fpga_perf.zdma_bytes / ((double) fpga_perf.zdma_elapsed_us * 1000.0) : 0.0;
-    const double zdma_traffic_gib = (double) fpga_perf.zdma_bytes / (1024.0 * 1024.0 * 1024.0);
-    fprintf(fp, "\n[External Transfer]\n");
-    fprintf(fp, "%-28s = %10.2f GB/s\n", "External bandwidth", external_bandwidth_gb_s);
-    fprintf(fp, "%-28s = %10.2f GiB\n", "ZDMA traffic", zdma_traffic_gib);
-    fprintf(fp, "%-28s = %10lld\n", "ZDMA descriptors", (long long) fpga_perf.zdma_descriptors);
-
-    fprintf(fp, "\n[Ping-Pong]\n");
-    fprintf(fp, "%-28s = %10lld / %lld\n", "Bank 0 / Bank 1 jobs",
-           (long long) fpga_perf.pingpong_bank_jobs[0], (long long) fpga_perf.pingpong_bank_jobs[1]);
-    fprintf(fp, "%-28s = %10lld\n", "Scheduler handoffs", (long long) fpga_perf.pingpong_handoffs);
-    fprintf(fp, "%-28s = %10.2f s\n", "Preparation overlap",
-           (double) fpga_perf.pingpong_prepare_overlap_us / 1000000.0);
-    fprintf(fp, "%-28s = %10.2f s (%lld jobs)\n", "Preparation late",
-           (double) fpga_perf.pingpong_prepare_late_us / 1000000.0,
-           (long long) fpga_perf.pingpong_prepare_late_jobs);
-
-    fprintf(fp, "\n[Preload]\n");
-    fprintf(fp, "%-28s = %10.2f s\n", "Input DMA", (double) fpga_perf.preload_dma_us / 1000000.0);
-    fprintf(fp, "%-28s = %10.2f s (%lld jobs)\n", "Compute overlap",
-           (double) fpga_perf.preload_overlap_us / 1000000.0,
-           (long long) fpga_perf.preload_overlap_jobs);
-
-    fprintf(fp, "\n[Coverage and Health]\n");
-    fprintf(fp, "%-28s = %10lld completed, %lld fallback, %lld reject\n", "FPGA GEMV",
-           (long long) fpga_perf.run_fpga_gemvs, (long long) fpga_perf.run_q8_unavailable_cpu_fallbacks,
-           (long long) fpga_perf.run_rejects);
-    fprintf(fp, "%-28s = %10lld drop, %lld error\n", "SPU stream",
-           (long long) fpga_perf.run_stream_drops, (long long) fpga_perf.run_stream_errors);
-    fprintf(fp, "%-28s = %10lld/%lld slots, %lld hit, %lld miss\n", "Weight residency",
-           (long long) fpga_perf.residency_slots_used, (long long) fpga_perf.residency_slots_total,
-           (long long) fpga_perf.residency_hits, (long long) fpga_perf.residency_misses);
-    fpga_log_finish_line(fp, true);
-}
 
 void fpga_log_runtime_summary(double load_ms, double prompt_ms, int prompt_tokens,
                               double decode_ms, int decode_runs) {

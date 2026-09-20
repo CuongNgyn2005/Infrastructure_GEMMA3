@@ -11,6 +11,9 @@ void   fpga_log_finish_line(FILE * fp, bool force_flush);
 void   fpga_log_vline(const char * tag, bool force_flush, const char * fmt, va_list ap);
 // Coarse CLI latency records are file-only, even if the sink failed to open.
 void   fpga_log_latency(const char * fmt, ...);
+// Failure-only P2 evidence; never redirect these records to the terminal.
+void   fpga_log_q16_audit(const char * fmt, ...);
+void   fpga_log_result_overlap(int graph_seq, bool enabled, long long jobs, long long host_us);
 struct fpga_pack_breakdown_log_t {
     long long total_us;
     long long serial_pack_us;
@@ -38,8 +41,6 @@ inline void fpga_log_load_checkpoint(const char *) {}
 #endif
 
 #ifdef USE_FPGA
-struct fpga_perf_decode_data;
-void fpga_log_decode_diagnostics(const fpga_perf_decode_data & fpga_perf);
 void fpga_log_runtime_summary(double load_ms, double prompt_ms, int prompt_tokens,
                               double decode_ms, int decode_runs);
 #endif

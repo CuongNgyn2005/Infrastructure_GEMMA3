@@ -8,9 +8,9 @@ extern "C" {
 
 struct ggml_tensor;
 
-// Decode-only FPGA service counters. The transfer duration contains H2IP DMA,
-// IP2H DMA, and the required host read of the output buffer; it excludes
-// graph construction, input preparation, host accumulation, and sampling.
+// Decode-only host-observed FPGA timings. DMA stages exclude CPU result
+// reading/conversion/accumulation, which is recorded separately. Compute is
+// launch-to-observed-completion time, not an FPGA hardware cycle counter.
 struct fpga_perf_decode_data {
     int64_t decode_tokens;
     int64_t decode_wall_us;
@@ -18,7 +18,8 @@ struct fpga_perf_decode_data {
     int64_t vpu_runs;
     int64_t ip_compute_us;
     int64_t h2ip_dma_us;
-    int64_t output_transfer_us;
+    int64_t ip2host_dma_us;
+    int64_t host_result_us;
     int64_t preparation_us;
     int64_t direct_weight_pack_us;
     int64_t scale_pack_us;

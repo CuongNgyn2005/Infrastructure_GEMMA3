@@ -22,6 +22,9 @@ def section(begin, end):
 
 harness = r'''
 #include <array>
+#include <cstring>
+#include <climits>
+constexpr int VPU_BLOCK_BEATS = 2;
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -53,7 +56,7 @@ static int checked_signal(pthread_cond_t * cv) {
 }
 #define pthread_cond_signal checked_signal
 '''
-harness += section("static void * fpga_p2_pack_worker_main(void *) {", "static bool checked_size_add(")
+harness += section("static bool fpga_copy_weight_pair_range(", "static bool checked_size_add(")
 harness += r'''
 #undef pthread_cond_signal
 int main() {
@@ -103,6 +106,7 @@ int main() {
                 rows, blocks, beats, 0, pairs, false, &ref_words));
             assert(fpga_p2_pack_worker_next_generation(&generation));
             task.generation = generation;
+            task.cached_words = i % 2 ? ref : nullptr;
             if (i % 3 == 0) std::this_thread::sleep_for(std::chrono::microseconds(20));
             assert(fpga_p2_pack_worker_submit(task));
             assert(fpga_pack_direct_weight_pair_range(dst, &tensor, input.data(), 0, 0,
@@ -132,7 +136,7 @@ int main() {
     g_p2_pack_worker_next_generation = UINT64_MAX;
     assert(!fpga_p2_pack_worker_next_generation(&generation));
     assert(fpga_p2_pack_worker_stop());
-    puts("PASS: 6000 byte-exact parallel jobs; wake races, stale/failed completion, admission, overflow, restart");
+    puts("PASS: 6000 byte-exact parallel jobs (3000 pack, 3000 copy); wake races, stale/failed completion, admission, overflow, restart");
 }
 '''
 # Structural guard: delayed notification is the intended production change.

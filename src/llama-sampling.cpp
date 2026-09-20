@@ -6,7 +6,6 @@
 
 #ifdef USE_FPGA
 #include "../ggml/src/ggml-cpu/fpga_host.h"
-#include "../ggml/src/ggml-cpu/fpga_log.h"
 #endif
 
 #include <algorithm>
@@ -2663,14 +2662,11 @@ struct llama_perf_sampler_data llama_perf_sampler(const struct llama_sampler * c
 }
 
 void llama_perf_sampler_print(const struct llama_sampler * chain) {
-    const auto data = llama_perf_sampler(chain);
-
-    LLAMA_LOG_INFO("%s:    sampling time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
-            __func__, data.t_sample_ms, data.n_sample, data.t_sample_ms / data.n_sample, 1e3 / data.t_sample_ms * data.n_sample);
+    (void) chain;
 #ifdef USE_FPGA
     fpga_perf_decode_data fpga_perf = {};
     if (fpga_perf_decode_get(&fpga_perf)) {
-        const long long transfer_us = fpga_perf.h2ip_dma_us + fpga_perf.output_transfer_us;
+        const long long transfer_us = fpga_perf.h2ip_dma_us + fpga_perf.ip2host_dma_us;
         const long long service_us = fpga_perf.ip_compute_us + transfer_us;
         const double ip_only_tokens_per_second = fpga_perf.ip_compute_us > 0 ?
             (double) fpga_perf.decode_tokens * 1000000.0 / (double) fpga_perf.ip_compute_us : 0.0;
@@ -2681,7 +2677,6 @@ void llama_perf_sampler_print(const struct llama_sampler * chain) {
         const double direct_weight_pack_pct = fpga_perf.preparation_us > 0 ?
             100.0 * (double) fpga_perf.direct_weight_pack_us / (double) fpga_perf.preparation_us : 0.0;
 
-        printf("\n--- Summary ---\n");
         printf("\n[Decode]\n");
         printf("%-28s = %10lld\n", "Tokens", (long long) fpga_perf.decode_tokens);
         printf("%-28s = %10.2f tokens/s\n", "End-to-end speed", end_to_end_tokens_per_second);
@@ -2689,7 +2684,13 @@ void llama_perf_sampler_print(const struct llama_sampler * chain) {
 
         printf("\n[IP]\n");
         printf("%-28s = %10.2f tokens/s\n", "IP-only compute speed", ip_only_tokens_per_second);
-        printf("%-28s = %10.2f tokens/s\n", "IP + transfer speed", service_tokens_per_second);
+        printf("%-28s = %10.2f tokens/s\n", "IP + DMA speed", service_tokens_per_second);
+
+        printf("\n[CPU Result Processing]\n");
+        printf("%-28s = %10.2f s\n", "Read + convert + accumulate", (double) fpga_perf.host_result_us / 1000000.0);
+        printf("%-28s = %10.2f ms/token\n", "Average per decode token",
+               fpga_perf.decode_tokens > 0 ?
+                   (double) fpga_perf.host_result_us / (1000.0 * (double) fpga_perf.decode_tokens) : 0.0);
 
         printf("\n[CPU Preparation]\n");
         printf("%-28s = %10.2f s\n", "Total", (double) fpga_perf.preparation_us / 1000000.0);
@@ -2697,9 +2698,7 @@ void llama_perf_sampler_print(const struct llama_sampler * chain) {
                (double) fpga_perf.direct_weight_pack_us / 1000000.0, direct_weight_pack_pct);
         printf("%-28s = %10.2f s\n", "Scale-table packing", (double) fpga_perf.scale_pack_us / 1000000.0);
 
-        fpga_log_decode_diagnostics(fpga_perf);
     } else {
-        printf("\n--- Summary ---\n");
         printf("No completed FPGA decode-token timing was recorded.\n");
         printf("--------------------------------------------------------------------------------\n");
     }

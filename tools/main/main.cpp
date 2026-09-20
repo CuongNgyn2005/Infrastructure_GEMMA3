@@ -85,7 +85,7 @@ static void fpga_teardown_trace(const char * stage) {
         return;
     }
 
-    std::fprintf(stderr, "[FPGA][TEARDOWN] stage=%s\n", stage);
+    std::fprintf(stderr, "[TEARDOWN] stage=%s\n", stage);
     std::fflush(stderr);
 }
 
@@ -1271,6 +1271,13 @@ int main(int argc, char ** argv) {
     }
 
     LOG("\n\n");
+#ifdef USE_FPGA
+    // Generated text uses the asynchronous LOG queue; the FPGA summary uses
+    // direct printf. Drain queued tokens before allowing the summary to pass
+    // them, then resume logging for performance messages and teardown.
+    common_log_pause(common_log_main());
+    common_log_resume(common_log_main());
+#endif
     common_perf_print(ctx, smpl);
 
     // A SIGINT can arrive at any instruction below.  Mark teardown before

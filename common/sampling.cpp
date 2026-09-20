@@ -394,6 +394,18 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
     // TODO: measure grammar performance
 
+#ifdef USE_FPGA
+    printf("\n--- Summary ---\n");
+    if (ctx) {
+        const auto data = llama_perf_context(ctx);
+        printf("\n[Prompt]\n");
+        printf("%-28s = %10d\n", "Tokens", data.n_p_eval);
+        printf("%-28s = %10.2f s\n", "Evaluation time", data.t_p_eval_ms / 1000.0);
+        printf("%-28s = %10.2f tokens/s\n", "Evaluation speed",
+               data.t_p_eval_ms > 0.0 ? 1000.0 * data.n_p_eval / data.t_p_eval_ms : 0.0);
+    }
+#endif
+
     if (gsmpl) {
         llama_perf_sampler_print(gsmpl->chain);
     }
