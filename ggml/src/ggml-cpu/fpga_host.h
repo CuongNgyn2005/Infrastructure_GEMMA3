@@ -17,6 +17,8 @@ struct fpga_perf_decode_data {
     int64_t fpga_matmuls;
     int64_t vpu_runs;
     int64_t ip_compute_us;
+    // Automatic completion-watcher timing; includes host polling overhead.
+    int ip_compute_timing_valid;
     int64_t h2ip_dma_us;
     int64_t ip2host_dma_us;
     int64_t host_result_us;

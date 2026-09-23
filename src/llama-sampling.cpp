@@ -2683,8 +2683,13 @@ void llama_perf_sampler_print(const struct llama_sampler * chain) {
         printf("%-28s = %10lld\n", "FPGA matmul hooks", (long long) fpga_perf.fpga_matmuls);
 
         printf("\n[IP]\n");
-        printf("%-28s = %10.2f tokens/s\n", "IP-only compute speed", ip_only_tokens_per_second);
-        printf("%-28s = %10.2f tokens/s\n", "IP + DMA speed", service_tokens_per_second);
+        if (fpga_perf.ip_compute_timing_valid && fpga_perf.ip_compute_us > 0) {
+            printf("%-28s = %10.2f tokens/s\n", "IP-only compute speed", ip_only_tokens_per_second);
+            printf("%-28s = %10.2f tokens/s\n", "IP + DMA speed", service_tokens_per_second);
+        } else {
+            printf("%-28s = not measured\n", "IP-only compute speed");
+            printf("%-28s = not measured\n", "IP + DMA speed");
+        }
 
         printf("\n[CPU Result Processing]\n");
         printf("%-28s = %10.2f s\n", "Read + convert + accumulate", (double) fpga_perf.host_result_us / 1000000.0);

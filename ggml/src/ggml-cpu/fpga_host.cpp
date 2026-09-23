@@ -284,7 +284,7 @@ static constexpr long long FPGA_DEFAULT_IP_TIMEOUT_US           = 5000000LL;
 // copies.  Keep each submitted descriptor bounded to 64 KiB.  Consecutive
 // chunks retain the same contiguous destination window and do not alter the
 // VPU's tile, Q8 layout, or arithmetic contract.
-static constexpr size_t    FPGA_DEFAULT_ZDMA_MAX_TRANSFER_BYTES = 64U * 1024U;
+static constexpr size_t    FPGA_DEFAULT_ZDMA_MAX_TRANSFER_BYTES = 256U * 1024U;
 static constexpr int       FPGA_DEFAULT_STATUS_EVERY            = 0;
 static constexpr int       FPGA_DEFAULT_PROFILE_EVERY           = 0;
 static constexpr int       FPGA_DEFAULT_DETAIL_EVERY            = 0;
@@ -563,6 +563,7 @@ typedef struct {
     long long                         dma_scale_us;
     long long                         dma_result_us;
     long long                         ip_start_us;
+    long long                         measured_compute_us;
     long long                         ip_compute_us;
     long long                         host_result_us;
     bool                              output_dma_ready;
@@ -6056,6 +6057,131 @@ static bool fpga_preload_q8_tile_inputs(fpga_tile_job_t &       job,
     return true;
 }
 
+static bool fpga_measure_q8_compute_completion(fpga_tile_job_t & job) {
+    job.measured_compute_us = 0;
+    uint32_t status = 0;
+    // Runs on the read-only completion watcher, independently of preparation.
+    // VPU DONE precedes final SPU writes: include both in P2 computation.
+    if (!wait_vpu_done(&status) || !wait_spu_stream_outputs(job)) {
+        return false;
+    }
+    const long long elapsed = monotonic_now_us() - job.ip_start_us;
+    if (elapsed <= 0) {
+        LOGE("IP compute timer returned a non-positive interval job=%u", job.job_id);
+        return false;
+    }
+    job.measured_compute_us = elapsed;
+    return true;
+}
+
+// One outstanding compute job, matching the hardware protocol. The watcher
+// owns a metadata snapshot (never a scheduler slot), and only reads MMIO.
+// Main remains the sole owner of DMA, descriptors, START and result retirement.
+static pthread_t g_compute_watch_thread;
+static pthread_mutex_t g_compute_watch_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_compute_watch_cond = PTHREAD_COND_INITIALIZER;
+static std::atomic<int> g_compute_watch_phase{0}; // 0 idle, 1 ready, 2 launched, 3 captured
+static std::atomic<bool> g_compute_watch_stop{false};
+static bool g_compute_watch_created = false;
+static bool g_compute_watch_pending = false;
+static bool g_compute_watch_ok = false;
+static fpga_tile_job_t g_compute_watch_job = {};
+
+static void * fpga_compute_watch_main(void *) {
+    for (;;) {
+        pthread_mutex_lock(&g_compute_watch_mutex);
+        while (!g_compute_watch_pending && !g_compute_watch_stop.load()) {
+            pthread_cond_wait(&g_compute_watch_cond, &g_compute_watch_mutex);
+        }
+        const bool stopping = g_compute_watch_stop.load();
+        pthread_mutex_unlock(&g_compute_watch_mutex);
+        if (stopping) {
+            return nullptr;
+        }
+        // Ready handshake happens BEFORE START, excluding thread wake-up time.
+        g_compute_watch_phase.store(1, std::memory_order_release);
+        while (g_compute_watch_phase.load(std::memory_order_acquire) != 2) {
+            if (g_compute_watch_stop.load()) {
+                return nullptr;
+            }
+            sched_yield();
+        }
+        g_compute_watch_ok = fpga_measure_q8_compute_completion(g_compute_watch_job);
+        pthread_mutex_lock(&g_compute_watch_mutex);
+        g_compute_watch_pending = false;
+        pthread_mutex_unlock(&g_compute_watch_mutex);
+        g_compute_watch_phase.store(3, std::memory_order_release);
+    }
+}
+
+static bool fpga_compute_watch_arm(const fpga_tile_job_t & job) {
+    if (!g_compute_watch_created) {
+        g_compute_watch_stop.store(false);
+        if (pthread_create(&g_compute_watch_thread, nullptr, fpga_compute_watch_main, nullptr) != 0) {
+            LOGE("Cannot create automatic IP completion watcher");
+            return false;
+        }
+        g_compute_watch_created = true;
+    }
+    if (g_compute_watch_phase.load(std::memory_order_acquire) != 0) {
+        LOGE("IP completion watcher still owns the preceding job");
+        return false;
+    }
+    pthread_mutex_lock(&g_compute_watch_mutex);
+    // Copy only the fields used by wait_spu_stream_outputs; no model data or
+    // vectors are copied, and early scheduler errors cannot dangle a pointer.
+    g_compute_watch_job.job_id = job.job_id;
+    g_compute_watch_job.bank = job.bank;
+    g_compute_watch_job.rows = job.rows;
+    g_compute_watch_job.group_blocks = job.group_blocks;
+    g_compute_watch_job.spu_stream_count_before = job.spu_stream_count_before;
+    g_compute_watch_job.spu_stream_done_before = job.spu_stream_done_before;
+    g_compute_watch_job.spu_stream_out_before = job.spu_stream_out_before;
+    g_compute_watch_job.spu_stream_drop_before = job.spu_stream_drop_before;
+    g_compute_watch_job.spu_stream_error_before = job.spu_stream_error_before;
+    g_compute_watch_pending = true;
+    pthread_cond_signal(&g_compute_watch_cond);
+    pthread_mutex_unlock(&g_compute_watch_mutex);
+    const long long begin = monotonic_now_us();
+    while (g_compute_watch_phase.load(std::memory_order_acquire) != 1) {
+        if (monotonic_now_us() - begin > g_ip_timeout_us) {
+            LOGE("IP completion watcher readiness timeout");
+            return false;
+        }
+        sched_yield();
+    }
+    return true;
+}
+
+static void fpga_compute_watch_launch(long long start_us) {
+    g_compute_watch_job.ip_start_us = start_us;
+    g_compute_watch_phase.store(2, std::memory_order_release);
+}
+
+static bool fpga_compute_watch_collect(fpga_tile_job_t & job) {
+    while (g_compute_watch_phase.load(std::memory_order_acquire) != 3) {
+        sched_yield(); // watcher uses the existing bounded hardware waits
+    }
+    const bool ok = g_compute_watch_ok && g_compute_watch_job.job_id == job.job_id;
+    job.measured_compute_us = ok ? g_compute_watch_job.measured_compute_us : 0;
+    g_compute_watch_phase.store(0, std::memory_order_release);
+    return ok;
+}
+
+static void fpga_compute_watch_shutdown() {
+    if (!g_compute_watch_created) {
+        return;
+    }
+    pthread_mutex_lock(&g_compute_watch_mutex);
+    g_compute_watch_stop.store(true);
+    pthread_cond_signal(&g_compute_watch_cond);
+    pthread_mutex_unlock(&g_compute_watch_mutex);
+    pthread_join(g_compute_watch_thread, nullptr); // before any MMIO unmap
+    g_compute_watch_created = false;
+    g_compute_watch_pending = false;
+    g_compute_watch_phase.store(0);
+}
+
 static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
                                     fpga_stage_totals_t * totals,
                                     const char *          tensor_name,
@@ -6239,10 +6365,15 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
 
     vpu_write_tile_descriptor(job, FPGA_SLOT_COMPUTING, FPGA_SLOT_FREE, 0x00000101U);
     mmio_fence();
-    job.ip_start_us = now_us();
     p2_trace_first_tile(job, "VPU_LAUNCH", "before");
+    if (!fpga_compute_watch_arm(job)) {
+        return false;
+    }
+    job.ip_start_us = now_us();
+    const long long compute_start_us = monotonic_now_us();
     vpu_wr32(REG_CTRL, CTRL_START);
     mmio_fence();
+    fpga_compute_watch_launch(compute_start_us);
     job.event_launch_us = p2_event_now_us();
     if (totals && job.handoff_prev_output_ready_us > 0 && job.event_launch_us >= job.handoff_prev_output_ready_us) {
         totals->scheduler_output_to_launch_us += job.event_launch_us - job.handoff_prev_output_ready_us;
@@ -6289,6 +6420,10 @@ static bool fpga_wait_and_drain_q8_tile_job(fpga_tile_job_t &     job,
         LOGE("P2 result ownership violation before drain job=%u", job.job_id);
         return false;
     }
+    if (!fpga_compute_watch_collect(job)) {
+        LOGE("IP completion measurement failed job=%u", job.job_id);
+        return false;
+    }
     uint32_t vpu_status = 0;
     p2_trace_first_tile(job, "VPU_DONE_WAIT", "before");
     if (!wait_vpu_done(&vpu_status)) {
@@ -6299,13 +6434,12 @@ static bool fpga_wait_and_drain_q8_tile_job(fpga_tile_job_t &     job,
             job.job_id, job.bank, attempt, vpu_status, vpu_rd32(REG_PROGRESS));
         return false;
     }
-    const long long ip1 = now_us();
     job.event_vpu_done_us = p2_event_now_us();
     p2_trace_first_tile(job, "VPU_DONE_WAIT", "after");
     p2_event_trace(job, "VPU_DONE", job.event_vpu_done_us, "launch_to_vpu_done_observed_us",
                    job.event_vpu_done_us - job.event_launch_us);
     job.vpu_status    = vpu_status;
-    job.ip_compute_us = ip1 - job.ip_start_us;
+    job.ip_compute_us = job.measured_compute_us;
     if (!vpu_verify_done_job(job, vpu_status)) {
         return false;
     }
@@ -6910,6 +7044,7 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
     uint32_t        tile_id           = 0;
     uint32_t        weight_tile_index = 0;
     fpga_tile_job_t slots[2]          = {};
+    fpga_tile_job_t * running        = nullptr;
     long long reused_jobs = 0;
     uint64_t avoided_weight_bytes = 0;
     const bool overlap_results = g_p2_result_overlap_enabled && g_vpu_descriptor_supported;
@@ -6920,11 +7055,57 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                       SPU_OUT_END <= SPU_PARAM_BASE,
                   "result overlap requires disjoint input/output DDR windows");
 
+    const auto store_rows = [&](int64_t completed_row0, int completed_rows) {
+        const long long store0 = now_us();
+        for (int64_t col = 0; col < m; ++col) {
+            const float * accum_col = &accum[(size_t) (col * completed_rows)];
+            for (int row = 0; row < completed_rows; ++row) {
+                store_dst_value(dst, completed_row0 + row, col, accum_col[(size_t) row]);
+            }
+        }
+        if (totals) {
+            totals->host_accum_us += now_us() - store0;
+        }
+    };
+    const auto can_carry_to_row = [&](int next_rows) {
+        // Prompt columns retain their established staging/bank-reuse loop.
+        // The existing off switch also restores the original row drains.
+        if (!overlap_results || m != 1) {
+            return false;
+        }
+        if (!g_p2_weight_residency_enabled || g_p2_residency_next_slot >= g_p2_resident_tiles.size()) {
+            return true;
+        }
+        // Previously the first tile of this row could build a resident entry
+        // with hardware idle. Keep that opportunity whenever its payload fits,
+        // even if it might already be resident. Do not change cache admission.
+        const int blocks = packed_q8_group_blocks_for_rows(next_rows, (int) nb);
+        size_t qs_padded = 0;
+        size_t scales_padded = 0;
+        if (!fpga_p2_residency_align_up(weight_window_bytes_for_rows(next_rows, blocks * VPU_BLOCK_BEATS),
+                                        WEIGHT_CACHE_ALIGN, &qs_padded) ||
+            !fpga_p2_residency_align_up((size_t) next_rows * (size_t) blocks * sizeof(uint16_t),
+                                        WEIGHT_CACHE_ALIGN, &scales_padded) ||
+            qs_padded > std::numeric_limits<size_t>::max() - scales_padded ||
+            g_p2_weight_residency_budget_mb < 0) {
+            return false;
+        }
+        const uint64_t budget_end = (uint64_t) WEIGHT_CACHE_BASE +
+                                   (uint64_t) g_p2_weight_residency_budget_mb * 1024ULL * 1024ULL;
+        if (budget_end > P2_WEIGHT_RESIDENCY_END) {
+            return false;
+        }
+        uint32_t allocation_end = 0;
+        return !fpga_p2_residency_range_end(g_p2_residency_next_off, qs_padded + scales_padded,
+                                           (uint32_t) budget_end, &allocation_end);
+    };
+
     for (int64_t row0 = 0; row0 < n; row0 += g_vpu_max_rows) {
         const int rows = (int) std::min<int64_t>(g_vpu_max_rows, n - row0);
-        accum.assign((size_t) (m * rows), 0.0f);
+        if (!running) {
+            accum.assign((size_t) (m * rows), 0.0f);
+        }
 
-        fpga_tile_job_t * running = nullptr;
         for (int64_t ib0 = 0; ib0 < nb;) {
             const int remaining_blocks = (int) (nb - ib0);
             const int group_blocks     = packed_q8_group_blocks_for_rows(rows, remaining_blocks);
@@ -7031,6 +7212,14 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                             totals->result_overlap_host_us += running->host_result_us;
                         }
                     }
+                    if (running->row0 != row0) {
+                        // B is now executing, but accum still belongs to A.
+                        // Store A with its own row count (including tails)
+                        // before reusing the buffer. B cannot drain until the
+                        // next iteration, after this transition is complete.
+                        store_rows(running->row0, running->rows);
+                        accum.assign((size_t) (m * rows), 0.0f);
+                    }
                     running = &prepared;
                 } else {
                     if (!fpga_submit_q8_tile_job(prepared, totals, tensor_name, layer_id, k, n, m, 0)) {
@@ -7053,6 +7242,11 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
             weight_tile_index++;
         }
 
+        const int64_t next_row0 = row0 + rows;
+        if (running && next_row0 < n &&
+            can_carry_to_row((int) std::min<int64_t>(g_vpu_max_rows, n - next_row0))) {
+            continue;
+        }
         if (running) {
             if (!fpga_wait_and_drain_q8_tile_job(*running, totals, tensor_name, layer_id, k, n, m, 0)) {
                 return false;
@@ -7060,18 +7254,10 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
             if (!fpga_accumulate_pl_scaled_q8_tile_job(*running, accum, totals)) {
                 return false;
             }
+            running = nullptr;
         }
 
-        const long long store0 = now_us();
-        for (int64_t col = 0; col < m; ++col) {
-            const float * accum_col = &accum[(size_t) (col * rows)];
-            for (int row = 0; row < rows; ++row) {
-                store_dst_value(dst, row0 + row, col, accum_col[(size_t) row]);
-            }
-        }
-        if (totals) {
-            totals->host_accum_us += now_us() - store0;
-        }
+        store_rows(row0, rows);
     }
     if (m > 1) {
         fpga_log_prompt_weight_reuse(tensor_name, m, reused_jobs, avoided_weight_bytes);
@@ -8232,6 +8418,7 @@ void fpga_cleanup(void) {
         return;
     }
     g_cleanup_done = true;
+    fpga_compute_watch_shutdown();
     LOGPROOF(
         "cleanup begin lifecycle=explicit-before-backend-free ddr_mapped=%d vpu_mapped=%d dma_mapped=%d "
         "weight_cache_entries=%zu weight_path_bench_passive=%d",
@@ -8439,6 +8626,7 @@ extern "C" int fpga_perf_decode_get(fpga_perf_decode_data * data) {
     }
 
     *data = g_fpga_perf_decode;
+    data->ip_compute_timing_valid = g_spu_q8_scale_stream_supported && g_contract_check_limit == 0;
     data->run_fpga_gemvs = g_fpga_count;
     data->run_q8_unavailable_cpu_fallbacks = g_q8_unavailable_cpu_fallback_calls.load(std::memory_order_relaxed);
     data->run_rejects = g_reject_count;
