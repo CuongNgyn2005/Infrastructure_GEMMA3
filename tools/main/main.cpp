@@ -286,6 +286,10 @@ int main(int argc, char ** argv) {
         LOG_WRN("%s: warning: scaling RoPE frequency by %g.\n", __func__, params.rope_freq_scale);
     }
 
+#ifdef USE_FPGA
+    // Run once before model loading/inference; release scratch RAM immediately.
+    fpga_log_ram_bandwidth();
+#endif
     LOG_INF("%s: llama backend init\n", __func__);
 
     llama_backend_init();

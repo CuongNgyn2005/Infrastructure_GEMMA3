@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
@@ -129,6 +130,58 @@ void fpga_log_pack_breakdown(const char * scope, int graph_seq, long long tokens
 }
 
 #ifdef USE_FPGA
+void fpga_log_ram_bandwidth() {
+    FILE * fp = fpga_log_fp();
+    if (fp == stderr) {
+        return;
+    }
+    // Two 32 MiB buffers exceed the ZCU104 CPU cache capacity. Touch every
+    // page before timing, so allocation and initial page faults are excluded.
+    // This is logical memcpy throughput, not a DDR-controller traffic counter.
+    constexpr size_t bytes = 32u * 1024u * 1024u;
+    constexpr unsigned passes = 8;
+    auto * src = static_cast<unsigned char *>(std::malloc(bytes));
+    auto * dst = static_cast<unsigned char *>(std::malloc(bytes));
+    if (!src || !dst) {
+        std::free(src);
+        std::free(dst);
+        fprintf(fp, "[RAM_BANDWIDTH] status=skipped reason=allocation_failed allocation_bytes=%zu\n", 2 * bytes);
+        fpga_log_finish_line(fp, true);
+        return;
+    }
+    for (size_t i = 0; i < bytes; ++i) {
+        src[i] = static_cast<unsigned char>((i * 31u + (i >> 8)) & 255u);
+    }
+    std::memset(dst, 0, bytes);
+    // A volatile function pointer preserves every copy even with optimization
+    // and LTO. Use the platform's libc memcpy, on one calling CPU thread.
+    void * (*volatile copy_fn)(void *, const void *, size_t) = std::memcpy;
+    copy_fn(dst, src, bytes); // Untimed warm-up, including destination faults.
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < passes; ++i) {
+        copy_fn(dst, src, bytes);
+    }
+    const auto end = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(end - start).count();
+    const bool verified = std::memcmp(src, dst, bytes) == 0;
+    std::free(src);
+    std::free(dst);
+    if (!verified || seconds <= 0.0) {
+        fprintf(fp, "[RAM_BANDWIDTH] status=failed reason=%s\n",
+                verified ? "invalid_duration" : "copy_mismatch");
+    } else {
+        const size_t copied_bytes = bytes * passes;
+        const double copy_gb_s = static_cast<double>(copied_bytes) / seconds / 1e9;
+        fprintf(fp, "[RAM_BANDWIDTH] status=ok method=libc_memcpy threads=1 "
+                    "buffer_bytes=%zu passes=%u copied_bytes=%zu elapsed_ms=%.6f "
+                    "copy_GB_s=%.6f logical_read_write_GB_s=%.6f verified=1 "
+                    "scope=startup_cpu_cached_memory physical_ddr_traffic=not_measured "
+                    "allocation_warmup_verification=excluded units=decimal_GB\n",
+                bytes, passes, copied_bytes, seconds * 1000.0, copy_gb_s, 2.0 * copy_gb_s);
+    }
+    fpga_log_finish_line(fp, true);
+}
+
 void fpga_log_load_checkpoint(const char * phase) {
     // Startup-only snapshots. Counters are process cumulative; subtract
     // adjacent records for a phase. No per-tensor/per-token instrumentation.

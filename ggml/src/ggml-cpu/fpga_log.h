@@ -36,6 +36,8 @@ void fpga_log_pack_breakdown(const char * scope, int graph_seq, long long tokens
                              const fpga_pack_breakdown_log_t & data);
 #ifdef USE_FPGA
 void   fpga_log_load_checkpoint(const char * phase);
+// One startup-only CPU RAM copy benchmark; no FPGA/physical-memory access.
+void   fpga_log_ram_bandwidth();
 #else
 inline void fpga_log_load_checkpoint(const char *) {}
 #endif
