@@ -36,7 +36,7 @@
 __extension__ typedef unsigned __int128 fpga_uint128_t;
 __extension__ typedef __int128          fpga_int128_t;
 
-#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v89-p2-only"
+#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v91-p2-fused-pack"
 
 #define MY_IP_BASE_ADDRESS 0x00000000A0000000LL
 #define REG_BASE_PHYS      0x00000000A0000000LL
@@ -847,9 +847,9 @@ static long long         g_p2_residency_metadata_validate_us          = 0;
 static long long         g_p2_residency_resident_param_us             = 0;
 static long long         g_p2_residency_direct_weight_pack_us         = 0;
 static uint64_t          g_p2_residency_direct_weight_pack_bytes      = 0;
-// V78 deliberately accelerates only the CPU stores that prepare the existing
-// P2 WEIGHT window.  The worker never owns a DMA, descriptor, IP, or SPU
-// action; g_mutex still serializes every hardware job around this local work.
+// V91 fuses direct WEIGHT and SCALE staging only for large, non-reused P2
+// tiles.  The worker never owns a DMA, descriptor, IP, or SPU action; g_mutex
+// still serializes every hardware job around this local work.
 static int               g_p2_pack_workers_requested                  = 2;
 static int               g_p2_pack_workers_active                     = 2;
 static long long         g_p2_pack_parallel_jobs                       = 0;
@@ -858,6 +858,9 @@ static long long         g_p2_pack_serial_threshold_skips              = 0;
 static long long         g_p2_pack_main_us                             = 0;
 static long long         g_p2_pack_helper_service_us                   = 0;
 static long long         g_p2_pack_caller_wait_us                      = 0;
+static long long         g_p2_pack_fused_jobs                          = 0;
+static long long         g_p2_pack_fused_us                             = 0;
+static long long         g_p2_pack_fused_scale_entries                  = 0;
 enum fpga_pack_detail_field {
     PACK_TOTAL, PACK_SERIAL, PACK_DISPATCH, PACK_MAIN, PACK_FENCE, PACK_WAIT,
     PACK_HELPER, PACK_SERIAL_JOBS, PACK_PARALLEL_JOBS,
@@ -878,9 +881,10 @@ static fpga_pack_breakdown_log_t fpga_pack_detail_record(
 static constexpr size_t  FPGA_P2_PACK_PARALLEL_MIN_BYTES               = 256U * 1024U;
 
 // A task has no device ownership: it is a prevalidated, disjoint range of
-// volatile WEIGHT words in the already-admitted DDR mapping.  The caller owns
-// all range checks and does not start DMA until it observes completion for the
-// matching generation.
+// volatile WEIGHT words and, for the direct fused path, the corresponding
+// row-major SCALE entries in the already-admitted DDR mapping.  The caller
+// owns all range checks and does not start DMA until it observes completion
+// for the matching generation.
 typedef struct {
     const struct ggml_tensor * src0;
     const void *               weight_data_base;
@@ -895,6 +899,10 @@ typedef struct {
     size_t                     expected_words;
     uint64_t                   generation;
     const uint32_t *           cached_words = nullptr; // Diagnostic copy only; production packs.
+    const void *               activation_data_base = nullptr;
+    volatile uint32_t *        scale_words = nullptr;
+    size_t                     expected_scale_entries = 0;
+    bool                       fused_scale = false;
 } fpga_p2_pack_worker_task_t;
 
 static pthread_mutex_t        g_p2_pack_worker_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -910,6 +918,7 @@ static uint64_t               g_p2_pack_worker_next_generation = 0;
 static uint64_t               g_p2_pack_worker_completed_generation = 0;
 static bool                   g_p2_pack_worker_completed_success = false;
 static size_t                 g_p2_pack_worker_completed_words = 0;
+static size_t                 g_p2_pack_worker_completed_scale_entries = 0;
 static long long              g_p2_pack_worker_completed_service_us = 0;
 static long long         g_p2_residency_avoided_cpu_pack_bytes        = 0;
 // Residency still transfers each selected tile from DDR to the IP.  Keep this
@@ -3928,13 +3937,21 @@ static void * fpga_p2_pack_worker_main(void *) {
 
         const long long service0 = now_us();
         size_t written_words = 0U;
-        const bool range_success = task.cached_words ? fpga_copy_weight_pair_range(task, &written_words) :
-            fpga_pack_direct_weight_pair_range(
-            task.dst_words, task.src0, task.weight_data_base, task.row0, task.k_block0, task.rows,
-            task.group_blocks, task.group_beats, task.pair_begin, task.pair_end, true, &written_words);
-        const bool success = range_success && written_words == task.expected_words;
-        // Completion is never published before all volatile WEIGHT stores are
-        // globally observed.  The caller performs its own DSB before DMA.
+        size_t written_scale_entries = 0U;
+        const bool range_success = task.fused_scale ?
+            fpga_pack_direct_weight_scale_pair_range(
+                task.dst_words, task.scale_words, task.src0, task.weight_data_base, task.activation_data_base,
+                task.row0, task.k_block0, task.rows, task.group_blocks, task.group_beats, task.pair_begin,
+                task.pair_end, true, &written_words, &written_scale_entries) :
+            (task.cached_words ? fpga_copy_weight_pair_range(task, &written_words) :
+             fpga_pack_direct_weight_pair_range(
+                task.dst_words, task.src0, task.weight_data_base, task.row0, task.k_block0, task.rows,
+                task.group_blocks, task.group_beats, task.pair_begin, task.pair_end, true, &written_words));
+        const bool scale_count_ok = !task.fused_scale || written_scale_entries == task.expected_scale_entries;
+        const bool success = range_success && written_words == task.expected_words && scale_count_ok;
+        // Completion is never published before all volatile WEIGHT and SCALE
+        // stores are globally observed.  The caller performs its own DSB
+        // before DMA.
         mmio_fence();
 
         pthread_mutex_lock(&g_p2_pack_worker_mutex);
@@ -3942,6 +3959,7 @@ static void * fpga_p2_pack_worker_main(void *) {
         g_p2_pack_worker_completed_generation = task.generation;
         g_p2_pack_worker_completed_success = success;
         g_p2_pack_worker_completed_words = written_words;
+        g_p2_pack_worker_completed_scale_entries = written_scale_entries;
         g_p2_pack_worker_completed_service_us = now_us() - service0;
         pthread_cond_broadcast(&g_p2_pack_worker_done_cv);
         pthread_mutex_unlock(&g_p2_pack_worker_mutex);
@@ -3961,6 +3979,7 @@ static bool fpga_p2_pack_worker_start(void) {
     g_p2_pack_worker_completed_generation = 0U;
     g_p2_pack_worker_completed_success = false;
     g_p2_pack_worker_completed_words = 0U;
+    g_p2_pack_worker_completed_scale_entries = 0U;
     g_p2_pack_worker_completed_service_us = 0;
     const int create_rc = pthread_create(&g_p2_pack_worker_thread, nullptr, fpga_p2_pack_worker_main, nullptr);
     if (create_rc == 0) {
@@ -4023,7 +4042,11 @@ static bool fpga_p2_pack_worker_submit(const fpga_p2_pack_worker_task_t & task) 
     return true;
 }
 
-static bool fpga_p2_pack_worker_wait(uint64_t generation, size_t * words, long long * service_us, long long * wait_us) {
+static bool fpga_p2_pack_worker_wait(uint64_t generation,
+                                     size_t * words,
+                                     long long * service_us,
+                                     long long * wait_us,
+                                     size_t * scale_entries = nullptr) {
     if (!words || !service_us || !wait_us || generation == 0U) {
         return false;
     }
@@ -4035,6 +4058,9 @@ static bool fpga_p2_pack_worker_wait(uint64_t generation, size_t * words, long l
     const bool success = g_p2_pack_worker_created && g_p2_pack_worker_completed_generation == generation &&
                          g_p2_pack_worker_completed_success;
     *words = g_p2_pack_worker_completed_words;
+    if (scale_entries) {
+        *scale_entries = g_p2_pack_worker_completed_scale_entries;
+    }
     *service_us = g_p2_pack_worker_completed_service_us;
     pthread_mutex_unlock(&g_p2_pack_worker_mutex);
     *wait_us = now_us() - wait0;
@@ -4066,6 +4092,7 @@ static bool fpga_p2_pack_worker_stop(void) {
     g_p2_pack_worker_stop_requested = false;
     g_p2_pack_worker_task_pending = false;
     g_p2_pack_worker_busy = false;
+    g_p2_pack_worker_completed_scale_entries = 0U;
     pthread_mutex_unlock(&g_p2_pack_worker_mutex);
     return true;
 }
@@ -7718,6 +7745,9 @@ int fpga_init(void) {
     g_p2_pack_main_us = 0;
     g_p2_pack_helper_service_us = 0;
     g_p2_pack_caller_wait_us = 0;
+    g_p2_pack_fused_jobs = 0;
+    g_p2_pack_fused_us = 0;
+    g_p2_pack_fused_scale_entries = 0;
     g_pack_detail.fill(0);
     g_pack_detail_snapshot.fill(0);
     g_pack_detail_decode.fill(0);
@@ -8537,10 +8567,12 @@ void fpga_cleanup(void) {
     LOGPROOF(
         "P2_PACK_SUMMARY requested_workers=%d active_workers=%d helper_stopped=%d parallel_min_bytes=%zu "
         "parallel_jobs=%lld parallel_bytes=%llu serial_threshold_skips=%lld main_pack_us=%lld "
-        "helper_service_us=%lld caller_wait_us=%lld",
+        "helper_service_us=%lld caller_wait_us=%lld fused_jobs=%lld fused_us=%lld fused_scale_entries=%lld "
+        "fused_direct_pack_includes_scale=1",
         g_p2_pack_workers_requested, g_p2_pack_workers_active, g_p2_pack_worker_created ? 0 : 1,
         FPGA_P2_PACK_PARALLEL_MIN_BYTES, g_p2_pack_parallel_jobs, (unsigned long long) g_p2_pack_parallel_bytes,
-        g_p2_pack_serial_threshold_skips, g_p2_pack_main_us, g_p2_pack_helper_service_us, g_p2_pack_caller_wait_us);
+        g_p2_pack_serial_threshold_skips, g_p2_pack_main_us, g_p2_pack_helper_service_us, g_p2_pack_caller_wait_us,
+        g_p2_pack_fused_jobs, g_p2_pack_fused_us, g_p2_pack_fused_scale_entries);
     fpga_log_pack_breakdown("decode_total", -1, g_fpga_perf_decode.decode_tokens,
                             fpga_pack_detail_record(g_pack_detail_decode));
     fpga_log_pack_breakdown("process_total_including_startup", -1, -1,
@@ -8550,7 +8582,8 @@ void fpga_cleanup(void) {
             "forced=1 enabled=%d diagnostic=%d trace=%d verify_metadata=%d slots=%zu/%zu index_buckets=%zu max_probes=%zu probes=%lld "
             "probe_exhausted_direct_stage=%lld hits=%lld misses=%lld host_metadata_hits=%lld host_metadata_invalidations=%lld "
             "volatile_ddr_reads=%lld build_us=%lld select_us=%lld metadata_validate_us=%lld resident_param_us=%lld "
-            "direct_weight_pack_us=%lld direct_weight_pack_bytes=%llu direct_weight_pack_GB_s=%.3f "
+             "direct_weight_pack_us=%lld direct_weight_pack_bytes=%llu direct_weight_pack_GB_s=%.3f "
+             "direct_pack_includes_fused_scale=1 "
             "avoided_cpu_pack_bytes=%lld avoided_ddr_to_ip_bytes=%lld "
             "miss_alignment=%lld miss_shape=%lld miss_collision=%lld miss_poison=%lld miss_stale=%lld miss_mismatch=%lld "
             "miss_capacity=%lld miss_quiescence=%lld miss_range=%lld miss_verify=%lld builds=%lld build_failures=%lld logical_bytes=%lld "
@@ -9561,6 +9594,19 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
         return false;
     }
 
+    fpga_p2_scale_shape_t scale_shape = {};
+    if (!fpga_p2_checked_scale_shape(rows, group_blocks, job.result_values, job.result_words, job.scale_bytes,
+                                     SPU_PARAM_BASE, &scale_shape)) {
+        LOGE(
+            "P2 scale shape rejected job=%u tile=%u rows=%d group_blocks=%d result_values=%u result_words=%u "
+            "scale_bytes=%zu spu_param=0x%08x action=no_write_no_dma_no_start",
+            job.job_id, job.tile_id, rows, group_blocks, job.result_values, job.result_words, job.scale_bytes,
+            SPU_PARAM_BASE);
+        return false;
+    }
+    // Admit the complete scale range before either direct producer can write.
+    volatile uint32_t * const scale_words = ddr_checked_u32_ptr(SPU_PARAM_BASE, job.scale_bytes);
+
     if (g_p2_init_requested) {
         p2_trace_set_job_context(job);
     }
@@ -9616,6 +9662,7 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
 
     const bool direct_source = !job.weight_cache_hit && !job.p2_residency_hit;
     const bool direct_reused = direct_source && reuse_direct_weight && staging->bytes == weight_bytes;
+    bool fused_direct_pack = false;
     const long long direct_weight_pack0 = direct_source && !direct_reused ? now_us() : 0;
     if (direct_source && !direct_reused) {
         size_t direct_payload_bytes = 0;
@@ -9657,6 +9704,18 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
             const long long dispatch0 = now_us();
             const size_t main_pair_end = pair_count / 2U;
             const size_t helper_words = (pair_count - main_pair_end) * words_per_pair;
+            const size_t main_scale_rows = main_pair_end * 2U;
+            const size_t helper_scale_rows = (size_t) rows - main_scale_rows;
+            if (main_scale_rows > (size_t) rows ||
+                main_scale_rows > std::numeric_limits<size_t>::max() / (size_t) group_blocks ||
+                helper_scale_rows > std::numeric_limits<size_t>::max() / (size_t) group_blocks) {
+                fpga_fatal(
+                    "P2 direct WEIGHT+SCALE parallel split arithmetic failed job=%u tile=%u rows=%d pairs=%zu "
+                    "split=%zu action=no_write_no_dma_no_start",
+                    job.job_id, job.tile_id, rows, pair_count, main_pair_end);
+            }
+            const size_t expected_main_scale_entries = main_scale_rows * (size_t) group_blocks;
+            const size_t expected_helper_scale_entries = helper_scale_rows * (size_t) group_blocks;
             if (main_pair_end == 0U || helper_words == 0U || direct_payload_bytes > UINT64_MAX - g_p2_pack_parallel_bytes) {
                 fpga_fatal(
                     "P2 direct WEIGHT parallel split precondition failed job=%u tile=%u pairs=%zu split=%zu "
@@ -9669,10 +9728,15 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
                     "P2 direct WEIGHT helper is unavailable before pack job=%u tile=%u action=no_write_no_dma_no_start",
                     job.job_id, job.tile_id);
             }
-            const fpga_p2_pack_worker_task_t task = {
+            fpga_p2_pack_worker_task_t task = {
                 src0, weight_data_base, row0, k_block0, rows, group_blocks, group_beats,
                 main_pair_end, pair_count, direct_weight_words, helper_words, generation,
             };
+            task.activation_data_base = act_group;
+            task.scale_words = scale_words;
+            task.expected_scale_entries = expected_helper_scale_entries;
+            task.fused_scale = direct_source && !direct_reused;
+            fused_direct_pack = task.fused_scale;
             if (!fpga_p2_pack_worker_submit(task)) {
                 fpga_fatal(
                     "P2 direct WEIGHT helper submit failed job=%u tile=%u generation=%llu "
@@ -9683,9 +9747,14 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
             const long long main_pack0 = now_us();
             g_pack_detail[PACK_DISPATCH] += main_pack0 - dispatch0;
             size_t main_words = 0U;
-            const bool main_ok = fpga_pack_direct_weight_pair_range(
-                direct_weight_words, src0, weight_data_base, row0, k_block0, rows, group_blocks, group_beats,
-                0U, main_pair_end, true, &main_words);
+            size_t main_scale_entries = 0U;
+            const bool main_ok = fused_direct_pack ?
+                fpga_pack_direct_weight_scale_pair_range(
+                    direct_weight_words, scale_words, src0, weight_data_base, act_group, row0, k_block0, rows,
+                    group_blocks, group_beats, 0U, main_pair_end, true, &main_words, &main_scale_entries) :
+                fpga_pack_direct_weight_pair_range(
+                    direct_weight_words, src0, weight_data_base, row0, k_block0, rows, group_blocks, group_beats,
+                    0U, main_pair_end, true, &main_words);
             const long long main_pack_end = now_us();
             const long long main_pack_us = main_pack_end - main_pack0;
             // The caller publishes its prefix before it waits for the helper
@@ -9694,19 +9763,29 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
             const long long caller_fence_end = now_us();
             g_pack_detail[PACK_FENCE] += caller_fence_end - main_pack_end;
             size_t helper_written_words = 0U;
+            size_t helper_scale_entries = 0U;
             long long helper_service_us = 0;
             long long caller_wait_us = 0;
             const bool helper_ok = fpga_p2_pack_worker_wait(generation, &helper_written_words, &helper_service_us,
-                                                              &caller_wait_us);
+                                                              &caller_wait_us, fused_direct_pack ?
+                                                                                                  &helper_scale_entries :
+                                                                                                  nullptr);
             if (!main_ok || !helper_ok || main_words != main_pair_end * words_per_pair ||
                 helper_written_words != helper_words || main_words > expected_words ||
-                helper_written_words > expected_words - main_words) {
+                helper_written_words > expected_words - main_words ||
+                (fused_direct_pack &&
+                 (main_scale_entries != expected_main_scale_entries ||
+                  helper_scale_entries != expected_helper_scale_entries))) {
                 fpga_fatal(
-                    "P2 direct WEIGHT parallel pack completion mismatch job=%u tile=%u generation=%llu main_ok=%d "
-                    "helper_ok=%d main_words=%zu helper_words=%zu expected_main=%zu expected_helper=%zu "
+                    "P2 direct WEIGHT+SCALE parallel pack completion mismatch job=%u tile=%u generation=%llu "
+                    "fused=%d main_ok=%d helper_ok=%d main_words=%zu helper_words=%zu expected_main=%zu "
+                    "expected_helper=%zu main_scale_entries=%zu helper_scale_entries=%zu expected_main_scale=%zu "
+                    "expected_helper_scale=%zu "
                     "action=no_dma_no_start",
-                    job.job_id, job.tile_id, (unsigned long long) generation, main_ok ? 1 : 0, helper_ok ? 1 : 0,
-                    main_words, helper_written_words, main_pair_end * words_per_pair, helper_words);
+                    job.job_id, job.tile_id, (unsigned long long) generation, fused_direct_pack ? 1 : 0,
+                    main_ok ? 1 : 0, helper_ok ? 1 : 0, main_words, helper_written_words,
+                    main_pair_end * words_per_pair, helper_words, main_scale_entries, helper_scale_entries,
+                    expected_main_scale_entries, expected_helper_scale_entries);
             }
             written_words = main_words + helper_written_words;
             g_p2_pack_parallel_jobs++;
@@ -9718,6 +9797,10 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
             g_pack_detail[PACK_WAIT] += caller_wait_us;
             g_pack_detail[PACK_HELPER] += helper_service_us;
             g_pack_detail[PACK_PARALLEL_JOBS]++;
+            if (fused_direct_pack) {
+                g_p2_pack_fused_jobs++;
+                g_p2_pack_fused_scale_entries += (long long) (main_scale_entries + helper_scale_entries);
+            }
         } else {
             if (g_p2_pack_workers_requested == 2) {
                 g_p2_pack_serial_threshold_skips++;
@@ -9748,25 +9831,21 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
         if (totals) {
             totals->prep_direct_weight_pack_us += direct_weight_pack_us;
         }
+        if (fused_direct_pack) {
+            g_p2_pack_fused_us += direct_weight_pack_us;
+        }
     } else if (job.p2_residency_hit) {
         g_p2_residency_avoided_cpu_pack_bytes += (long long) job.weight_bytes;
     }
 
+    // Fused direct jobs emitted every live scale entry in the two producer
+    // ranges above.  The scale timer therefore measures only residual padding
+    // and fence work for those jobs; direct-pack timing explicitly includes
+    // the fused live scale emission.
     const long long scale_pack0 = now_us();
-    fpga_p2_scale_shape_t scale_shape = {};
-    if (!fpga_p2_checked_scale_shape(rows, group_blocks, job.result_values, job.result_words, job.scale_bytes,
-                                     SPU_PARAM_BASE, &scale_shape)) {
-        LOGE(
-            "P2 scale shape rejected job=%u tile=%u rows=%d group_blocks=%d result_values=%u result_words=%u "
-            "scale_bytes=%zu spu_param=0x%08x action=no_write_no_dma_no_start",
-            job.job_id, job.tile_id, rows, group_blocks, job.result_values, job.result_words, job.scale_bytes,
-            SPU_PARAM_BASE);
-        return false;
-    }
     // Check the complete P2 PARAM range once before the first volatile
     // store.  Every live entry is written exactly once; only the 0..3
     // unused lanes in the final 128-bit word are cleared.
-    volatile uint32_t * const scale_words = ddr_checked_u32_ptr(SPU_PARAM_BASE, job.scale_bytes);
     volatile uint32_t * scale_out = scale_words;
     const auto store_scale_pair = [](volatile uint32_t * dst, uint32_t first, uint32_t second) {
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -9778,7 +9857,7 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
         dst[1] = second;
 #endif
     };
-    if (job.p2_residency_hit) {
+    if (!fused_direct_pack && job.p2_residency_hit) {
         // The matmul lock keeps resident metadata stable throughout preparation.
         // Validate the entire source before writing any scale entries.
         if (job.p2_residency_slot >= g_p2_resident_tiles.size() ||
@@ -9807,7 +9886,7 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
                 *scale_out++ = fpga_p2_pack_scale_entry((uint16_t) act_group[gb].d, *weight_scale++);
             }
         }
-    } else {
+    } else if (!fused_direct_pack) {
         for (int row = 0; row < rows; ++row) {
             const block_q8_0_t * weight_row =
                 weight_block_from_base(src0, weight_data_base, row0 + row, k_block0);

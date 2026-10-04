@@ -7,7 +7,11 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 source = (root / "ggml/src/ggml-cpu/fpga_host.cpp").read_text()
-begin = source.index("    volatile uint32_t * const scale_words = ddr_checked_u32_ptr(SPU_PARAM_BASE, job.scale_bytes);")
+# The production scale window is admitted before weight preparation so the
+# fused direct workers can use the same validated destination. Extract the
+# actual legacy emission block after that admission; the first later fence is
+# the caller's worker-join fence, not the scale writer's fence.
+begin = source.index("    volatile uint32_t * scale_out = scale_words;")
 block = source[begin:source.index("    mmio_fence();", begin)]
 begin = source.index("static inline uint32_t fpga_p2_pack_scale_entry(")
 entry = source[begin:source.index("\n}\n", begin) + 3]
@@ -41,6 +45,8 @@ harness += '''
 static bool emit(Job job, Shape scale_shape, int rows, int group_blocks,
                  const block_q8_0_t * act_group, const Tensor * src0,
                  const void * weight_data_base, int row0, int k_block0) {
+volatile uint32_t * const scale_words = ddr_checked_u32_ptr(SPU_PARAM_BASE, job.scale_bytes);
+const bool fused_direct_pack = false;
 '''
 harness += block + "\nreturn true;\n}\n"
 harness += r'''
