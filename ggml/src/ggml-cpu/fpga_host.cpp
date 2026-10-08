@@ -36,7 +36,7 @@
 __extension__ typedef unsigned __int128 fpga_uint128_t;
 __extension__ typedef __int128          fpga_int128_t;
 
-#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v91-p2-fused-pack"
+#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v92-p2-dma-pack-pipeline"
 
 #define MY_IP_BASE_ADDRESS 0x00000000A0000000LL
 #define REG_BASE_PHYS      0x00000000A0000000LL
@@ -187,6 +187,20 @@ static constexpr uint32_t SPU_PARAM_BASE         = 0x00380000;
 static constexpr uint32_t SPU_PARAM_END          = 0x003C0000;
 static constexpr uint32_t SPU_SCRATCH_BASE       = 0x003C0000;
 static constexpr uint32_t SPU_SCRATCH_END        = 0x00400000;
+// The opt-in DMA/packing pipeline uses only the already mapped scratch
+// windows.  Each source slot is disjoint from the other slot and from the
+// fixed PL destination windows.  No model-sized allocation is introduced.
+static constexpr uint32_t P2_PIPELINE_WEIGHT_SLOT_BYTES = 512U * 1024U;
+static constexpr uint32_t P2_PIPELINE_SCALE_SLOT_BYTES  = 64U * 1024U;
+static constexpr uint32_t P2_PIPELINE_WEIGHT_SLOT_COUNT = 2U;
+static constexpr uint32_t P2_PIPELINE_SCALE_SLOT_COUNT  = 2U;
+static constexpr size_t   P2_PIPELINE_PACK_BATCH_PAIRS  = 8U;
+static_assert(WEIGHT_BASE + P2_PIPELINE_WEIGHT_SLOT_BYTES * P2_PIPELINE_WEIGHT_SLOT_COUNT == WEIGHT_END,
+              "P2 pipeline weight slots must fill only the existing weight staging window");
+static_assert(SPU_PARAM_BASE + P2_PIPELINE_SCALE_SLOT_BYTES * P2_PIPELINE_SCALE_SLOT_COUNT <= SPU_PARAM_END,
+              "P2 pipeline scale slots must stay inside the existing SPU_PARAM staging window");
+static_assert(P2_PIPELINE_PACK_BATCH_PAIRS * 4096U <= 32U * 1024U,
+              "P2 pipeline callback pack batches must stay bounded");
 static_assert((WEIGHT_BASE % alignof(uint32_t)) == 0U, "WEIGHT_BASE must be 32-bit aligned");
 // All host-visible MY_IP registers and local-memory windows used by this
 // driver lie below this offset.  The Vivado segment is 256 MiB, but the
@@ -276,6 +290,14 @@ static constexpr uint32_t FPGA_REQUIRED_P2_STREAM_ABI           = 0x50320003U;
 static constexpr uint32_t SPU_STREAM_STATUS_QUIESCENT           = 0x00000010U;
 static constexpr uint32_t SPU_CTRL_SOFT_RESET                   = 0x00000004U;
 static constexpr uint32_t P2_REQUIRED_SPU_WORD_CAPACITY = (VPU_DEFAULT_ROWS * VPU_PACKED_Q8_MAX_BLOCKS + 3U) / 4U;
+// The deployed PL consumes only the first 4096 128-bit SPU_PARAM words even
+// though the host mapping reserves a larger PARAM window.  Keep the source
+// and fixed PL destination limits separate so a two-slot source cannot admit
+// a tile that would overrun the actual parameter BRAM.
+static constexpr size_t P2_PIPELINE_PL_SCALE_BYTES =
+    (size_t) P2_REQUIRED_SPU_WORD_CAPACITY * 16U;
+static_assert(P2_PIPELINE_PL_SCALE_BYTES <= P2_PIPELINE_SCALE_SLOT_BYTES,
+              "P2 pipeline scale source slots must hold the deployed PL parameter capacity");
 
 static constexpr long long FPGA_DEFAULT_DMA_TIMEOUT_US          = 5000000LL;
 static constexpr long long FPGA_DEFAULT_IP_TIMEOUT_US           = 5000000LL;
@@ -547,6 +569,7 @@ typedef struct {
     uint32_t                          result_words;
     uint32_t                          scale_words;
     uint32_t                          weight_src_off;
+    uint32_t                          scale_src_off;
     bool                              weight_cache_hit;
     bool                              p2_residency_hit;
     uint32_t                          p2_residency_slot;
@@ -615,6 +638,35 @@ typedef struct {
     long long                         input_preload_done_us;
     long long                         preload_ready_to_launch_us;
 } fpga_tile_job_t;
+
+// A bounded lookahead owns only the next tile's immutable identity and the
+// two existing DDR source slots.  It has no descriptor, bank, or device
+// ownership.  The DMA poll callback advances the main producer in small
+// disjoint pair ranges while the persistent helper emits the fixed suffix.
+typedef struct {
+    bool                  valid;
+    bool                  worker_submitted;
+    bool                  consumed;
+    uint64_t              generation;
+    uint64_t              source_epoch;
+    size_t                pair_count;
+    size_t                helper_pair_begin;
+    size_t                main_pair_next;
+    size_t                words_per_pair;
+    size_t                expected_words;
+    size_t                expected_scale_entries;
+    size_t                callback_bytes;
+    size_t                main_written_words;
+    size_t                main_scale_entries;
+    long long             helper_service_us;
+    long long             residual_us;
+    long long             callback_us;
+    fpga_stage_totals_t * totals;
+    const void *          weight_data_base;
+    volatile uint32_t *   weight_words;
+    volatile uint32_t *   scale_words;
+    fpga_tile_job_t       job;
+} fpga_p2_dma_pipeline_lookahead_t;
 
 typedef struct {
     std::vector<block_q8_0_t>  act_blocks_all;
@@ -861,6 +913,19 @@ static long long         g_p2_pack_caller_wait_us                      = 0;
 static long long         g_p2_pack_fused_jobs                          = 0;
 static long long         g_p2_pack_fused_us                             = 0;
 static long long         g_p2_pack_fused_scale_entries                  = 0;
+// This second-stage pipeline is intentionally opt-in and decode-only.  The
+// default path keeps the established prepare/submit order until an owner
+// board run explicitly qualifies the overlap.
+static bool               g_p2_pack_dma_pipeline_requested               = false;
+static bool               g_p2_pack_dma_pipeline_enabled                 = false;
+static long long          g_p2_pack_dma_pipeline_eligible_jobs            = 0;
+static long long          g_p2_pack_dma_pipeline_consumed_jobs            = 0;
+static uint64_t           g_p2_pack_dma_pipeline_callback_bytes           = 0;
+static long long          g_p2_pack_dma_pipeline_callback_us              = 0;
+static long long          g_p2_pack_dma_pipeline_helper_us                = 0;
+static long long          g_p2_pack_dma_pipeline_residual_us              = 0;
+static long long          g_p2_pack_dma_pipeline_residual_bytes           = 0;
+static long long          g_p2_pack_dma_pipeline_rejected_jobs            = 0;
 enum fpga_pack_detail_field {
     PACK_TOTAL, PACK_SERIAL, PACK_DISPATCH, PACK_MAIN, PACK_FENCE, PACK_WAIT,
     PACK_HELPER, PACK_SERIAL_JOBS, PACK_PARALLEL_JOBS,
@@ -1035,6 +1100,13 @@ typedef struct {
     long long polls;
     bool      saw_enabled;
 } zdma_completion_info_t;
+
+typedef bool (*fpga_dma_poll_hook_fn)(void * context, long long elapsed_us);
+
+typedef struct {
+    fpga_dma_poll_hook_fn fn;
+    void *                 context;
+} fpga_dma_poll_hook_t;
 
 typedef struct {
     bool               valid;
@@ -2997,13 +3069,16 @@ static bool zdma_clear_isr_for_new_transfer(const char * tag) {
 // observe the old disabled state before the posted start write is accepted.
 // The caller has positively cleared the old W1C event, so DMA_DONE here is a
 // completion generated by the descriptor just launched.
-static bool zdma_wait_transfer_complete(const char * tag, zdma_completion_info_t * info) {
+static bool zdma_wait_transfer_complete(const char *                  tag,
+                                        zdma_completion_info_t *       info,
+                                        const fpga_dma_poll_hook_t *   poll_hook = nullptr,
+                                        long long                      launch_us = 0) {
     if (!dma_is_mapped()) {
         LOGE("ZDMA completion gate has no mapped channel tag=%s", tag ? tag : "?");
         return false;
     }
 
-    const long long t0          = now_us();
+    const long long t0          = launch_us > 0 ? launch_us : now_us();
     long long       polls       = 0;
     bool            saw_enabled = false;
     while (true) {
@@ -3043,6 +3118,23 @@ static bool zdma_wait_transfer_complete(const char * tag, zdma_completion_info_t
                 tag ? tag : "?", status, status & ZDMA_STATUS_STATE_MASK, isr, ctrl2, g_dma->ZDMA_CH_TOTAL_BYTE,
                 dma_done ? 1 : 0, saw_enabled ? 1 : 0, polls);
             zdma_dump(tag);
+            return false;
+        }
+        // The hook is deliberately after error, DONE/disabled, and the
+        // launch-anchored timeout checks.  It may only touch a disjoint host
+        // DDR source slot; it cannot alter descriptors or device state.
+        if (poll_hook && poll_hook->fn && !poll_hook->fn(poll_hook->context, now_us() - t0)) {
+            // A failed host hook must not return while the channel still owns
+            // its descriptor.  Drain EN before the caller can reuse either
+            // staging slot or report the transfer failure.
+            if (!zdma_wait_channel_disabled(tag, "poll_hook_failure")) {
+                // No caller may reuse either source slot, descriptor, or
+                // mapping while EN remains asserted.  There is no safe
+                // software abort/reset sequence in this ABI, so fail closed
+                // instead of returning into a possible CPU fallback.
+                fpga_fatal("ZDMA EN remained set after DMA poll hook failure; refusing slot reuse");
+            }
+            LOGE("ZDMA poll hook failed tag=%s elapsed_us=%lld", tag ? tag : "?", now_us() - t0);
             return false;
         }
         ++polls;
@@ -3120,7 +3212,11 @@ static bool p2_zdma_verify_descriptor_commit(uint64_t src_phys,
     return true;
 }
 
-static bool fpga_dma_copy_one(uint64_t src_phys, uint64_t dst_phys, size_t bytes, const char * tag) {
+static bool fpga_dma_copy_one(uint64_t                         src_phys,
+                              uint64_t                         dst_phys,
+                              size_t                           bytes,
+                              const char *                     tag,
+                              const fpga_dma_poll_hook_t *     poll_hook = nullptr) {
     if (!dma_is_mapped()) {
         LOGE("ZDMA is not mapped for tag=%s", tag ? tag : "?");
         return false;
@@ -3245,7 +3341,10 @@ static bool fpga_dma_copy_one(uint64_t src_phys, uint64_t dst_phys, size_t bytes
     }
 
     zdma_completion_info_t completion = {};
-    if (!zdma_wait_transfer_complete(tag, &completion)) {
+    if (!zdma_wait_transfer_complete(tag, &completion, poll_hook, t0)) {
+        if (poll_hook && !zdma_wait_channel_disabled(tag, "pipeline_completion_failure")) {
+            fpga_fatal("ZDMA EN remained set after pipeline completion failure; refusing slot reuse");
+        }
         const uint32_t total_bytes_after_transfer = g_dma->ZDMA_CH_TOTAL_BYTE;
         const uint32_t post_vpu_status            = vpu_is_mapped() ? vpu_rd32(REG_STATUS) : 0U;
         const uint32_t post_vpu_progress          = vpu_is_mapped() ? vpu_rd32(REG_PROGRESS) : 0U;
@@ -3324,7 +3423,13 @@ static bool fpga_dma_copy_one(uint64_t src_phys, uint64_t dst_phys, size_t bytes
     return true;
 }
 
-static bool fpga_dma_copy(uint64_t src_phys, uint64_t dst_phys, size_t bytes, const char * tag);
+static bool fpga_dma_copy(uint64_t                     src_phys,
+                          uint64_t                     dst_phys,
+                          size_t                       bytes,
+                          const char *                 tag,
+                          const fpga_dma_poll_hook_t * poll_hook = nullptr);
+
+static bool fpga_p2_dma_pipeline_poll(void * context, long long elapsed_us);
 
 static bool fpga_dma_write_to_ip(uint32_t offset, size_t bytes, const char * tag) {
     return fpga_dma_copy(DDR_BASE_PHYS + (uint64_t) offset, LMM_BASE_PHYS + (uint64_t) offset, bytes, tag);
@@ -3404,7 +3509,11 @@ static bool fpga_ddr_coherency_stress_test(void) {
 // so splitting a copy here does not expose a partially loaded ACT/WEIGHT
 // window to the VPU.  It does, however, keep the ZDMA/IP interconnect away
 // from the 512 KiB descriptor pattern implicated by the contract log.
-static bool fpga_dma_copy(uint64_t src_phys, uint64_t dst_phys, size_t bytes, const char * tag) {
+static bool fpga_dma_copy(uint64_t                     src_phys,
+                          uint64_t                     dst_phys,
+                          size_t                       bytes,
+                          const char *                 tag,
+                          const fpga_dma_poll_hook_t * poll_hook) {
     if (bytes == 0U || bytes > UINT32_MAX) {
         LOGE("invalid ZDMA byte count tag=%s bytes=%zu", tag ? tag : "?", bytes);
         return false;
@@ -3438,7 +3547,8 @@ static bool fpga_dma_copy(uint64_t src_phys, uint64_t dst_phys, size_t bytes, co
         } else {
             snprintf(chunk_tag, sizeof(chunk_tag), "%s[%zu/%zu]", tag ? tag : "?", chunk + 1U, chunk_count);
         }
-        if (!fpga_dma_copy_one(src_phys + (uint64_t) offset, dst_phys + (uint64_t) offset, this_bytes, chunk_tag)) {
+        if (!fpga_dma_copy_one(src_phys + (uint64_t) offset, dst_phys + (uint64_t) offset, this_bytes, chunk_tag,
+                               poll_hook)) {
             return false;
         }
     }
@@ -4065,6 +4175,112 @@ static bool fpga_p2_pack_worker_wait(uint64_t generation,
     pthread_mutex_unlock(&g_p2_pack_worker_mutex);
     *wait_us = now_us() - wait0;
     return success;
+}
+
+static void fpga_p2_dma_pipeline_invalidate(fpga_p2_dma_pipeline_lookahead_t * lookahead) {
+    if (!lookahead) {
+        return;
+    }
+    if (lookahead->worker_submitted) {
+        size_t helper_words = 0U;
+        size_t helper_scales = 0U;
+        long long helper_service = 0;
+        long long helper_wait = 0;
+        const bool helper_done = fpga_p2_pack_worker_wait(lookahead->generation, &helper_words, &helper_service,
+                                                          &helper_wait, &helper_scales);
+        if (!helper_done) {
+            fpga_fatal("P2 DMA pipeline helper did not publish completion; refusing source-slot reuse");
+        }
+        lookahead->worker_submitted = false;
+    }
+    lookahead->valid = false;
+    lookahead->consumed = false;
+}
+
+struct fpga_p2_dma_pipeline_scope_guard {
+    fpga_p2_dma_pipeline_lookahead_t * lookahead;
+    ~fpga_p2_dma_pipeline_scope_guard() {
+        if (lookahead && (lookahead->valid || lookahead->worker_submitted)) {
+            fpga_p2_dma_pipeline_invalidate(lookahead);
+        }
+    }
+};
+
+// Pack one bounded prefix slice for a preadmitted future tile.  The helper
+// owns the fixed suffix; both ranges are disjoint in the inactive source slot.
+static bool fpga_p2_dma_pipeline_pack_batch(fpga_p2_dma_pipeline_lookahead_t * lookahead, size_t pair_end) {
+    if (!lookahead || !lookahead->valid || lookahead->consumed || !lookahead->weight_words ||
+        !lookahead->scale_words || pair_end < lookahead->main_pair_next || pair_end > lookahead->helper_pair_begin) {
+        return false;
+    }
+    const size_t pair_begin = lookahead->main_pair_next;
+    if (pair_begin == pair_end) {
+        return true;
+    }
+    size_t written_words = 0U;
+    size_t written_scales = 0U;
+    if (!fpga_pack_direct_weight_scale_pair_range(
+            lookahead->weight_words, lookahead->scale_words, lookahead->job.src0, lookahead->weight_data_base,
+            lookahead->job.act_group, lookahead->job.row0, lookahead->job.k_block0, lookahead->job.rows,
+            lookahead->job.group_blocks, lookahead->job.group_beats, pair_begin, pair_end, true, &written_words,
+            &written_scales)) {
+        return false;
+    }
+    const size_t pair_count = pair_end - pair_begin;
+    if (pair_count > SIZE_MAX / lookahead->words_per_pair ||
+        pair_count * lookahead->words_per_pair > SIZE_MAX / sizeof(uint32_t)) {
+        return false;
+    }
+    if (lookahead->main_written_words > SIZE_MAX - written_words ||
+        lookahead->main_scale_entries > SIZE_MAX - written_scales) {
+        return false;
+    }
+    const size_t expected_scales =
+        ((std::min(pair_end * 2U, (size_t) lookahead->job.rows) - pair_begin * 2U) *
+         (size_t) lookahead->job.group_blocks);
+    if (written_words != pair_count * lookahead->words_per_pair || written_scales != expected_scales) {
+        return false;
+    }
+    lookahead->main_pair_next = pair_end;
+    lookahead->main_written_words += written_words;
+    lookahead->main_scale_entries += written_scales;
+    return true;
+}
+
+static bool fpga_p2_dma_pipeline_poll(void * context, long long elapsed_us) {
+    (void) elapsed_us;
+    auto * const lookahead = static_cast<fpga_p2_dma_pipeline_lookahead_t *>(context);
+    if (!lookahead || !lookahead->valid || lookahead->consumed) {
+        return false;
+    }
+    if (lookahead->main_pair_next >= lookahead->helper_pair_begin) {
+        return true;
+    }
+    const long long pack0 = now_us();
+    const size_t words_before = lookahead->main_written_words;
+    const size_t pair_end = std::min(lookahead->main_pair_next + P2_PIPELINE_PACK_BATCH_PAIRS,
+                                     lookahead->helper_pair_begin);
+    const bool ok = fpga_p2_dma_pipeline_pack_batch(lookahead, pair_end);
+    const long long pack_us = now_us() - pack0;
+    lookahead->callback_us += pack_us;
+    g_p2_pack_dma_pipeline_callback_us += pack_us;
+    if (ok) {
+        const size_t words = lookahead->main_written_words - words_before;
+        if (words > SIZE_MAX / sizeof(uint32_t) ||
+            lookahead->callback_bytes > SIZE_MAX - words * sizeof(uint32_t) ||
+            g_p2_pack_dma_pipeline_callback_bytes > UINT64_MAX - (uint64_t) (words * sizeof(uint32_t))) {
+            lookahead->valid = false;
+            return false;
+        }
+        const size_t bytes = words * sizeof(uint32_t);
+        lookahead->callback_bytes += bytes;
+        g_p2_pack_dma_pipeline_callback_bytes += (uint64_t) bytes;
+        return true;
+    }
+    // The DMA completion loop will first quiesce the channel.  The submitter
+    // then joins the helper and invalidates this record before any slot reuse.
+    lookahead->valid = false;
+    return false;
 }
 
 // Called under g_mutex during explicit cleanup.  A join error is surfaced to
@@ -5740,6 +5956,33 @@ static uint32_t fpga_p2_residency_select_or_build(const struct ggml_tensor * src
     return slot;
 }
 
+// Read-only admission probe for the DMA packing pipeline.  It never reserves
+// a residency slot, writes DDR, polls hardware, or changes residency state.
+static bool fpga_p2_residency_contains(const struct ggml_tensor * src0,
+                                       int64_t                    row0,
+                                       int                        rows,
+                                       int64_t                    k_block0,
+                                       int                        group_blocks,
+                                       int                        group_beats,
+                                       size_t                     weight_bytes) {
+    if (!g_p2_weight_residency_enabled || !src0 || rows <= 0 || group_blocks <= 0 || group_beats <= 0) {
+        return false;
+    }
+    const size_t scale_bytes = (size_t) rows * (size_t) group_blocks * sizeof(uint16_t);
+    for (const fpga_p2_resident_tile_t & tile : g_p2_resident_tiles) {
+        if (!tile.enabled || tile.building || !tile.sealed || tile.poisoned || tile.epoch != g_p2_weight_residency_epoch ||
+            tile.stream_protocol != g_stream_protocol_version || tile.bitstream_id != g_bitstream_id ||
+            tile.p2_abi != g_p2_stream_abi_signature) {
+            continue;
+        }
+        if (fpga_p2_residency_identity_matches(tile, src0, row0, rows, k_block0, group_blocks, group_beats,
+                                               weight_bytes, scale_bytes)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void p2_trace_first_tile(const fpga_tile_job_t & job, const char * stage, const char * edge);
 
 static void p2_trace_set_job_context(const fpga_tile_job_t & job);
@@ -5760,6 +6003,8 @@ struct fpga_prompt_weight_staging_t {
     int group_blocks = 0;
     size_t bytes = 0;
     uint64_t epoch = 0;
+    uint32_t weight_off = WEIGHT_BASE;
+    uint32_t scale_off = SPU_PARAM_BASE;
 };
 
 static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
@@ -5776,7 +6021,407 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
                                      uint32_t                          tile_id,
                                      int                               bank,
                                      fpga_stage_totals_t *             totals,
-                                     fpga_prompt_weight_staging_t *    staging = nullptr);
+                                     fpga_prompt_weight_staging_t *    staging = nullptr,
+                                     uint32_t                          weight_stage_off = WEIGHT_BASE,
+                                     uint32_t                          scale_stage_off = SPU_PARAM_BASE);
+
+static bool fpga_p2_dma_pipeline_admit(fpga_p2_dma_pipeline_lookahead_t & lookahead,
+                                       const struct ggml_tensor *         src0,
+                                       const void *                       weight_data_base,
+                                       const block_q8_0_t *               act_group,
+                                       int64_t                            row0,
+                                       int                                rows,
+                                       int64_t                            k_block0,
+                                       int                                group_blocks,
+                                       int64_t                            col,
+                                       uint32_t                           tile_id,
+                                       int                                bank,
+                                       fpga_stage_totals_t *              totals,
+                                       uint32_t                           weight_src_off,
+                                       uint32_t                           scale_src_off);
+
+static bool fpga_p2_dma_pipeline_consume(fpga_p2_dma_pipeline_lookahead_t & lookahead,
+                                         fpga_tile_job_t &                   job,
+                                         fpga_stage_totals_t *                totals,
+                                         const struct ggml_tensor *             expected_src0,
+                                         const void *                           expected_weight_data_base,
+                                         int64_t                                expected_row0,
+                                         int                                      expected_rows,
+                                         int64_t                                expected_k_block0,
+                                         int                                      expected_group_blocks,
+                                         int64_t                                expected_col,
+                                         uint32_t                               expected_tile_id);
+
+static bool fpga_p2_dma_pipeline_finalize(fpga_p2_dma_pipeline_lookahead_t & lookahead);
+
+static bool fpga_p2_dma_pipeline_geometry(size_t rows,
+                                          size_t group_blocks,
+                                          int    group_beats,
+                                          size_t * weight_bytes,
+                                          size_t * scale_bytes,
+                                          size_t * pair_count,
+                                          size_t * words_per_pair,
+                                          size_t * scale_entries) {
+    if (!weight_bytes || !scale_bytes || !pair_count || !words_per_pair || !scale_entries || rows == 0U ||
+        rows > (size_t) g_vpu_max_rows || group_blocks == 0U || group_blocks > (size_t) INT_MAX ||
+        group_blocks > (size_t) INT_MAX / (size_t) VPU_BLOCK_BEATS || group_beats <= 0 ||
+        group_beats > g_vpu_max_beats) {
+        return false;
+    }
+    if (rows > (size_t) std::numeric_limits<int>::max() ||
+        group_beats != (int) (group_blocks * (size_t) VPU_BLOCK_BEATS)) {
+        return false;
+    }
+    const size_t weight = weight_window_bytes_for_rows((int) rows, group_beats);
+    if (rows > std::numeric_limits<size_t>::max() / group_blocks) {
+        return false;
+    }
+    const size_t entries = rows * group_blocks;
+    if (entries == 0U || entries > std::numeric_limits<size_t>::max() - ((size_t) VPU_RESULT_PACK_LANES - 1U)) {
+        return false;
+    }
+    const size_t result_words =
+        (entries + (size_t) VPU_RESULT_PACK_LANES - 1U) / (size_t) VPU_RESULT_PACK_LANES;
+    if (result_words == 0U || result_words > std::numeric_limits<size_t>::max() / 16U) {
+        return false;
+    }
+    const size_t scale = result_words * 16U;
+    const size_t pairs = (rows + 1U) / 2U;
+    const size_t pair_words = (size_t) group_beats * 8U;
+    if (pairs == 0U || pair_words == 0U ||
+        pairs > std::numeric_limits<size_t>::max() / pair_words ||
+        pairs * pair_words > std::numeric_limits<size_t>::max() / sizeof(uint32_t)) {
+        return false;
+    }
+    const size_t payload = pairs * pair_words * sizeof(uint32_t);
+    if (weight == 0U || weight != payload || weight > P2_PIPELINE_WEIGHT_SLOT_BYTES ||
+        scale == 0U || scale > P2_PIPELINE_SCALE_SLOT_BYTES || scale > P2_PIPELINE_PL_SCALE_BYTES ||
+        !range_fits(WEIGHT_BASE, weight, WEIGHT_BASE, WEIGHT_END) ||
+        !range_fits(SPU_PARAM_BASE, scale, SPU_PARAM_BASE,
+                    SPU_PARAM_BASE + (uint32_t) P2_PIPELINE_PL_SCALE_BYTES)) {
+        return false;
+    }
+    *weight_bytes = weight;
+    *scale_bytes = scale;
+    *pair_count = pairs;
+    *words_per_pair = pair_words;
+    *scale_entries = entries;
+    return true;
+}
+
+static bool fpga_p2_dma_pipeline_slot_ranges(uint32_t weight_src_off,
+                                              uint32_t scale_src_off,
+                                              size_t   weight_bytes,
+                                              size_t   scale_bytes) {
+    if (weight_src_off < WEIGHT_BASE || weight_src_off >= WEIGHT_END ||
+        scale_src_off < SPU_PARAM_BASE || scale_src_off >= SPU_PARAM_END ||
+        (weight_src_off - WEIGHT_BASE) / P2_PIPELINE_WEIGHT_SLOT_BYTES >= P2_PIPELINE_WEIGHT_SLOT_COUNT ||
+        (scale_src_off - SPU_PARAM_BASE) / P2_PIPELINE_SCALE_SLOT_BYTES >= P2_PIPELINE_SCALE_SLOT_COUNT) {
+        return false;
+    }
+    const uint32_t weight_slot = (weight_src_off - WEIGHT_BASE) / P2_PIPELINE_WEIGHT_SLOT_BYTES;
+    const uint32_t scale_slot = (scale_src_off - SPU_PARAM_BASE) / P2_PIPELINE_SCALE_SLOT_BYTES;
+    if (weight_src_off != WEIGHT_BASE + weight_slot * P2_PIPELINE_WEIGHT_SLOT_BYTES ||
+        scale_src_off != SPU_PARAM_BASE + scale_slot * P2_PIPELINE_SCALE_SLOT_BYTES ||
+        weight_bytes == 0U || scale_bytes == 0U || weight_bytes > P2_PIPELINE_WEIGHT_SLOT_BYTES ||
+        scale_bytes > P2_PIPELINE_SCALE_SLOT_BYTES ||
+        !range_fits(weight_src_off, weight_bytes, WEIGHT_BASE + weight_slot * P2_PIPELINE_WEIGHT_SLOT_BYTES,
+                    WEIGHT_BASE + (weight_slot + 1U) * P2_PIPELINE_WEIGHT_SLOT_BYTES) ||
+        !range_fits(scale_src_off, scale_bytes, SPU_PARAM_BASE + scale_slot * P2_PIPELINE_SCALE_SLOT_BYTES,
+                    SPU_PARAM_BASE + (scale_slot + 1U) * P2_PIPELINE_SCALE_SLOT_BYTES)) {
+        return false;
+    }
+    return true;
+}
+
+// Emit the small ACT window only after the previously launched job has been
+// drained.  WEIGHT and PARAM are prepared ahead of time, but ACT_BASE is
+// shared by both jobs and must never be overwritten while the old job reads it.
+static bool fpga_p2_dma_pipeline_prepare_activation(fpga_tile_job_t & job, fpga_stage_totals_t * totals) {
+    if (!job.act_group || job.group_blocks <= 0 || job.group_beats <= 0 ||
+        !range_fits(ACT_BASE, job.act_bytes, ACT_BASE, ACT_END) || !ddr_range_fits(ACT_BASE, job.act_bytes)) {
+        return false;
+    }
+    const long long prep0 = now_us();
+    if (job.event_prep_begin_us == 0) {
+        job.event_prep_begin_us = p2_event_now_us();
+    }
+    for (int gb = 0; gb < job.group_blocks; ++gb) {
+        const block_q8_0_t & act = job.act_group[gb];
+        for (int beat = 0; beat < VPU_BLOCK_BEATS; ++beat) {
+            const uint32_t word_index = (uint32_t) gb * (uint32_t) VPU_BLOCK_BEATS + (uint32_t) beat;
+            write_i8x16_to_ddr(ACT_BASE + word_index * 16U, act.qs + beat * VPU_NUM_LANES);
+        }
+    }
+    mmio_fence();
+    job.event_prep_done_us = p2_event_now_us();
+    const long long elapsed = now_us() - prep0;
+    if (totals) {
+        totals->prep_act_pack_us += elapsed;
+        totals->prep_us += elapsed;
+    }
+    return true;
+}
+
+static bool fpga_p2_dma_pipeline_admit(fpga_p2_dma_pipeline_lookahead_t & lookahead,
+                                       const struct ggml_tensor *         src0,
+                                       const void *                       weight_data_base,
+                                       const block_q8_0_t *               act_group,
+                                       int64_t                            row0,
+                                       int                                rows,
+                                       int64_t                            k_block0,
+                                       int                                group_blocks,
+                                       int64_t                            col,
+                                       uint32_t                           tile_id,
+                                       int                                bank,
+                                       fpga_stage_totals_t *              totals,
+                                       uint32_t                           weight_src_off,
+                                       uint32_t                           scale_src_off) {
+    if (lookahead.valid || lookahead.worker_submitted || !g_p2_pack_dma_pipeline_enabled || !src0 ||
+        !weight_data_base || !act_group || rows <= 0 || group_blocks <= 0 || row0 < 0 || k_block0 < 0 || col < 0 ||
+        !ddr_is_mapped()) {
+        return false;
+    }
+    if ((size_t) group_blocks > (size_t) INT_MAX / (size_t) VPU_BLOCK_BEATS ||
+        (src0->ne[1] < 0 || (uint64_t) row0 > (uint64_t) src0->ne[1] ||
+         (uint64_t) rows > (uint64_t) src0->ne[1] - (uint64_t) row0) ||
+        (src0->ne[0] < 0 || (src0->ne[0] % VPU_QK8_0) != 0 ||
+         (uint64_t) k_block0 > (uint64_t) (src0->ne[0] / VPU_QK8_0) ||
+         (uint64_t) group_blocks > (uint64_t) (src0->ne[0] / VPU_QK8_0) - (uint64_t) k_block0)) {
+        ++g_p2_pack_dma_pipeline_rejected_jobs;
+        return false;
+    }
+    size_t weight_bytes = 0U;
+    size_t scale_bytes = 0U;
+    size_t pair_count = 0U;
+    size_t words_per_pair = 0U;
+    size_t scale_entries = 0U;
+    const int group_beats = group_blocks * VPU_BLOCK_BEATS;
+    if (!fpga_p2_dma_pipeline_geometry((size_t) rows, (size_t) group_blocks, group_beats,
+                                       &weight_bytes, &scale_bytes, &pair_count, &words_per_pair, &scale_entries) ||
+        pair_count < 2U || !fpga_p2_dma_pipeline_slot_ranges(weight_src_off, scale_src_off, weight_bytes, scale_bytes) ||
+        !ddr_range_fits(weight_src_off, weight_bytes) || !ddr_range_fits(scale_src_off, scale_bytes)) {
+        ++g_p2_pack_dma_pipeline_rejected_jobs;
+        return false;
+    }
+    fpga_p2_scale_shape_t scale_shape = {
+        scale_entries, (scale_entries + VPU_RESULT_PACK_LANES - 1U) / VPU_RESULT_PACK_LANES, scale_bytes,
+        ((scale_entries + VPU_RESULT_PACK_LANES - 1U) / VPU_RESULT_PACK_LANES) * VPU_RESULT_PACK_LANES - scale_entries};
+    if (!fpga_p2_checked_scale_shape(rows, group_blocks, (uint32_t) scale_entries, (uint32_t) scale_shape.words,
+                                     scale_bytes, scale_src_off, &scale_shape)) {
+        ++g_p2_pack_dma_pipeline_rejected_jobs;
+        return false;
+    }
+    if (fpga_p2_residency_contains(src0, row0, rows, k_block0, group_blocks, group_blocks * VPU_BLOCK_BEATS,
+                                   weight_bytes)) {
+        ++g_p2_pack_dma_pipeline_rejected_jobs;
+        return false;
+    }
+
+    fpga_p2_dma_pipeline_lookahead_t candidate = {};
+    candidate.valid                  = true;
+    candidate.generation             = 0U;
+    candidate.source_epoch           = g_p2_weight_residency_epoch;
+    candidate.pair_count             = pair_count;
+    candidate.helper_pair_begin      = pair_count / 2U;
+    candidate.main_pair_next         = 0U;
+    candidate.words_per_pair         = words_per_pair;
+    candidate.expected_words         = pair_count * words_per_pair;
+    candidate.expected_scale_entries = scale_entries;
+    candidate.totals                 = totals;
+    candidate.weight_data_base       = weight_data_base;
+    candidate.weight_words           = ddr_checked_u32_ptr(weight_src_off, weight_bytes);
+    candidate.scale_words            = ddr_checked_u32_ptr(scale_src_off, scale_bytes);
+    candidate.job                    = {};
+    candidate.job.bank               = bank & 1;
+    candidate.job.job_id             = fpga_next_job_id();
+    candidate.job.matmul_call_id     = g_active_matmul_call_id;
+    candidate.job.graph_seq          = g_active_matmul_graph_seq;
+    candidate.job.layer_id           = g_active_matmul_layer_id;
+    candidate.job.shape_k            = g_active_matmul_shape_k;
+    candidate.job.shape_n            = g_active_matmul_shape_n;
+    candidate.job.shape_m            = g_active_matmul_shape_m;
+    candidate.job.cpu_shadow_dst     = g_active_matmul_cpu_shadow;
+    candidate.job.pingpong_scheduler  = g_active_matmul_pingpong;
+    candidate.job.tensor_name         = g_active_matmul_tensor_name;
+    candidate.job.tile_id             = tile_id;
+    candidate.job.tensor_id           = fpga_tensor_id_from_ptr(src0);
+    candidate.job.row0                = row0;
+    candidate.job.rows                = rows;
+    candidate.job.k_block0            = k_block0;
+    candidate.job.group_blocks        = group_blocks;
+    candidate.job.group_beats         = group_blocks * VPU_BLOCK_BEATS;
+    candidate.job.col                 = col;
+    candidate.job.act_bytes           = (size_t) candidate.job.group_beats * 16U;
+    candidate.job.weight_bytes        = weight_bytes;
+    candidate.job.scale_bytes         = scale_bytes;
+    candidate.job.spu_result_bytes    = (size_t) rows * 16U;
+    candidate.job.result_bytes        = (size_t) scale_shape.words * 16U;
+    candidate.job.result_values       = (uint32_t) scale_entries;
+    candidate.job.result_words        = (uint32_t) scale_shape.words;
+    candidate.job.scale_words         = (uint32_t) scale_shape.words;
+    candidate.job.weight_src_off      = weight_src_off;
+    candidate.job.scale_src_off       = scale_src_off;
+    candidate.job.p2_residency_slot   = P2_WEIGHT_RESIDENCY_NO_SLOT;
+    candidate.job.act_group            = act_group;
+    candidate.job.src0                 = src0;
+    candidate.job.weight_cache         = nullptr;
+    candidate.job.event_prep_begin_us  = p2_event_now_us();
+
+    if (!range_fits(ACT_BASE, candidate.job.act_bytes, ACT_BASE, ACT_END) ||
+        !range_fits(RESULT_BASE, (size_t) candidate.job.result_words * 16U, RESULT_BASE, RESULT_END) ||
+        !range_fits(SPU_OUT_BASE, candidate.job.spu_result_bytes, SPU_OUT_BASE, SPU_OUT_END) ||
+        !ddr_range_fits(ACT_BASE, candidate.job.act_bytes) ||
+        !ddr_range_fits(RESULT_BASE, (size_t) candidate.job.result_words * 16U) ||
+        !ddr_range_fits(SPU_OUT_BASE, candidate.job.spu_result_bytes)) {
+        ++g_p2_pack_dma_pipeline_rejected_jobs;
+        return false;
+    }
+
+    const size_t helper_words = (pair_count - candidate.helper_pair_begin) * words_per_pair;
+    const size_t helper_rows = (size_t) rows - candidate.helper_pair_begin * 2U;
+    if (helper_rows == 0U || helper_rows > std::numeric_limits<size_t>::max() / (size_t) group_blocks ||
+        helper_words == 0U) {
+        ++g_p2_pack_dma_pipeline_rejected_jobs;
+        return false;
+    }
+    uint64_t generation = 0U;
+    if (!fpga_p2_pack_worker_next_generation(&generation)) {
+        ++g_p2_pack_dma_pipeline_rejected_jobs;
+        return false;
+    }
+    fpga_p2_pack_worker_task_t task = {};
+    task.src0                    = src0;
+    task.weight_data_base       = weight_data_base;
+    task.activation_data_base   = act_group;
+    task.row0                   = row0;
+    task.k_block0               = k_block0;
+    task.rows                   = rows;
+    task.group_blocks           = group_blocks;
+    task.group_beats            = group_blocks * VPU_BLOCK_BEATS;
+    task.pair_begin             = candidate.helper_pair_begin;
+    task.pair_end               = pair_count;
+    task.dst_words              = candidate.weight_words;
+    task.expected_words         = helper_words;
+    task.generation             = generation;
+    task.scale_words            = candidate.scale_words;
+    task.expected_scale_entries = helper_rows * (size_t) group_blocks;
+    task.fused_scale            = true;
+    if (!fpga_p2_pack_worker_submit(task)) {
+        ++g_p2_pack_dma_pipeline_rejected_jobs;
+        return false;
+    }
+    candidate.generation       = generation;
+    candidate.worker_submitted = true;
+    lookahead                  = candidate;
+    ++g_p2_pack_dma_pipeline_eligible_jobs;
+    return true;
+}
+
+static bool fpga_p2_dma_pipeline_consume(fpga_p2_dma_pipeline_lookahead_t & lookahead,
+                                         fpga_tile_job_t &                   job,
+                                         fpga_stage_totals_t *                totals,
+                                         const struct ggml_tensor *             expected_src0,
+                                         const void *                           expected_weight_data_base,
+                                         int64_t                                expected_row0,
+                                         int                                      expected_rows,
+                                         int64_t                                expected_k_block0,
+                                         int                                      expected_group_blocks,
+                                         int64_t                                expected_col,
+                                         uint32_t                               expected_tile_id) {
+    if (!lookahead.valid || lookahead.consumed || lookahead.worker_submitted || lookahead.main_pair_next !=
+                                                                            lookahead.helper_pair_begin ||
+        lookahead.main_written_words != lookahead.helper_pair_begin * lookahead.words_per_pair ||
+        lookahead.main_scale_entries > lookahead.expected_scale_entries || lookahead.totals != totals ||
+        lookahead.source_epoch != g_p2_weight_residency_epoch || lookahead.job.src0 != expected_src0 ||
+        lookahead.weight_data_base != expected_weight_data_base || lookahead.job.row0 != expected_row0 ||
+        lookahead.job.rows != expected_rows || lookahead.job.k_block0 != expected_k_block0 ||
+        lookahead.job.group_blocks != expected_group_blocks || lookahead.job.col != expected_col ||
+        lookahead.job.tile_id != expected_tile_id || lookahead.job.weight_src_off == 0U ||
+        lookahead.job.scale_src_off == 0U || lookahead.job.bank != (int) (expected_tile_id & 1U) ||
+        !fpga_p2_dma_pipeline_slot_ranges(lookahead.job.weight_src_off, lookahead.job.scale_src_off,
+                                           lookahead.job.weight_bytes, lookahead.job.scale_bytes)) {
+        return false;
+    }
+    job = lookahead.job;
+    job.event_prep_begin_us = lookahead.job.event_prep_begin_us;
+    lookahead.consumed = true;
+    lookahead.valid = false;
+    ++g_p2_pack_dma_pipeline_consumed_jobs;
+    return true;
+}
+
+static bool fpga_p2_dma_pipeline_finalize(fpga_p2_dma_pipeline_lookahead_t & lookahead) {
+    if (!lookahead.valid || lookahead.consumed || !lookahead.worker_submitted) {
+        return !lookahead.valid || lookahead.consumed;
+    }
+    const long long finalize0 = now_us();
+    const long long residual0 = now_us();
+    while (lookahead.main_pair_next < lookahead.helper_pair_begin) {
+        const size_t pair_end = std::min(lookahead.main_pair_next + P2_PIPELINE_PACK_BATCH_PAIRS,
+                                         lookahead.helper_pair_begin);
+        if (!fpga_p2_dma_pipeline_pack_batch(&lookahead, pair_end)) {
+            return false;
+        }
+    }
+    lookahead.residual_us += now_us() - residual0;
+
+    size_t helper_words = 0U;
+    size_t helper_scales = 0U;
+    long long helper_wait = 0;
+    if (!fpga_p2_pack_worker_wait(lookahead.generation, &helper_words, &lookahead.helper_service_us, &helper_wait,
+                                  &helper_scales)) {
+        return false;
+    }
+    lookahead.worker_submitted = false;
+    const size_t helper_expected_words =
+        (lookahead.pair_count - lookahead.helper_pair_begin) * lookahead.words_per_pair;
+    const size_t helper_rows = lookahead.job.rows > (int) (lookahead.helper_pair_begin * 2U) ?
+                                   (size_t) lookahead.job.rows - lookahead.helper_pair_begin * 2U :
+                                   0U;
+    const size_t helper_expected_scales = helper_rows * (size_t) lookahead.job.group_blocks;
+    if (helper_words != helper_expected_words || helper_scales != helper_expected_scales) {
+        return false;
+    }
+    if (lookahead.main_written_words != lookahead.helper_pair_begin * lookahead.words_per_pair ||
+        lookahead.main_scale_entries != lookahead.expected_scale_entries - helper_expected_scales) {
+        return false;
+    }
+    // scale_bytes is already the padded byte capacity of the source slot.
+    // Each entry occupies one uint32_t in the packed row-major table; do not
+    // multiply the byte-derived entry count by the number of 128-bit lanes a
+    // result word contains.  That would clear four times the admitted range
+    // and could overwrite the adjacent pipeline slot.
+    const size_t scale_capacity_entries = lookahead.job.scale_bytes / sizeof(uint32_t);
+    if (lookahead.expected_scale_entries > scale_capacity_entries) {
+        return false;
+    }
+    for (size_t linear = lookahead.expected_scale_entries; linear < scale_capacity_entries; ++linear) {
+        lookahead.scale_words[linear] = 0U;
+    }
+    mmio_fence();
+    if (lookahead.main_written_words > SIZE_MAX / sizeof(uint32_t)) {
+        return false;
+    }
+    const size_t total_main_bytes = lookahead.main_written_words * sizeof(uint32_t);
+    if (lookahead.callback_bytes > total_main_bytes ||
+        g_p2_pack_dma_pipeline_residual_bytes > LLONG_MAX - (long long) (total_main_bytes - lookahead.callback_bytes)) {
+        return false;
+    }
+    g_p2_pack_dma_pipeline_residual_bytes += (long long) (total_main_bytes - lookahead.callback_bytes);
+    g_p2_pack_dma_pipeline_helper_us += lookahead.helper_service_us;
+    g_p2_pack_dma_pipeline_residual_us += lookahead.residual_us;
+    if (lookahead.totals) {
+        // Callback and helper service overlap the current DMA.  Count only
+        // the host-side residual/finalization wall time in the ordinary prep
+        // chart; the separate pipeline counters retain the overlapped work.
+        const long long finalize_wall_us = now_us() - finalize0;
+        lookahead.totals->prep_direct_weight_pack_us += lookahead.residual_us;
+        lookahead.totals->prep_us += finalize_wall_us;
+    }
+    (void) helper_wait;
+    return true;
+}
 
 static void p2_trace_first_tile(const fpga_tile_job_t & job, const char * stage, const char * edge) {
     if (!p2_trace_this_tile()) {
@@ -6216,7 +6861,8 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
                                     int64_t               k,
                                     int64_t               n,
                                     int64_t               m,
-                                    int                   attempt) {
+                                    int                   attempt,
+                                    const fpga_dma_poll_hook_t * poll_hook = nullptr) {
     job.event_submit_begin_us = p2_event_now_us();
     if (job.input_preload_poisoned || (job.input_preloaded && !fpga_q8_input_preload_key_matches(job))) {
         LOGE("P1_INPUT_PRELOAD_KEY_FAIL job=%u bank=%d preloaded=%d poisoned=%d action=abort_no_deferred_launch",
@@ -6301,7 +6947,11 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
         }
         g_p2_first_act_dma_trace_active = true;
     }
-    const bool act_dma_ok = job.input_preloaded || fpga_dma_write_to_ip(ACT_BASE, job.act_bytes, "ACT");
+    const bool act_dma_ok =
+        job.input_preloaded ||
+        (poll_hook ? fpga_dma_copy(DDR_BASE_PHYS + (uint64_t) ACT_BASE, LMM_BASE_PHYS + (uint64_t) ACT_BASE,
+                                   job.act_bytes, "ACT", poll_hook) :
+                       fpga_dma_write_to_ip(ACT_BASE, job.act_bytes, "ACT"));
     if (first_p2_act_detail) {
         g_p2_first_act_dma_trace_active = false;
         g_p2_first_act_dma_trace_done   = true;
@@ -6324,7 +6974,11 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
     vpu_select_banks(job.bank, job.bank);
     if (!job.input_preloaded && !job.weight_bank_reused &&
         !fpga_dma_copy(DDR_BASE_PHYS + (uint64_t) job.weight_src_off, LMM_BASE_PHYS + (uint64_t) WEIGHT_BASE,
-                       job.weight_bytes, "WEIGHT")) {
+                       job.weight_bytes, "WEIGHT", poll_hook)) {
+        if (poll_hook && poll_hook->context) {
+            fpga_p2_dma_pipeline_invalidate(
+                static_cast<fpga_p2_dma_pipeline_lookahead_t *>(poll_hook->context));
+        }
         return false;
     }
     const long long event_dma_weight_done = p2_event_now_us();
@@ -6343,7 +6997,8 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
     }
     const long long event_dma_scale0 = p2_event_now_us();
     p2_trace_first_tile(job, "SPU_PARAM_DMA", "before");
-    if (!fpga_dma_write_to_ip(SPU_PARAM_BASE, job.scale_bytes, "SPU_SCALE")) {
+    if (!fpga_dma_copy(DDR_BASE_PHYS + (uint64_t) job.scale_src_off, LMM_BASE_PHYS + (uint64_t) SPU_PARAM_BASE,
+                       job.scale_bytes, "SPU_SCALE", poll_hook)) {
         return false;
     }
     const long long event_dma_scale_done = p2_event_now_us();
@@ -7127,6 +7782,13 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                                            (uint32_t) budget_end, &allocation_end);
     };
 
+    const bool pipeline_route = g_p2_pack_dma_pipeline_enabled && m == 1;
+    // Keep the packed lookahead alive across both K and row loops.  The
+    // admission lambda may select the first tile of the next row when the
+    // existing overlap policy carries the current result forward.
+    fpga_p2_dma_pipeline_lookahead_t lookahead = {};
+    fpga_p2_dma_pipeline_scope_guard pipeline_guard{ &lookahead };
+
     for (int64_t row0 = 0; row0 < n; row0 += g_vpu_max_rows) {
         const int rows = (int) std::min<int64_t>(g_vpu_max_rows, n - row0);
         if (!running) {
@@ -7143,6 +7805,63 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
             // drain only writes the disjoint result window. Contract/restage
             // diagnostics use the separate single-bank path, not this loop.
             fpga_prompt_weight_staging_t staging;
+            const auto admit_next_tile = [&](const fpga_tile_job_t & current) {
+                if (!pipeline_route || lookahead.valid || current.input_preloaded || current.weight_bank_reused ||
+                    current.weight_cache_hit || current.p2_residency_hit ||
+                    current.weight_bytes < FPGA_P2_PACK_PARALLEL_MIN_BYTES ||
+                    current.weight_bytes > P2_PIPELINE_WEIGHT_SLOT_BYTES ||
+                    current.scale_bytes > P2_PIPELINE_SCALE_SLOT_BYTES || current.scale_bytes > P2_PIPELINE_PL_SCALE_BYTES ||
+                    current.weight_src_off != WEIGHT_BASE +
+                                                  (current.tile_id & 1U) * P2_PIPELINE_WEIGHT_SLOT_BYTES) {
+                    return true;
+                }
+                int64_t next_col = current.col + 1;
+                int64_t next_k   = current.k_block0;
+                int64_t next_row0 = current.row0;
+                int     next_rows  = current.rows;
+                if (next_col >= m) {
+                    next_col = 0;
+                    next_k += current.group_blocks;
+                }
+                if (next_k >= nb) {
+                    const int64_t candidate_row0 = current.row0 + current.rows;
+                    if (candidate_row0 >= n) {
+                        return true;
+                    }
+                    next_row0 = candidate_row0;
+                    next_rows = (int) std::min<int64_t>(g_vpu_max_rows, n - candidate_row0);
+                    if (!can_carry_to_row(next_rows)) {
+                        return true;
+                    }
+                    next_k = 0;
+                }
+                const int next_group_blocks = packed_q8_group_blocks_for_rows(next_rows, (int) (nb - next_k));
+                const int next_group_beats  = next_group_blocks * VPU_BLOCK_BEATS;
+                const uint32_t next_tile_id = current.tile_id + 1U;
+                const uint32_t next_slot = next_tile_id & 1U;
+                const uint32_t next_weight_off = WEIGHT_BASE + next_slot * P2_PIPELINE_WEIGHT_SLOT_BYTES;
+                const uint32_t next_scale_off  = SPU_PARAM_BASE + next_slot * P2_PIPELINE_SCALE_SLOT_BYTES;
+                const block_q8_0_t * next_act = &act_blocks_all[(size_t) (next_col * nb + next_k)];
+                size_t next_weight_bytes = 0U;
+                size_t next_scale_bytes = 0U;
+                size_t next_pairs = 0U;
+                size_t next_words_per_pair = 0U;
+                size_t next_scale_entries = 0U;
+                if (!fpga_p2_dma_pipeline_geometry((size_t) next_rows, (size_t) next_group_blocks, next_group_beats,
+                                                   &next_weight_bytes, &next_scale_bytes, &next_pairs,
+                                                   &next_words_per_pair, &next_scale_entries) ||
+                    next_pairs < 2U ||
+                    fpga_p2_residency_contains(src0, next_row0, next_rows, next_k, next_group_blocks, next_group_beats,
+                                               next_weight_bytes)) {
+                    return true;
+                }
+                (void) next_scale_bytes;
+                (void) next_words_per_pair;
+                (void) next_scale_entries;
+                return fpga_p2_dma_pipeline_admit(
+                    lookahead, src0, src0->data, next_act, next_row0, next_rows, next_k, next_group_blocks,
+                    next_col, next_tile_id, (int) next_slot, totals, next_weight_off, next_scale_off);
+            };
             // Both banks start unknown for every row/K tile. Only this column
             // loop writes their weights; ACT, scales, and result retirement
             // do not modify weight RAM. No validity survives a return/retry.
@@ -7160,10 +7879,36 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                         group_blocks, group_beats, tile_id, bank);
                 }
 
-                if (!fpga_prepare_q8_tile_job(prepared, src0, src0->data, act_group, row0, rows, ib0, group_blocks, col,
-                                              weight_tile_index, weight_cache, tile_id, bank, totals,
-                                              m > 1 ? &staging : nullptr)) {
-                    return false;
+                bool pipeline_prepared = false;
+                if (lookahead.valid) {
+                    if (lookahead.job.tile_id != tile_id ||
+                        !fpga_p2_dma_pipeline_consume(lookahead, prepared, totals, src0, src0->data, row0, rows, ib0,
+                                                      group_blocks, col, tile_id)) {
+                        fpga_p2_dma_pipeline_invalidate(&lookahead);
+                        return false;
+                    }
+                    pipeline_prepared = true;
+                } else {
+                    size_t pipeline_weight_bytes = 0U;
+                    size_t pipeline_scale_bytes = 0U;
+                    size_t pipeline_pairs = 0U;
+                    size_t pipeline_words_per_pair = 0U;
+                    size_t pipeline_scale_entries = 0U;
+                    const bool use_pipeline_slots =
+                        pipeline_route &&
+                        fpga_p2_dma_pipeline_geometry((size_t) rows, (size_t) group_blocks, group_beats,
+                                                      &pipeline_weight_bytes, &pipeline_scale_bytes, &pipeline_pairs,
+                                                      &pipeline_words_per_pair, &pipeline_scale_entries) &&
+                        pipeline_pairs >= 2U;
+                    const uint32_t stage_slot = tile_id & 1U;
+                    if (!fpga_prepare_q8_tile_job(
+                            prepared, src0, src0->data, act_group, row0, rows, ib0, group_blocks, col,
+                            weight_tile_index, weight_cache, tile_id, bank, totals, m > 1 ? &staging : nullptr,
+                            use_pipeline_slots ? WEIGHT_BASE + stage_slot * P2_PIPELINE_WEIGHT_SLOT_BYTES : WEIGHT_BASE,
+                            use_pipeline_slots ? SPU_PARAM_BASE + stage_slot * P2_PIPELINE_SCALE_SLOT_BYTES :
+                                                  SPU_PARAM_BASE)) {
+                        return false;
+                    }
                 }
 
                 prepared.weight_bank_reused = m > 1 && weight_bank_loaded[bank];
@@ -7225,7 +7970,18 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                     } else if (g_p1_sched_summary_enabled) {
                         g_p1_sched_summary.serial_submit_after_no_preload++;
                     }
-                    if (!fpga_submit_q8_tile_job(prepared, totals, tensor_name, layer_id, k, n, m, 0)) {
+                    if (pipeline_prepared && !fpga_p2_dma_pipeline_prepare_activation(prepared, totals)) {
+                        return false;
+                    }
+                    if (!admit_next_tile(prepared)) {
+                        fpga_p2_dma_pipeline_invalidate(&lookahead);
+                        return false;
+                    }
+                    const fpga_dma_poll_hook_t poll_hook = {
+                        fpga_p2_dma_pipeline_poll, lookahead.valid ? static_cast<void *>(&lookahead) : nullptr };
+                    if (!fpga_submit_q8_tile_job(prepared, totals, tensor_name, layer_id, k, n, m, 0,
+                                                 lookahead.valid ? &poll_hook : nullptr)) {
+                        fpga_p2_dma_pipeline_invalidate(&lookahead);
                         return false;
                     }
                     if (overlap_results) {
@@ -7247,9 +8003,32 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                         store_rows(running->row0, running->rows);
                         accum.assign((size_t) (m * rows), 0.0f);
                     }
+                    // Finalize the next tile only after A's pending result has
+                    // been accumulated and, at a row transition, stored.  The
+                    // helper still owns C's inactive DDR source slot, and the
+                    // scope guard joins it if this finalization fails.
+                    if (lookahead.valid && !fpga_p2_dma_pipeline_finalize(lookahead)) {
+                        fpga_p2_dma_pipeline_invalidate(&lookahead);
+                        return false;
+                    }
                     running = &prepared;
                 } else {
-                    if (!fpga_submit_q8_tile_job(prepared, totals, tensor_name, layer_id, k, n, m, 0)) {
+                    if (pipeline_prepared && !fpga_p2_dma_pipeline_prepare_activation(prepared, totals)) {
+                        return false;
+                    }
+                    if (!admit_next_tile(prepared)) {
+                        fpga_p2_dma_pipeline_invalidate(&lookahead);
+                        return false;
+                    }
+                    const fpga_dma_poll_hook_t poll_hook = {
+                        fpga_p2_dma_pipeline_poll, lookahead.valid ? static_cast<void *>(&lookahead) : nullptr };
+                    if (!fpga_submit_q8_tile_job(prepared, totals, tensor_name, layer_id, k, n, m, 0,
+                                                 lookahead.valid ? &poll_hook : nullptr)) {
+                        fpga_p2_dma_pipeline_invalidate(&lookahead);
+                        return false;
+                    }
+                    if (lookahead.valid && !fpga_p2_dma_pipeline_finalize(lookahead)) {
+                        fpga_p2_dma_pipeline_invalidate(&lookahead);
                         return false;
                     }
                     running = &prepared;
@@ -7690,6 +8469,14 @@ int fpga_init(void) {
     const bool p2_input_preload_enable_env  = env_flag_enabled("FPGA_P2_INPUT_PRELOAD");
     const bool p2_input_preload_disable_env = env_flag_disabled("FPGA_P2_INPUT_PRELOAD");
     g_p2_input_preload_enabled = !p2_input_preload_disable_env;
+    const bool p2_pack_dma_pipeline_enable_env = env_flag_enabled("FPGA_P2_PACK_DMA_PIPELINE");
+    const bool p2_pack_dma_pipeline_disable_env = env_flag_disabled("FPGA_P2_PACK_DMA_PIPELINE");
+    if (p2_pack_dma_pipeline_enable_env && p2_pack_dma_pipeline_disable_env) {
+        fpga_fatal(
+            "FPGA_P2_PACK_DMA_PIPELINE=1 conflicts with FPGA_P2_PACK_DMA_PIPELINE=0; select exactly one pipeline policy");
+    }
+    g_p2_pack_dma_pipeline_requested = p2_pack_dma_pipeline_enable_env;
+    g_p2_pack_dma_pipeline_enabled = false;
     g_p2_result_overlap_enabled = !env_flag_disabled("FPGA_P2_RESULT_OVERLAP");
     g_p1_preload_trace_enabled           = env_flag_enabled("FPGA_P1_PRELOAD_TRACE");
     g_p1_sched_summary_enabled           = env_flag_enabled("FPGA_P1_SCHED_SUMMARY");
@@ -7748,6 +8535,14 @@ int fpga_init(void) {
     g_p2_pack_fused_jobs = 0;
     g_p2_pack_fused_us = 0;
     g_p2_pack_fused_scale_entries = 0;
+    g_p2_pack_dma_pipeline_eligible_jobs = 0;
+    g_p2_pack_dma_pipeline_consumed_jobs = 0;
+    g_p2_pack_dma_pipeline_callback_bytes = 0;
+    g_p2_pack_dma_pipeline_callback_us = 0;
+    g_p2_pack_dma_pipeline_helper_us = 0;
+    g_p2_pack_dma_pipeline_residual_us = 0;
+    g_p2_pack_dma_pipeline_residual_bytes = 0;
+    g_p2_pack_dma_pipeline_rejected_jobs = 0;
     g_pack_detail.fill(0);
     g_pack_detail_snapshot.fill(0);
     g_pack_detail_decode.fill(0);
@@ -8214,6 +9009,22 @@ int fpga_init(void) {
             g_pingpong_scheduler_enabled ? 1 : 0, g_spu_q8_scale_stream_supported ? 1 : 0,
             g_contract_check_limit, g_pl_scale_contract_check_limit);
     }
+    if (g_p2_pack_dma_pipeline_requested) {
+        if (p2_pack_dma_pipeline_disable_env || g_p2_input_preload_enabled || g_contract_check_limit > 0 ||
+            g_pl_scale_contract_check_limit > 0 || !g_pingpong_scheduler_enabled ||
+            !g_spu_q8_scale_stream_supported || g_p2_pack_workers_requested != 2) {
+            fpga_fatal(
+                "FPGA_P2_PACK_DMA_PIPELINE=1 requires FPGA_P2_INPUT_PRELOAD=0, admitted P2 ping-pong, no contract "
+                "qualification, and FPGA_P2_PACK_WORKERS=2; refusing an ambiguous shared-staging policy");
+        }
+        LOGINIT(
+            "P2_PACK_DMA_PIPELINE requested=1 admission=waiting_for_persistent_helper mode=decode_direct_large_tiles "
+            "slots=2 weight_slot_bytes=%u scale_slot_bytes=%u callback_batch_pairs=%zu preload=0 residency_builds=deferred",
+            P2_PIPELINE_WEIGHT_SLOT_BYTES, P2_PIPELINE_SCALE_SLOT_BYTES, P2_PIPELINE_PACK_BATCH_PAIRS);
+    } else {
+        g_p2_pack_dma_pipeline_enabled = false;
+        LOGINIT("P2_PACK_DMA_PIPELINE enabled=0 default=off");
+    }
     if (pl_scale_requested && !g_spu_q8_scale_stream_supported) {
         fpga_fatal(
             "FPGA_PL_SCALE_ENABLE requested but P2 admission or stream/descriptors/protocol are incompatible: "
@@ -8280,7 +9091,7 @@ int fpga_init(void) {
         "input_preload=%d input_preload_policy=default_on_opt_out input_preload_disable_env=%d route=%s identity "
         "protocol=0x%08x bitstream_id=0x%08x p2_abi=0x%08x stream_status=0x%08x spu_words=%u descriptor_cap=%d "
         "pingpong_cap=%d vpu_two_row_transport_cap=%d spu_q8_scale_pair_stream_cap=%d two_row_transport_ok=%d "
-        "windows spu_param=0x%08x spu_out=0x%08x",
+        "windows spu_param=0x%08x spu_out=0x%08x pack_dma_pipeline_requested=%d pack_dma_pipeline_enabled=%d",
         g_spu_q8_scale_stream_supported ? 1 : 0, g_pl_scale_contract_check_limit,
         pipeline_disable_env ? 0 : 1, pipeline_disable_env ? 1 : 0, g_pingpong_scheduler_enabled ? 1 : 0,
         g_p2_input_preload_enabled ? 1 : 0, p2_input_preload_disable_env ? 1 : 0,
@@ -8290,7 +9101,8 @@ int fpga_init(void) {
         g_stream_protocol_version, g_bitstream_id, g_p2_stream_abi_signature, g_spu_stream_status, g_spu_word_capacity,
         g_vpu_descriptor_supported ? 1 : 0, g_vpu_pingpong_supported ? 1 : 0,
         vpu_p2_two_row_transport_cap ? 1 : 0, spu_q8_scale_pair_stream_cap ? 1 : 0,
-        p2_two_row_transport_compatible ? 1 : 0, SPU_PARAM_BASE, SPU_OUT_BASE);
+         p2_two_row_transport_compatible ? 1 : 0, SPU_PARAM_BASE, SPU_OUT_BASE,
+         g_p2_pack_dma_pipeline_requested ? 1 : 0, g_p2_pack_dma_pipeline_enabled ? 1 : 0);
     // Establish and read back P2 mode 0 before any self-test or model transfer.
     if (!fpga_enforce_p2_stream_mode("P2 route baseline")) {
         fpga_fatal("stream mode-0 baseline was not quiescent/readable; refusing P2 data-plane traffic");
@@ -8428,6 +9240,23 @@ int fpga_init(void) {
                 "before ready and no DMA/IP job was started");
         }
         g_p2_pack_workers_active = 2;
+    }
+    if (g_p2_pack_dma_pipeline_requested) {
+        // The pipeline submits its suffix to this already-created helper during
+        // admission. Publish the route only after the helper exists, so a
+        // worker policy mismatch cannot reach the first eligible tile.
+        if (!g_p2_pack_worker_created || g_p2_pack_workers_active != 2) {
+            pthread_mutex_unlock(&g_mutex);
+            fpga_cleanup();
+            fpga_fatal(
+                "FPGA_P2_PACK_DMA_PIPELINE requested but the persistent WEIGHT-pack helper was not admitted; "
+                "no pipeline tile was started");
+        }
+        g_p2_pack_dma_pipeline_enabled = true;
+        LOGINIT(
+            "P2_PACK_DMA_PIPELINE enabled=1 mode=decode_direct_large_tiles slots=2 weight_slot_bytes=%u "
+            "scale_slot_bytes=%u callback_batch_pairs=%zu preload=0 residency_builds=deferred helper=ready",
+            P2_PIPELINE_WEIGHT_SLOT_BYTES, P2_PIPELINE_SCALE_SLOT_BYTES, P2_PIPELINE_PACK_BATCH_PAIRS);
     }
     LOGINIT(
         "P2_PACK_CONFIG requested_workers=%d active_workers=%d parallel_min_bytes=%zu policy=pair_disjoint_before_dma "
@@ -8568,11 +9397,20 @@ void fpga_cleanup(void) {
         "P2_PACK_SUMMARY requested_workers=%d active_workers=%d helper_stopped=%d parallel_min_bytes=%zu "
         "parallel_jobs=%lld parallel_bytes=%llu serial_threshold_skips=%lld main_pack_us=%lld "
         "helper_service_us=%lld caller_wait_us=%lld fused_jobs=%lld fused_us=%lld fused_scale_entries=%lld "
-        "fused_direct_pack_includes_scale=1",
+        "fused_direct_pack_includes_scale=1 dma_pipeline_requested=%d dma_pipeline_enabled=%d "
+        "dma_pipeline_host_dma_includes_callback=1 dma_pipeline_eligible_jobs=%lld dma_pipeline_consumed_jobs=%lld "
+        "dma_pipeline_callback_us=%lld "
+        "dma_pipeline_callback_bytes=%llu dma_pipeline_helper_us=%lld dma_pipeline_residual_us=%lld "
+        "dma_pipeline_residual_bytes=%lld dma_pipeline_rejected_jobs=%lld",
         g_p2_pack_workers_requested, g_p2_pack_workers_active, g_p2_pack_worker_created ? 0 : 1,
         FPGA_P2_PACK_PARALLEL_MIN_BYTES, g_p2_pack_parallel_jobs, (unsigned long long) g_p2_pack_parallel_bytes,
         g_p2_pack_serial_threshold_skips, g_p2_pack_main_us, g_p2_pack_helper_service_us, g_p2_pack_caller_wait_us,
-        g_p2_pack_fused_jobs, g_p2_pack_fused_us, g_p2_pack_fused_scale_entries);
+         g_p2_pack_fused_jobs, g_p2_pack_fused_us, g_p2_pack_fused_scale_entries,
+         g_p2_pack_dma_pipeline_requested ? 1 : 0, g_p2_pack_dma_pipeline_enabled ? 1 : 0,
+         g_p2_pack_dma_pipeline_eligible_jobs, g_p2_pack_dma_pipeline_consumed_jobs,
+         g_p2_pack_dma_pipeline_callback_us, (unsigned long long) g_p2_pack_dma_pipeline_callback_bytes,
+         g_p2_pack_dma_pipeline_helper_us, g_p2_pack_dma_pipeline_residual_us,
+         g_p2_pack_dma_pipeline_residual_bytes, g_p2_pack_dma_pipeline_rejected_jobs);
     fpga_log_pack_breakdown("decode_total", -1, g_fpga_perf_decode.decode_tokens,
                             fpga_pack_detail_record(g_pack_detail_decode));
     fpga_log_pack_breakdown("process_total_including_startup", -1, -1,
@@ -9496,11 +10334,14 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
                                      uint32_t                          tile_id,
                                      int                               bank,
                                      fpga_stage_totals_t *             totals,
-                                     fpga_prompt_weight_staging_t *    staging) {
+                                     fpga_prompt_weight_staging_t *    staging,
+                                     uint32_t                          weight_stage_off,
+                                     uint32_t                          scale_stage_off) {
     const bool reuse_direct_weight = staging && staging->valid &&
         staging->src0 == src0 && staging->data == weight_data_base && staging->ddr == g_ddr &&
         staging->row0 == row0 && staging->rows == rows && staging->k_block0 == k_block0 &&
-        staging->group_blocks == group_blocks && staging->epoch == g_p2_weight_residency_epoch;
+        staging->group_blocks == group_blocks && staging->epoch == g_p2_weight_residency_epoch &&
+        staging->weight_off == weight_stage_off && staging->scale_off == scale_stage_off;
     if (staging) {
         // Every early return leaves reuse invalid. Publish only after the
         // pack helper and the existing final publication fence complete.
@@ -9582,30 +10423,31 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
     job.result_values    = result_values;
     job.result_words     = result_words;
     job.scale_words      = result_words;
-    job.weight_src_off   = WEIGHT_BASE;
+    job.weight_src_off   = weight_stage_off;
+    job.scale_src_off    = scale_stage_off;
     job.p2_residency_slot = P2_WEIGHT_RESIDENCY_NO_SLOT;
     job.act_group        = act_group;
     job.src0             = src0;
     job.weight_cache     = weight_cache;
 
-    if (!range_fits(SPU_PARAM_BASE, scale_bytes, SPU_PARAM_BASE, SPU_PARAM_END) ||
-        !ddr_range_fits(SPU_PARAM_BASE, scale_bytes)) {
-        LOGE("P2 scale window rejected bytes=%zu action=no_dma", scale_bytes);
+    if (!range_fits(scale_stage_off, scale_bytes, SPU_PARAM_BASE, SPU_PARAM_END) ||
+        !ddr_range_fits(scale_stage_off, scale_bytes)) {
+        LOGE("P2 scale source window rejected off=0x%08x bytes=%zu action=no_dma", scale_stage_off, scale_bytes);
         return false;
     }
 
     fpga_p2_scale_shape_t scale_shape = {};
     if (!fpga_p2_checked_scale_shape(rows, group_blocks, job.result_values, job.result_words, job.scale_bytes,
-                                     SPU_PARAM_BASE, &scale_shape)) {
+                                     scale_stage_off, &scale_shape)) {
         LOGE(
             "P2 scale shape rejected job=%u tile=%u rows=%d group_blocks=%d result_values=%u result_words=%u "
             "scale_bytes=%zu spu_param=0x%08x action=no_write_no_dma_no_start",
             job.job_id, job.tile_id, rows, group_blocks, job.result_values, job.result_words, job.scale_bytes,
-            SPU_PARAM_BASE);
+            scale_stage_off);
         return false;
     }
     // Admit the complete scale range before either direct producer can write.
-    volatile uint32_t * const scale_words = ddr_checked_u32_ptr(SPU_PARAM_BASE, job.scale_bytes);
+    volatile uint32_t * const scale_words = ddr_checked_u32_ptr(scale_stage_off, job.scale_bytes);
 
     if (g_p2_init_requested) {
         p2_trace_set_job_context(job);
@@ -9674,9 +10516,9 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
             !fpga_weight_layout_payload_bytes(rows, group_beats, &direct_payload_bytes) ||
             direct_payload_bytes != weight_bytes || direct_payload_bytes != job.weight_bytes ||
             direct_payload_bytes != pair_count * group_beats_size * 32U ||
-            direct_payload_bytes > (size_t) UINT32_MAX - (size_t) WEIGHT_BASE ||
-            !range_fits(WEIGHT_BASE, direct_payload_bytes, WEIGHT_BASE, WEIGHT_END) ||
-            !ddr_range_fits(WEIGHT_BASE, direct_payload_bytes) ||
+            direct_payload_bytes > (size_t) UINT32_MAX - (size_t) weight_stage_off ||
+            !range_fits(weight_stage_off, direct_payload_bytes, WEIGHT_BASE, WEIGHT_END) ||
+            !ddr_range_fits(weight_stage_off, direct_payload_bytes) ||
             direct_payload_bytes > UINT64_MAX - g_p2_residency_direct_weight_pack_bytes) {
             LOGE(
                 "P2 direct WEIGHT pack precondition failed job=%u tile=%u rows=%d group_beats=%d payload=%zu "
@@ -9686,7 +10528,7 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
             return false;
         }
 
-        volatile uint32_t * direct_weight_words = ddr_checked_u32_ptr(WEIGHT_BASE, direct_payload_bytes);
+        volatile uint32_t * direct_weight_words = ddr_checked_u32_ptr(weight_stage_off, direct_payload_bytes);
         const size_t words_per_pair = group_beats_size * 8U;
         const size_t expected_words = direct_payload_bytes / sizeof(uint32_t);
         if (words_per_pair == 0U || pair_count > std::numeric_limits<size_t>::max() / words_per_pair ||
@@ -9955,6 +10797,8 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
         staging->group_blocks = group_blocks;
         staging->bytes = weight_bytes;
         staging->epoch = g_p2_weight_residency_epoch;
+        staging->weight_off = job.weight_src_off;
+        staging->scale_off = job.scale_src_off;
         staging->valid = true;
     }
     return true;

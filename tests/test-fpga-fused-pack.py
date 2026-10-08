@@ -23,6 +23,20 @@ def section(begin, end):
     return source[start:source.index(end, start)]
 
 
+def function(begin):
+    start = source.index(begin)
+    brace = source.index("{", start)
+    depth = 0
+    for position in range(brace, len(source)):
+        if source[position] == "{":
+            depth += 1
+        elif source[position] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:position + 1]
+    raise AssertionError(f"unterminated function: {begin}")
+
+
 harness = r'''
 #include <algorithm>
 #include <array>
@@ -55,7 +69,19 @@ harness += "static std::array<long long, PACK_DETAIL_COUNT> g_pack_detail = {};\
 task_end = source.index("} fpga_p2_pack_worker_task_t;")
 task_start = source.rfind("typedef struct {", 0, task_end)
 harness += source[task_start:source.index("static long long         g_p2_residency_avoided_cpu_pack_bytes", task_end)]
-harness += section("static bool fpga_copy_weight_pair_range(", "static bool checked_size_add(")
+# The worker implementation is no longer one contiguous source section:
+# fpga_host.cpp places the independent DMA-pipeline helpers between worker
+# wait and worker stop. Extract only the production worker functions needed by
+# this RAM test so additions to the host scheduler do not pull unrelated types.
+for worker_function in (
+        "static bool fpga_copy_weight_pair_range(",
+        "static void * fpga_p2_pack_worker_main(",
+        "static bool fpga_p2_pack_worker_start(",
+        "static bool fpga_p2_pack_worker_next_generation(",
+        "static bool fpga_p2_pack_worker_submit(",
+        "static bool fpga_p2_pack_worker_wait(",
+        "static bool fpga_p2_pack_worker_stop("):
+    harness += function(worker_function) + "\n"
 
 harness += r'''
 static uint16_t raw_d(const block_q8_0 & block) {

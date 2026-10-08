@@ -20,6 +20,20 @@ def section(begin, end):
     return source[start:source.index(end, start)]
 
 
+def function(begin):
+    start = source.index(begin)
+    brace = source.index("{", start)
+    depth = 0
+    for position in range(brace, len(source)):
+        if source[position] == "{":
+            depth += 1
+        elif source[position] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:position + 1]
+    raise AssertionError(f"unterminated function: {begin}")
+
+
 harness = r'''
 #include <array>
 #include <cstring>
@@ -56,7 +70,15 @@ static int checked_signal(pthread_cond_t * cv) {
 }
 #define pthread_cond_signal checked_signal
 '''
-harness += section("static bool fpga_copy_weight_pair_range(", "static bool checked_size_add(")
+for worker_function in (
+        "static bool fpga_copy_weight_pair_range(",
+        "static void * fpga_p2_pack_worker_main(",
+        "static bool fpga_p2_pack_worker_start(",
+        "static bool fpga_p2_pack_worker_next_generation(",
+        "static bool fpga_p2_pack_worker_submit(",
+        "static bool fpga_p2_pack_worker_wait(",
+        "static bool fpga_p2_pack_worker_stop("):
+    harness += function(worker_function) + "\n"
 harness += r'''
 #undef pthread_cond_signal
 int main() {
