@@ -101,12 +101,11 @@ struct fpga_stage_totals_t {
     long long prep_weight_select_us = 0, prep_direct_weight_pack_us = 0;
     long long prep_scale_pack_us = 0, prep_act_pack_us = 0;
     long long activation_scale_fp16_overflows = 0;
-    long long input_preload_us = 0, preload_launch_bubble_us = 0, input_preload_jobs = 0;
     long long scheduler_prepare_overlap_us = 0, scheduler_prepare_late_us = 0;
-    long long scheduler_prepare_headroom_us = 0, scheduler_preload_overlap_us = 0;
+    long long scheduler_prepare_headroom_us = 0;
     long long scheduler_output_to_launch_us = 0, scheduler_retire_to_launch_us = 0;
     long long scheduler_handoffs = 0, scheduler_prepare_late_jobs = 0;
-    long long scheduler_preload_overlap_jobs = 0, result_overlap_jobs = 0;
+    long long result_overlap_jobs = 0;
     long long result_overlap_host_us = 0;
     long long bank_h2ip_us[2] = {}, bank_compute_us[2] = {}, bank_ip2host_us[2] = {};
     long long bank_host_read_us[2] = {}, bank_jobs[2] = {};
@@ -143,25 +142,13 @@ struct fpga_tile_job_t {
     long long dma_result_us = 0, ip_start_us = 0, measured_compute_us = 0, ip_compute_us = 0;
     long long host_result_us = 0;
     bool output_dma_ready = false, hardware_released = false, result_consumed = false;
-    long long event_prep_begin_us = 0, event_prep_done_us = 0, event_preload_begin_us = 0;
-    long long event_preload_done_us = 0, event_submit_begin_us = 0;
+    long long event_prep_begin_us = 0, event_prep_done_us = 0, event_submit_begin_us = 0;
     long long event_input_transfer_begin_us = 0, event_launch_us = 0, event_vpu_done_us = 0;
     long long event_spu_finality_us = 0, event_retire_us = 0;
     long long handoff_prev_output_ready_us = 0, handoff_prev_retire_us = 0;
     uint32_t vpu_status = 0, spu_stream_count_before = 0, spu_stream_done_before = 0;
     uint32_t spu_stream_out_before = 0, spu_stream_drop_before = 0, spu_stream_error_before = 0;
-    bool weight_bank_reused = false, input_preloaded = false, input_preload_poisoned = false;
-    uint32_t preload_key_job_id = 0, preload_key_tensor_id = 0;
-    const ggml_tensor * preload_key_tensor = nullptr;
-    int64_t preload_key_row0 = 0, preload_key_k_block0 = 0;
-    int preload_key_rows = 0, preload_key_col = 0, preload_key_group_blocks = 0;
-    size_t preload_key_act_bytes = 0, preload_key_weight_bytes = 0, preload_key_scale_bytes = 0;
-    uint32_t preload_key_weight_src_off = 0, preload_key_weight_layout_version = 0;
-    uint32_t preload_key_p2_residency_slot = P2_WEIGHT_RESIDENCY_NO_SLOT;
-    uint64_t preload_key_p2_residency_epoch = 0;
-    uint32_t preload_key_p2_residency_seal = 0;
-    int preload_key_bank = 0;
-    long long input_preload_us = 0, input_preload_done_us = 0, preload_ready_to_launch_us = 0;
+    bool weight_bank_reused = false;
 };
 
 struct fpga_p2_dma_pipeline_lookahead_t {
@@ -186,7 +173,7 @@ int g_packed_q8_max_blocks = 2, g_packed_q8_result_words = 2;
 int configured_max_rows = 3, configured_max_blocks = 2;
 bool configured_descriptor = true;
 int max_blocks = 2, test_blocks = 0, test_columns = 0, test_rows = 0;
-bool g_p2_input_preload_enabled = false, g_p1_sched_summary_enabled = true;
+bool g_p1_sched_summary_enabled = true;
 bool g_p2_result_overlap_enabled = false, g_vpu_descriptor_supported = true;
 bool g_pingpong_timing_enabled = false;
 bool g_p2_pack_dma_pipeline_enabled = false, pipeline_resident = false;
@@ -204,7 +191,7 @@ int g_active_matmul_graph_seq = 0, g_active_matmul_layer_id = 0;
 int64_t g_active_matmul_shape_k = 0, g_active_matmul_shape_n = 0, g_active_matmul_shape_m = 0;
 bool g_active_matmul_cpu_shadow = false, g_active_matmul_pingpong = true;
 const char * g_active_matmul_tensor_name = nullptr;
-struct { long long pingpong_pairs = 0, serial_submit_after_no_preload = 0; } g_p1_sched_summary;
+struct { long long pingpong_pairs = 0; } g_p1_sched_summary;
 
 static int packed_q8_group_blocks_for_rows(int rows, int remaining_blocks) {
     const int beat_limited_blocks = std::max(1, g_vpu_max_beats / VPU_BLOCK_BEATS);
@@ -424,27 +411,21 @@ harness += residency_align + "\n" + residency_end
 # Keep the existing old scheduler checks: these snippets are the reviewed
 # production guards around weight DMA, while all register/DDR operations remain
 # RAM-only stubs.
-start = SOURCE.index("    if (!job.weight_bank_reused &&")
-preload = SOURCE[start : SOURCE.index("\n    if (g_p1_sched_summary_enabled)", start)]
-start = SOURCE.index("    const long long dma_weight0", SOURCE.index("static bool fpga_submit_q8_tile_job("))
-submit = SOURCE[start : SOURCE.index("    const long long dma_scale0", start)]
+weight_transfer = SOURCE[
+    SOURCE.index("    if (!job.weight_bank_reused &&", SOURCE.index("static bool fpga_submit_q8_tile_job(")) :
+    SOURCE.index("\n    const long long event_dma_weight_done", SOURCE.index("static bool fpga_submit_q8_tile_job("))
+]
 harness += r'''
-bool weight_transfer(fpga_tile_job_t & job, bool preload) {
+bool weight_transfer(fpga_tile_job_t & job) {
     const fpga_dma_poll_hook_t * poll_hook = nullptr;
-    if (preload) {
-        auto poison = [](const char *) { return false; };
-''' + preload + r'''
-    } else {
-''' + submit + r'''
-        (void) dma_weight0; (void) dma_weight1;
-    }
+''' + weight_transfer + r'''
     return true;
 }
 bool transfer(fpga_tile_job_t & job) {
     assert(active != job.bank);
     ++activations;
     const int before = loads;
-    assert(weight_transfer(job, active != -1));
+    assert(weight_transfer(job));
     if (job.weight_bank_reused) {
         assert(loads == before && valid[job.bank] && banks[job.bank] == key(job));
     } else {
@@ -494,13 +475,6 @@ bool fpga_prepare_q8_tile_job(fpga_tile_job_t & job, const ggml_tensor * src0, c
     (void) weight_data_base;
     return true;
 }
-bool fpga_preload_q8_tile_inputs(fpga_tile_job_t & job, const fpga_tile_job_t & running,
-                                 fpga_stage_totals_t *) {
-    if (!step()) return false;
-    assert(active == running.bank);
-    if (job.job_id % 3U) { assert(transfer(job)); job.input_preloaded = true; }
-    return true;
-}
 bool fpga_wait_and_drain_q8_tile_job(fpga_tile_job_t & job, fpga_stage_totals_t *, const char *, int,
                                      int64_t, int64_t, int64_t, int) {
     if (!step()) return false;
@@ -528,7 +502,7 @@ bool fpga_submit_q8_tile_job(fpga_tile_job_t & job, fpga_stage_totals_t *, const
                              int64_t, int64_t, int64_t, int, const fpga_dma_poll_hook_t * poll_hook) {
     if (!step()) return false;
     assert(active == -1);
-    if (!job.input_preloaded) assert(transfer(job));
+    assert(transfer(job));
     if (poll_hook && poll_hook->fn) assert(poll_hook->fn(poll_hook->context, 0));
     assert(valid[job.bank] && banks[job.bank] == key(job));
     ++scales;
@@ -546,7 +520,7 @@ void fpga_log_prompt_weight_reuse(const char *, int64_t, long long jobs, uint64_
 harness += release + "\n" + accumulate + "\n" + scheduler
 harness += r'''
 
-bool run_legacy(int columns, bool preload, bool overlap, int failure, int rows = 7, int blocks = 5, int cache = 0) {
+bool run_legacy(int columns, bool overlap, int failure, int rows = 7, int blocks = 5, int cache = 0) {
     active = -1; valid[0] = valid[1] = false;
     loads = activations = scales = launches = reused = 0;
     operations = 0; fail_at = failure; logged_jobs = -1; logged_bytes = 0;
@@ -562,7 +536,6 @@ bool run_legacy(int columns, bool preload, bool overlap, int failure, int rows =
     g_packed_q8_result_words = std::max(1, (g_vpu_max_rows * g_packed_q8_max_blocks + VPU_RESULT_PACK_LANES - 1) /
                                               VPU_RESULT_PACK_LANES);
     g_p2_pack_dma_pipeline_enabled = false;
-    g_p2_input_preload_enabled = preload;
     g_p2_result_overlap_enabled = overlap;
     g_vpu_descriptor_supported = configured_descriptor;
     g_p2_weight_residency_enabled = cache != 0;
@@ -621,7 +594,6 @@ bool run_pipeline_case(int rows, int blocks, bool enabled, bool resident) {
     test_columns = 1; test_rows = rows; test_blocks = blocks;
     g_vpu_max_rows = 256; max_blocks = 64;
     g_p2_pack_dma_pipeline_enabled = enabled;
-    g_p2_input_preload_enabled = false;
     g_p2_result_overlap_enabled = true;
     g_vpu_descriptor_supported = true;
     g_p2_weight_residency_enabled = resident;
@@ -659,30 +631,28 @@ bool run_pipeline_case(int rows, int blocks, bool enabled, bool resident) {
 }
 
 int main() {
-    for (bool preload : {false, true}) {
-        fpga_tile_job_t job = {};
-        dma_success = false;
-        assert(!weight_transfer(job, preload));
-        job.weight_bank_reused = true;
-        assert(weight_transfer(job, preload));
-        job.weight_bank_reused = false; job.input_preloaded = true;
-        if (!preload) assert(weight_transfer(job, false));
-        dma_success = true;
-    }
+    fpga_tile_job_t job = {};
+    dma_success = false;
+    assert(!weight_transfer(job));
+    job.weight_bank_reused = true;
+    assert(weight_transfer(job));
+    job.weight_bank_reused = false;
+    assert(!weight_transfer(job));
+    dma_success = true;
     int cases = 0;
     configured_max_rows = 3;
     configured_max_blocks = 2;
     for (bool descriptors : {false, true}) {
         configured_descriptor = descriptors;
         for (bool overlap : {false, true}) for (int columns : {1, 2, 3, 4, 5, 46})
-        for (bool preload : {false, true}) for (int blocks : {1, 2, 5})
+        for (int blocks : {1, 2, 5})
         for (int cache : {0, 1, 2, 3, 4, 5, 6}) {
-            assert(run_legacy(columns, preload, overlap, 0, 7, blocks, cache)); ++cases;
+            assert(run_legacy(columns, overlap, 0, 7, blocks, cache)); ++cases;
             const int count = (int) operations;
             for (int fail = 1; fail <= count; ++fail) {
-                assert(!run_legacy(columns, preload, overlap, fail, 7, blocks, cache)); ++cases;
+                assert(!run_legacy(columns, overlap, fail, 7, blocks, cache)); ++cases;
             }
-            assert(run_legacy(columns, preload, overlap, 0, 7, blocks, cache)); ++cases;
+            assert(run_legacy(columns, overlap, 0, 7, blocks, cache)); ++cases;
         }
     }
 
@@ -691,11 +661,11 @@ int main() {
     configured_max_rows = 256;
     configured_max_blocks = 64;
     configured_descriptor = true;
-    for (bool preload : {false, true}) for (bool overlap : {false, true}) {
+    for (bool overlap : {false, true}) {
         int jobs = 0, handoffs = 0;
         for (const auto & shape : {std::pair<int, int>{1024, 36}, {256, 36}, {256, 36}, {1152, 32},
                                   {6912, 36}, {6912, 36}, {1152, 216}}) {
-            assert(run_legacy(1, preload, overlap, 0, shape.first, shape.second, 2));
+            assert(run_legacy(1, overlap, 0, shape.first, shape.second, 2));
             jobs += launches;
             handoffs += overlap_reads;
         }
@@ -709,7 +679,7 @@ int main() {
     for (int rows : {1, 255, 256, 257, 512, 513, 769})
         for (int blocks : {1, 36, 64, 65, 216})
             for (int cache : {0, 1, 2, 3, 4, 5, 6}) {
-                assert(run_legacy(1, true, true, 0, rows, blocks, cache));
+                assert(run_legacy(1, true, 0, rows, blocks, cache));
                 ++cases;
             }
 

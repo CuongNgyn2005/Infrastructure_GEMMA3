@@ -36,7 +36,7 @@
 __extension__ typedef unsigned __int128 fpga_uint128_t;
 __extension__ typedef __int128          fpga_int128_t;
 
-#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v92-p2-dma-pack-pipeline"
+#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v94-p2-dma-pack-pipeline"
 
 #define MY_IP_BASE_ADDRESS 0x00000000A0000000LL
 #define REG_BASE_PHYS      0x00000000A0000000LL
@@ -83,9 +83,6 @@ static bool               g_p2_boundary_diagnostics_enabled   = false;
 // completed host operations but must never become a timing fence, a terminal
 // breadcrumb, or a prerequisite for scheduling.
 static bool               g_p2_event_trace_enabled             = false;
-static uint32_t           g_p1_preload_breadcrumbs             = 0;
-static constexpr uint32_t FPGA_P1_PRELOAD_BREADCRUMB_LIMIT     = 8U;
-static bool               g_p1_preload_trace_enabled           = false;
 static uint32_t           g_p2_trace_job_id                   = 0;
 static uint32_t           g_p2_trace_tile_id                  = 0;
 static int                g_p2_trace_bank                     = -1;
@@ -406,28 +403,19 @@ typedef struct {
     long long prep_scale_pack_us;
     long long prep_act_pack_us;
     long long activation_scale_fp16_overflows;
-    // P1 is explicitly opt-in. Keep its timing separate from ordinary input
-    // DMA so an owner can compare preload duration and post-retirement launch
-    // bubble without changing default stage-telemetry semantics.
-    long long input_preload_us;
-    long long preload_launch_bubble_us;
-    long long input_preload_jobs;
     // Scheduler handoff telemetry. All timestamps use CLOCK_MONOTONIC.
     // "late" means preparation completed after the running job output was
     // already ready; "headroom" means it completed before that boundary.
     long long scheduler_prepare_overlap_us;
     long long scheduler_prepare_late_us;
     long long scheduler_prepare_headroom_us;
-    long long scheduler_preload_overlap_us;
     long long scheduler_output_to_launch_us;
     long long scheduler_retire_to_launch_us;
     long long scheduler_handoffs;
     long long scheduler_prepare_late_jobs;
-    long long scheduler_preload_overlap_jobs;
     long long result_overlap_jobs;
     long long result_overlap_host_us;
-    // Bank-aware telemetry.  H2IP includes ACT + WEIGHT + SCALE and, when
-    // P1 preload is active, the already-completed ACT/WEIGHT preload time.
+    // Bank-aware telemetry. H2IP includes ACT + WEIGHT + SCALE.
     long long bank_h2ip_us[2];
     long long bank_compute_us[2];
     long long bank_ip2host_us[2];
@@ -594,8 +582,6 @@ typedef struct {
     bool                              result_consumed;
     long long                         event_prep_begin_us;
     long long                         event_prep_done_us;
-    long long                         event_preload_begin_us;
-    long long                         event_preload_done_us;
     long long                         event_submit_begin_us;
     long long                         event_input_transfer_begin_us;
     long long                         event_launch_us;
@@ -612,31 +598,6 @@ typedef struct {
     uint32_t                          spu_stream_error_before;
     // Valid only within the pipelined scheduler's current weight-tile column loop.
     bool                              weight_bank_reused;
-    // An input preload establishes ACT and WEIGHT in an inactive bank.
-    // This snapshot is redundant by design: deferred launch proves it owns
-    // the exact staged tile, rather than a same-shaped slot reuse.
-    bool                              input_preloaded;
-    bool                              input_preload_poisoned;
-    uint32_t                          preload_key_job_id;
-    const struct ggml_tensor *        preload_key_tensor;
-    uint32_t                          preload_key_tensor_id;
-    int64_t                           preload_key_row0;
-    int                               preload_key_rows;
-    int64_t                           preload_key_col;
-    int64_t                           preload_key_k_block0;
-    int                               preload_key_group_blocks;
-    size_t                            preload_key_act_bytes;
-    size_t                            preload_key_weight_bytes;
-    size_t                            preload_key_scale_bytes;
-    uint32_t                          preload_key_weight_src_off;
-    uint32_t                          preload_key_weight_layout_version;
-    uint32_t                          preload_key_p2_residency_slot;
-    uint64_t                          preload_key_p2_residency_epoch;
-    uint32_t                          preload_key_p2_residency_seal;
-    int                               preload_key_bank;
-    long long                         input_preload_us;
-    long long                         input_preload_done_us;
-    long long                         preload_ready_to_launch_us;
 } fpga_tile_job_t;
 
 // A bounded lookahead owns only the next tile's immutable identity and the
@@ -821,10 +782,6 @@ static bool     g_spu_rmsnorm_supported         = false;
 static bool     g_spu_rope_supported            = false;
 static bool     g_spu_softmax_supported         = false;
 static bool     g_pingpong_scheduler_enabled    = false;
-// Existing capability bits do not prove that an inactive-bank write select is
-// harmless while VPU is active. P1 is admitted by default only on the
-// validated production ping-pong route; FPGA_P2_INPUT_PRELOAD=0 opts out.
-static bool     g_p2_input_preload_enabled      = false;
 static bool     g_p2_result_overlap_enabled     = true;
 // File-only aggregate telemetry for a completed graph sequence.  This is
 // opt-in because even a host timestamp belongs outside the production fast
@@ -913,9 +870,10 @@ static long long         g_p2_pack_caller_wait_us                      = 0;
 static long long         g_p2_pack_fused_jobs                          = 0;
 static long long         g_p2_pack_fused_us                             = 0;
 static long long         g_p2_pack_fused_scale_entries                  = 0;
-// This second-stage pipeline is intentionally opt-in and decode-only.  The
-// default path keeps the established prepare/submit order until an owner
-// board run explicitly qualifies the overlap.
+// This second-stage pipeline is the production default after compatible P2
+// admission and remains decode-only.  An explicit zero keeps the established
+// prepare/submit order for diagnostics or rollback; an explicit one remains a
+// fail-closed request when the admission gate is incompatible.
 static bool               g_p2_pack_dma_pipeline_requested               = false;
 static bool               g_p2_pack_dma_pipeline_enabled                 = false;
 static long long          g_p2_pack_dma_pipeline_eligible_jobs            = 0;
@@ -1173,12 +1131,6 @@ typedef struct {
     long long matmuls;
     long long vpu_runs;
     long long pingpong_pairs;
-    long long preload_attempts;
-    long long preload_admitted_while_active;
-    long long preload_terminal_skip;
-    long long serial_submit_after_no_preload;
-    long long input_preload_us;
-    long long preload_launch_bubble_us;
     long long ip_compute_us;
     long long dma_act_us;
     long long dma_weight_us;
@@ -1215,7 +1167,6 @@ typedef struct {
     long long act_dma_us;
     long long weight_dma_us;
     long long scale_dma_us;
-    long long preload_us;
     long long ip_compute_us;
     long long ip2host_dma_us;
     long long host_read_us;
@@ -1223,12 +1174,10 @@ typedef struct {
     long long scheduler_prepare_overlap_us;
     long long scheduler_prepare_late_us;
     long long scheduler_prepare_headroom_us;
-    long long scheduler_preload_overlap_us;
     long long scheduler_output_to_launch_us;
     long long scheduler_retire_to_launch_us;
     long long scheduler_handoffs;
     long long scheduler_prepare_late_jobs;
-    long long scheduler_preload_overlap_jobs;
     long long result_overlap_jobs;
     long long result_overlap_host_us;
     long long zdma_descriptors;
@@ -1273,10 +1222,6 @@ static long long now_us(void) {
     gettimeofday(&tv, nullptr);
     return (long long) tv.tv_sec * 1000000LL + (long long) tv.tv_usec;
 }
-
-// P1 breadcrumbs are diagnostic-only. Ordinary records require
-// FPGA_P1_PRELOAD_TRACE=1; force is reserved for failures and flushes them.
-static void fpga_p1_preload_breadcrumb(bool force, const char * fmt, ...);
 
 // Wall clock is useful for long-running summaries, but it can step while NTP
 // disciplines the board.  P2 event durations must instead use a monotonic
@@ -1567,11 +1512,10 @@ static bool fpga_write_post_spu_descriptor(const fpga_tile_job_t & job,
     if (!g_vpu_descriptor_supported) {
         return true;
     }
-    // P1 cannot infer retirement from a write alone: its deferred launch
-    // needs an exact FREE/FREE readback even when verbose boundary tracing is
-    // off.  Other descriptor phases keep the established quiet fast path.
+    // Keep the established quiet fast path except for explicit boundary
+    // diagnostics and the final FREE/FREE readback requested by the caller.
     if (!g_p2_boundary_diagnostics_enabled &&
-        !(final_free_free && (g_p2_input_preload_enabled || force_readback))) {
+        !(final_free_free && force_readback)) {
         vpu_write_tile_descriptor(job, input_state, output_state, flags);
         return true;
     }
@@ -2624,10 +2568,9 @@ static bool fpga_weight_path_bench_environment_allowed(void) {
                               env_int_value("FPGA_PL_SCALE_CONTRACT_CHECK", 0, 0, 1000000) != 0 ||
                               env_flag_enabled("FPGA_SOURCE_AUDIT_ONLY") ||
                               env_flag_enabled("FPGA_PIPELINE_ENABLE") ||
-                              env_flag_enabled("FPGA_P2_INPUT_PRELOAD") ||
                               env_flag_enabled("FPGA_ABORT_ON_CPU_FALLBACK");
     if (incompatible) {
-        fpga_fatal("FPGA_WEIGHT_PATH_BENCH=1 rejects cache/residency/contract/source-audit/preload/pipeline/explicit-"
+        fpga_fatal("FPGA_WEIGHT_PATH_BENCH=1 rejects cache/residency/contract/source-audit/pipeline/explicit-"
                    "abort modes; benchmark routes the captured m==1 sequence to native CPU and never launches ZDMA/VPU");
     }
     return true;
@@ -5730,8 +5673,9 @@ static uint32_t fpga_p2_residency_select_or_build_impl(const struct ggml_tensor 
                               qs_bytes, scale_bytes, budget_bytes);
         return P2_WEIGHT_RESIDENCY_NO_SLOT;
     }
-    // A build is optional. While P1 owns either bank, decline immediately so
-    // residency never blocks waiting for a running descriptor to retire.
+    // A build is optional. While the ping-pong scheduler owns either bank,
+    // decline immediately so residency never blocks waiting for a running
+    // descriptor to retire.
     if (g_pingpong_scheduler_enabled) {
         mmio_fence();
         const uint32_t status_before = vpu_rd32(REG_STATUS);
@@ -5740,14 +5684,14 @@ static uint32_t fpga_p2_residency_select_or_build_impl(const struct ggml_tensor 
         const uint32_t desc_flags    = vpu_rd32(REG_DESC_FLAGS);
         const uint32_t status_after  = vpu_rd32(REG_STATUS);
         mmio_fence();
-        const bool p1_registers_idle = status_before == status_after && (status_before & STATUS_BUSY) == 0U &&
+        const bool scheduler_registers_idle = status_before == status_after && (status_before & STATUS_BUSY) == 0U &&
                                        (bank_stat & BANK_STAT_BUSY) == 0U &&
                                        slot_state == fpga_slot_state_word(0, FPGA_SLOT_FREE, FPGA_SLOT_FREE) &&
                                        desc_flags == 0U;
-        if (!p1_registers_idle) {
+        if (!scheduler_registers_idle) {
             g_p2_residency_misses++;
             g_p2_residency_miss_quiescence++;
-            fpga_p2_residency_log(false, "MISS", "reason=active_p1_registers_not_idle action=defer_direct_stage "
+            fpga_p2_residency_log(false, "MISS", "reason=active_scheduler_registers_not_idle action=defer_direct_stage "
                                           "status_before=0x%08x status_after=0x%08x bank_stat=0x%08x "
                                           "slot_state=0x%08x flags=0x%08x",
                                   status_before, status_after, bank_stat, slot_state, desc_flags);
@@ -6435,20 +6379,6 @@ static void p2_trace_first_tile(const fpga_tile_job_t & job, const char * stage,
     }
 }
 
-static bool fpga_q8_input_preload_key_matches(const fpga_tile_job_t & job) {
-    return job.input_preloaded && !job.input_preload_poisoned && job.preload_key_job_id == job.job_id &&
-           job.preload_key_tensor == job.src0 && job.preload_key_tensor_id == job.tensor_id &&
-           job.preload_key_row0 == job.row0 && job.preload_key_rows == job.rows && job.preload_key_col == job.col &&
-           job.preload_key_k_block0 == job.k_block0 &&
-           job.preload_key_group_blocks == job.group_blocks && job.preload_key_act_bytes == job.act_bytes &&
-           job.preload_key_weight_bytes == job.weight_bytes && job.preload_key_scale_bytes == job.scale_bytes &&
-           job.preload_key_weight_src_off == job.weight_src_off &&
-           job.preload_key_weight_layout_version == P2_WEIGHT_RESIDENCY_LAYOUT_V2 &&
-           job.preload_key_p2_residency_slot == job.p2_residency_slot &&
-           job.preload_key_p2_residency_epoch == job.p2_residency_epoch &&
-           job.preload_key_p2_residency_seal == job.p2_residency_seal && job.preload_key_bank == (job.bank & 1);
-}
-
 static bool fpga_p2_residency_job_still_valid(const fpga_tile_job_t & job) {
     if (!job.p2_residency_hit) {
         return true;
@@ -6471,262 +6401,6 @@ static bool fpga_p2_residency_job_still_valid(const fpga_tile_job_t & job) {
         fpga_p2_residency_poison_slot(job.p2_residency_slot, "post_selection_binding_mismatch");
     }
     return valid;
-}
-
-// P1 samples live ownership immediately before changing the inactive write
-// bank.  The bracketing status reads make a transition during the MMIO read
-// sequence observable, so it cannot be mistaken for either admitted state.
-typedef struct {
-    uint32_t status_before;
-    uint32_t bank_stat;
-    uint32_t active_job;
-    uint32_t done_job;
-    uint32_t descriptor_job;
-    uint32_t slot_state;
-    uint32_t status_after;
-} fpga_p1_preload_register_snapshot_t;
-
-enum fpga_p1_preload_state_t : uint32_t {
-    FPGA_P1_PRELOAD_STATE_ACTIVE,
-    FPGA_P1_PRELOAD_STATE_TERMINAL,
-    FPGA_P1_PRELOAD_STATE_MISMATCH,
-};
-
-static constexpr uint32_t FPGA_P1_PRELOAD_RESNAPSHOT_LIMIT = 4U;
-
-static fpga_p1_preload_register_snapshot_t fpga_p1_preload_register_snapshot(void) {
-    // A DSB/CPU fence before and after the read sequence prevents host-side
-    // reordering around this ownership decision.  This is observational only:
-    // it performs no W1C, descriptor, bank, or control write.
-    mmio_fence();
-    const fpga_p1_preload_register_snapshot_t snapshot = {
-        vpu_rd32(REG_STATUS),    vpu_rd32(REG_BANK_STAT), vpu_rd32(REG_ACTIVE_JOB),
-        vpu_rd32(REG_DONE_JOB),  vpu_rd32(REG_JOB_ID),     vpu_rd32(REG_SLOT_STATE),
-        vpu_rd32(REG_STATUS),
-    };
-    mmio_fence();
-    return snapshot;
-}
-
-static fpga_p1_preload_state_t fpga_classify_p1_preload_state(
-    const fpga_p1_preload_register_snapshot_t & snapshot, const fpga_tile_job_t & running) {
-    const uint32_t status_mask = STATUS_DONE | STATUS_BUSY | STATUS_ERROR;
-    const uint32_t bank_mask   = BANK_STAT_BUSY | BANK_STAT_DONE | BANK_STAT_ERROR;
-    const uint32_t expected_slot = fpga_slot_state_word(running.bank, FPGA_SLOT_COMPUTING, FPGA_SLOT_FREE);
-    const uint32_t status_before = snapshot.status_before & status_mask;
-    const uint32_t status_after  = snapshot.status_after & status_mask;
-    const bool status_stable = status_before == status_after;
-    const bool descriptor_running = snapshot.descriptor_job == running.job_id && snapshot.slot_state == expected_slot;
-    const bool active_bank_running =
-        (((snapshot.bank_stat & BANK_STAT_ACTIVE_BANK) != 0U) ? 1 : 0) == (running.bank & 1);
-
-    if (status_stable && status_before == STATUS_BUSY && (snapshot.bank_stat & bank_mask) == BANK_STAT_BUSY &&
-        active_bank_running && snapshot.active_job == running.job_id && descriptor_running) {
-        return FPGA_P1_PRELOAD_STATE_ACTIVE;
-    }
-
-    const bool done_bank_running =
-        (((snapshot.bank_stat & BANK_STAT_DONE_BANK) != 0U) ? 1 : 0) == (running.bank & 1);
-    if (status_stable && status_before == STATUS_DONE && (snapshot.bank_stat & bank_mask) == BANK_STAT_DONE &&
-        active_bank_running && done_bank_running && snapshot.active_job == running.job_id &&
-        snapshot.done_job == running.job_id && descriptor_running) {
-        return FPGA_P1_PRELOAD_STATE_TERMINAL;
-    }
-
-    return FPGA_P1_PRELOAD_STATE_MISMATCH;
-}
-
-// A BUSY -> DONE pair with the running descriptor still owned by the running
-// job is the only mismatch eligible for re-sampling.  The active-bank,
-// descriptor, and slot checks remain mandatory; bank status may contain the
-// old or new BUSY/DONE value while the VPU completes.  Error bits and every
-// other ownership mismatch fail closed without another read sequence.
-static bool fpga_p1_preload_snapshot_may_be_transitioning(
-    const fpga_p1_preload_register_snapshot_t & snapshot, const fpga_tile_job_t & running) {
-    const uint32_t bank_state = snapshot.bank_stat & (BANK_STAT_BUSY | BANK_STAT_DONE | BANK_STAT_ERROR);
-    const bool active_bank_running =
-        (((snapshot.bank_stat & BANK_STAT_ACTIVE_BANK) != 0U) ? 1 : 0) == (running.bank & 1);
-    const uint32_t expected_slot = fpga_slot_state_word(running.bank, FPGA_SLOT_COMPUTING, FPGA_SLOT_FREE);
-    const bool bank_status_transition = bank_state == BANK_STAT_BUSY || bank_state == BANK_STAT_DONE ||
-                                         bank_state == (BANK_STAT_BUSY | BANK_STAT_DONE);
-
-    return (snapshot.status_before & (STATUS_DONE | STATUS_BUSY | STATUS_ERROR)) == STATUS_BUSY &&
-           (snapshot.status_after & (STATUS_DONE | STATUS_BUSY | STATUS_ERROR)) == STATUS_DONE &&
-           bank_status_transition && active_bank_running && snapshot.active_job == running.job_id &&
-           snapshot.descriptor_job == running.job_id && snapshot.slot_state == expected_slot;
-}
-
-// P1 overlap is deliberately narrow.  The running job retains its descriptor,
-// VPU configuration, read-bank selection, SPU_PARAM/SPU_OUT, and CTRL state.
-// Only ZDMA ACT/WEIGHT writes to the other bank are admitted here.
-static bool fpga_preload_q8_tile_inputs(fpga_tile_job_t &       job,
-                                        const fpga_tile_job_t & running,
-                                        fpga_stage_totals_t *   totals) {
-    if (g_p1_sched_summary_enabled) {
-        g_p1_sched_summary.preload_attempts++;
-    }
-    const auto poison = [&job, &running](const char * reason) {
-        job.input_preload_poisoned = true;
-        LOGE("P1_INPUT_PRELOAD_FAIL job=%u running_job=%u bank=%d running_bank=%d reason=%s action=abort_no_deferred_launch",
-             job.job_id, running.job_id, job.bank & 1, running.bank & 1, reason ? reason : "?");
-        fpga_p1_preload_breadcrumb(true,
-                                   "event=fail job=%u running_job=%u bank=%d running_bank=%d reason=%s action=abort",
-                                   job.job_id, running.job_id, job.bank & 1, running.bank & 1, reason ? reason : "?");
-        return false;
-    };
-
-    if (!g_p2_input_preload_enabled || !g_pingpong_scheduler_enabled || !g_spu_q8_scale_stream_supported) {
-        return poison("preload_not_admitted");
-    }
-    if (job.input_preloaded || job.input_preload_poisoned || job.job_id == 0U || running.job_id == 0U ||
-        job.job_id == running.job_id || (job.bank & 1) == (running.bank & 1) || running.ip_start_us <= 0) {
-        return poison("invalid_running_or_target_ownership");
-    }
-    // The scheduler's software pointer is not enough proof of live ownership.
-    // A fully terminal N can legitimately be observed here after prepare(N+1)
-    // but before this P1 gate.  It is too late to overlap safely, yet N still
-    // owns the exact descriptor: skip only that terminal signature and let the
-    // existing drain/retire path submit N+1 serially.  No other mixed, stale,
-    // or error state is safe to reinterpret as a successful preload.
-    fpga_p1_preload_register_snapshot_t snapshot = fpga_p1_preload_register_snapshot();
-    fpga_p1_preload_state_t preload_state = fpga_classify_p1_preload_state(snapshot, running);
-    if (preload_state == FPGA_P1_PRELOAD_STATE_MISMATCH &&
-        fpga_p1_preload_snapshot_may_be_transitioning(snapshot, running)) {
-        for (uint32_t retry = 0; retry < FPGA_P1_PRELOAD_RESNAPSHOT_LIMIT; ++retry) {
-            snapshot = fpga_p1_preload_register_snapshot();
-            preload_state = fpga_classify_p1_preload_state(snapshot, running);
-            if (preload_state != FPGA_P1_PRELOAD_STATE_MISMATCH ||
-                !fpga_p1_preload_snapshot_may_be_transitioning(snapshot, running)) {
-                break;
-            }
-        }
-    }
-    if (preload_state == FPGA_P1_PRELOAD_STATE_TERMINAL) {
-        if (g_p1_sched_summary_enabled) {
-            // This is the one non-fatal no-overlap outcome: N has already
-            // reached the exact terminal signature, so N+1 must submit
-            // serially after the established drain/retire boundary.
-            g_p1_sched_summary.preload_terminal_skip++;
-        }
-        fpga_p1_preload_breadcrumb(
-            false,
-            "event=P1_INPUT_PRELOAD_SKIP reason=running_job_terminal_before_preload job=%u running_job=%u "
-            "bank=%d running_bank=%d status_before=0x%08x status_after=0x%08x bank_stat=0x%08x active_bank=%d "
-            "done_bank=%d active_job=0x%08x done_job=0x%08x descriptor_job=0x%08x slot_state=0x%08x "
-            "action=drain_then_serial_submit",
-            job.job_id, running.job_id, job.bank & 1, running.bank & 1, snapshot.status_before, snapshot.status_after,
-            snapshot.bank_stat, (snapshot.bank_stat & BANK_STAT_ACTIVE_BANK) != 0U ? 1 : 0,
-            (snapshot.bank_stat & BANK_STAT_DONE_BANK) != 0U ? 1 : 0, snapshot.active_job, snapshot.done_job,
-            snapshot.descriptor_job, snapshot.slot_state);
-        return true;
-    }
-    if (preload_state != FPGA_P1_PRELOAD_STATE_ACTIVE) {
-        job.input_preload_poisoned = true;
-        LOGE(
-            "P1_INPUT_PRELOAD_FAIL job=%u running_job=%u bank=%d running_bank=%d reason=register_snapshot_mismatch "
-            "expected_slot_state=0x%08x status_before=0x%08x status_after=0x%08x bank_stat=0x%08x active_job=0x%08x "
-            "done_job=0x%08x descriptor_job=0x%08x slot_state=0x%08x action=abort_no_deferred_launch",
-            job.job_id, running.job_id, job.bank & 1, running.bank & 1,
-            fpga_slot_state_word(running.bank, FPGA_SLOT_COMPUTING, FPGA_SLOT_FREE), snapshot.status_before,
-            snapshot.status_after, snapshot.bank_stat, snapshot.active_job, snapshot.done_job, snapshot.descriptor_job,
-            snapshot.slot_state);
-        fpga_p1_preload_breadcrumb(
-            true,
-            "event=fail job=%u running_job=%u bank=%d running_bank=%d reason=register_snapshot_mismatch "
-            "status_before=0x%08x status_after=0x%08x bank_stat=0x%08x active_job=0x%08x done_job=0x%08x "
-            "descriptor_job=0x%08x slot_state=0x%08x action=abort",
-            job.job_id, running.job_id, job.bank & 1, running.bank & 1, snapshot.status_before, snapshot.status_after,
-            snapshot.bank_stat, snapshot.active_job, snapshot.done_job, snapshot.descriptor_job, snapshot.slot_state);
-        return false;
-    }
-    // fpga_dma_copy() repeats this gate per descriptor, but establish it at
-    // the P1 boundary as well: no preload may begin while another ZDMA
-    // descriptor owns the channel.
-    if (!zdma_wait_channel_disabled("P1_INPUT_PRELOAD", "before_act")) {
-        return poison("zdma_not_idle");
-    }
-    if (!fpga_p2_residency_job_still_valid(job)) {
-        return poison("p2_residency_post_selection_mismatch");
-    }
-
-    const long long preload0 = now_us();
-    const long long event0   = p2_event_now_us();
-    job.event_preload_begin_us = event0;
-    fpga_p1_preload_breadcrumb(false,
-                               "event=admit job=%u running_job=%u target_bank=%d active_bank=%d bank_stat=0x%08x "
-                               "active_job=%u",
-                               job.job_id, running.job_id, job.bank & 1, running.bank & 1, snapshot.bank_stat,
-                               snapshot.active_job);
-    // Preserve the running bank as read-bank.  Changing it while N executes
-    // could redirect its live operand path; only the inactive write-bank bit
-    // is changed for N+1's ACT/WEIGHT ZDMA transfers.
-    vpu_select_banks(job.bank, running.bank);
-    mmio_fence();
-    const uint32_t expected_bank = (uint32_t) (job.bank & 1) | ((uint32_t) (running.bank & 1) << 1);
-    const uint32_t actual_bank   = vpu_rd32(REG_BANK);
-    if ((actual_bank & 0x3U) != expected_bank) {
-        return poison("inactive_bank_select_readback_mismatch");
-    }
-
-    if (!fpga_dma_write_to_ip(ACT_BASE, job.act_bytes, "P1_ACT")) {
-        return poison("act_dma_failed");
-    }
-    // Keep the running bank selected for reads during the second input DMA.
-    vpu_select_banks(job.bank, running.bank);
-    mmio_fence();
-    if ((vpu_rd32(REG_BANK) & 0x3U) != expected_bank) {
-        return poison("inactive_bank_reselect_readback_mismatch");
-    }
-    if (!job.weight_bank_reused &&
-        !fpga_dma_copy(DDR_BASE_PHYS + (uint64_t) job.weight_src_off, LMM_BASE_PHYS + (uint64_t) WEIGHT_BASE,
-                       job.weight_bytes, "P1_WEIGHT")) {
-        return poison("weight_dma_failed");
-    }
-    if (g_p1_sched_summary_enabled) {
-        // ACT is transferred and WEIGHT is transferred or already retained
-        // in the inactive bank after admission against an active running job.
-        g_p1_sched_summary.preload_admitted_while_active++;
-    }
-    if (job.p2_residency_hit) {
-        fpga_p2_residency_log(false, "P1_PRELOAD_CACHE_SOURCE",
-                              "job=%u bank=%d epoch=%llu seal=0x%08x weight_src_off=0x%08x bytes=%zu",
-                              job.job_id, job.bank & 1, (unsigned long long) job.p2_residency_epoch,
-                              job.p2_residency_seal, job.weight_src_off, job.weight_bytes);
-    }
-
-    job.input_preloaded         = true;
-    job.preload_key_job_id      = job.job_id;
-    job.preload_key_tensor      = job.src0;
-    job.preload_key_tensor_id   = job.tensor_id;
-    job.preload_key_row0        = job.row0;
-    job.preload_key_rows        = job.rows;
-    job.preload_key_col         = job.col;
-    job.preload_key_k_block0    = job.k_block0;
-    job.preload_key_group_blocks = job.group_blocks;
-    job.preload_key_act_bytes   = job.act_bytes;
-    job.preload_key_weight_bytes = job.weight_bytes;
-    job.preload_key_scale_bytes = job.scale_bytes;
-    job.preload_key_weight_src_off = job.weight_src_off;
-    job.preload_key_weight_layout_version = P2_WEIGHT_RESIDENCY_LAYOUT_V2;
-    job.preload_key_p2_residency_slot = job.p2_residency_slot;
-    job.preload_key_p2_residency_epoch = job.p2_residency_epoch;
-    job.preload_key_p2_residency_seal = job.p2_residency_seal;
-    job.preload_key_bank        = job.bank & 1;
-    job.input_preload_us        = now_us() - preload0;
-    job.input_preload_done_us   = now_us();
-    const long long event_done  = p2_event_now_us();
-    job.event_preload_done_us = event_done;
-    if (totals) {
-        totals->input_preload_us += job.input_preload_us;
-        totals->input_preload_jobs++;
-    }
-    p2_event_trace(job, "P1_INPUT_PRELOAD_DONE", event_done, "preload_us", event_done - event0);
-    fpga_p1_preload_breadcrumb(false,
-                               "event=success job=%u running_job=%u bank=%d act_bytes=%zu weight_bytes=%zu preload_us=%lld",
-                               job.job_id, running.job_id, job.bank & 1, job.act_bytes,
-                               job.weight_bank_reused ? 0 : job.weight_bytes,
-                               job.input_preload_us);
-    return true;
 }
 
 static bool fpga_measure_q8_compute_completion(fpga_tile_job_t & job) {
@@ -6864,24 +6538,10 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
                                     int                   attempt,
                                     const fpga_dma_poll_hook_t * poll_hook = nullptr) {
     job.event_submit_begin_us = p2_event_now_us();
-    if (job.input_preload_poisoned || (job.input_preloaded && !fpga_q8_input_preload_key_matches(job))) {
-        LOGE("P1_INPUT_PRELOAD_KEY_FAIL job=%u bank=%d preloaded=%d poisoned=%d action=abort_no_deferred_launch",
-             job.job_id, job.bank & 1, job.input_preloaded ? 1 : 0, job.input_preload_poisoned ? 1 : 0);
-        return false;
-    }
     if (!fpga_p2_residency_job_still_valid(job)) {
         LOGE("P2_RESIDENCY_POST_SELECTION_FAIL job=%u tile=%u action=no_start_no_cpu_fallback", job.job_id,
              job.tile_id);
         return false;
-    }
-    if (job.input_preloaded) {
-        const long long reuse_event = p2_event_now_us();
-        const long long preload_hold_us =
-            job.input_preload_done_us > 0 ? std::max(0LL, now_us() - job.input_preload_done_us) : 0LL;
-        // Do not emit ACT_DMA_DONE/WEIGHT_DMA_DONE for a deferred launch: no
-        // input DMA occurs here.  This explicit event preserves event-log
-        // semantics for owner-side preload-versus-serial comparisons.
-        p2_event_trace(job, "P1_INPUT_REUSE", reuse_event, "preload_hold_us", preload_hold_us);
     }
     if (g_p2_init_requested) {
         p2_trace_set_job_context(job);
@@ -6913,11 +6573,9 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
     const long long dma_act0       = now_us();
     const long long event_dma_act0 = p2_event_now_us();
     job.event_input_transfer_begin_us = event_dma_act0;
-    if (!job.input_preloaded) {
-        p2_trace_first_tile(job, "ACT_DMA", "before");
-    }
+    p2_trace_first_tile(job, "ACT_DMA", "before");
     const bool first_p2_act_detail =
-        g_p2_first_act_dma_trace_enabled && !job.input_preloaded && g_p2_init_requested && job.tile_id == 0U &&
+        g_p2_first_act_dma_trace_enabled && g_p2_init_requested && job.tile_id == 0U &&
         !g_p2_first_act_dma_trace_done;
     if (first_p2_act_detail) {
         fpga_p2_dma_breadcrumb("step=bank_select edge=before expected_bank=%d reg_bank=0x%08x bank_stat=0x%08x",
@@ -6948,10 +6606,9 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
         g_p2_first_act_dma_trace_active = true;
     }
     const bool act_dma_ok =
-        job.input_preloaded ||
-        (poll_hook ? fpga_dma_copy(DDR_BASE_PHYS + (uint64_t) ACT_BASE, LMM_BASE_PHYS + (uint64_t) ACT_BASE,
-                                   job.act_bytes, "ACT", poll_hook) :
-                       fpga_dma_write_to_ip(ACT_BASE, job.act_bytes, "ACT"));
+        poll_hook ? fpga_dma_copy(DDR_BASE_PHYS + (uint64_t) ACT_BASE, LMM_BASE_PHYS + (uint64_t) ACT_BASE,
+                                  job.act_bytes, "ACT", poll_hook) :
+                    fpga_dma_write_to_ip(ACT_BASE, job.act_bytes, "ACT");
     if (first_p2_act_detail) {
         g_p2_first_act_dma_trace_active = false;
         g_p2_first_act_dma_trace_done   = true;
@@ -6960,19 +6617,17 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
         return false;
     }
     const long long event_dma_act_done = p2_event_now_us();
-    if (!job.input_preloaded) {
-        p2_trace_first_tile(job, "ACT_DMA", "after");
-        p2_event_trace(job, "ACT_DMA_DONE", event_dma_act_done, "act_dma_us", event_dma_act_done - event_dma_act0);
-    }
+    p2_trace_first_tile(job, "ACT_DMA", "after");
+    p2_event_trace(job, "ACT_DMA_DONE", event_dma_act_done, "act_dma_us", event_dma_act_done - event_dma_act0);
     const long long dma_act1 = now_us();
 
     const long long dma_weight0       = now_us();
     const long long event_dma_weight0 = p2_event_now_us();
-    if (!job.input_preloaded && !job.weight_bank_reused) {
+    if (!job.weight_bank_reused) {
         p2_trace_first_tile(job, "WEIGHT_DMA", "before");
     }
     vpu_select_banks(job.bank, job.bank);
-    if (!job.input_preloaded && !job.weight_bank_reused &&
+    if (!job.weight_bank_reused &&
         !fpga_dma_copy(DDR_BASE_PHYS + (uint64_t) job.weight_src_off, LMM_BASE_PHYS + (uint64_t) WEIGHT_BASE,
                        job.weight_bytes, "WEIGHT", poll_hook)) {
         if (poll_hook && poll_hook->context) {
@@ -6982,7 +6637,7 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
         return false;
     }
     const long long event_dma_weight_done = p2_event_now_us();
-    if (!job.input_preloaded && !job.weight_bank_reused) {
+    if (!job.weight_bank_reused) {
         p2_trace_first_tile(job, "WEIGHT_DMA", "after");
         p2_event_trace(job, "WEIGHT_DMA_DONE", event_dma_weight_done, "weight_dma_us",
                        event_dma_weight_done - event_dma_weight0);
@@ -7009,8 +6664,8 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
                    event_dma_scale_done - job.event_input_transfer_begin_us);
     const long long dma_scale1 = now_us();
 
-    job.dma_act_us              = job.input_preloaded ? 0 : dma_act1 - dma_act0;
-    job.dma_weight_us           = (job.input_preloaded || job.weight_bank_reused) ? 0 : dma_weight1 - dma_weight0;
+    job.dma_act_us              = dma_act1 - dma_act0;
+    job.dma_weight_us           = job.weight_bank_reused ? 0 : dma_weight1 - dma_weight0;
     job.dma_scale_us            = dma_scale1 - dma_scale0;
     job.spu_stream_count_before = vpu_rd32(REG_SPU_STREAM_COUNT);
     job.spu_stream_done_before  = vpu_rd32(REG_SPU_STREAM_DONE);
@@ -7018,7 +6673,7 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
     job.spu_stream_drop_before  = vpu_rd32(REG_SPU_STREAM_DROP);
     job.spu_stream_error_before = vpu_rd32(REG_SPU_STREAM_ERROR);
     const int bank_index = job.bank & 1;
-    const long long h2ip_us = job.input_preload_us + job.dma_act_us + job.dma_weight_us + job.dma_scale_us;
+    const long long h2ip_us = job.dma_act_us + job.dma_weight_us + job.dma_scale_us;
     if (totals) {
         totals->dma_act_us += job.dma_act_us;
         totals->dma_weight_us += job.dma_weight_us;
@@ -7036,12 +6691,12 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
         fpga_log_line(
             true, "PINGPONG_TIMING", false,
             "phase=host_to_ip graph_seq=%d layer=%d tensor=%s tile=%u job=%u bank=%d bank_role=%s "
-            "preloaded=%d h2ip_ms=%.3f act_dma_ms=%.3f weight_dma_ms=%.3f scale_dma_ms=%.3f preload_ms=%.3f "
+            "h2ip_ms=%.3f act_dma_ms=%.3f weight_dma_ms=%.3f scale_dma_ms=%.3f "
             "act_bytes=%zu weight_bytes=%zu scale_bytes=%zu",
             job.graph_seq, layer_id, tensor_name ? tensor_name : "?", job.tile_id, job.job_id, bank_index,
-            p2_bank_label(bank_index), job.input_preloaded ? 1 : 0, (double) h2ip_us / 1000.0,
+            p2_bank_label(bank_index), (double) h2ip_us / 1000.0,
             (double) job.dma_act_us / 1000.0, (double) job.dma_weight_us / 1000.0,
-            (double) job.dma_scale_us / 1000.0, (double) job.input_preload_us / 1000.0, job.act_bytes,
+            (double) job.dma_scale_us / 1000.0, job.act_bytes,
             job.weight_bank_reused ? 0 : job.weight_bytes, job.scale_bytes);
     }
 
@@ -7067,13 +6722,6 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
     if (totals && job.event_launch_us > 0 &&
         (totals->first_ip_launch_mono_us == 0 || job.event_launch_us < totals->first_ip_launch_mono_us)) {
         totals->first_ip_launch_mono_us = job.event_launch_us;
-    }
-    if (job.input_preloaded && job.preload_ready_to_launch_us > 0) {
-        const long long launch_bubble_us = now_us() - job.preload_ready_to_launch_us;
-        if (totals) {
-            totals->preload_launch_bubble_us += launch_bubble_us;
-        }
-        p2_event_trace(job, "P1_DEFERRED_START", job.event_launch_us, "free_to_start_us", launch_bubble_us);
     }
     p2_trace_first_tile(job, "VPU_LAUNCH", "after");
     p2_event_trace(job, "START", job.event_launch_us, "none_us", 0);
@@ -7806,7 +7454,7 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
             // diagnostics use the separate single-bank path, not this loop.
             fpga_prompt_weight_staging_t staging;
             const auto admit_next_tile = [&](const fpga_tile_job_t & current) {
-                if (!pipeline_route || lookahead.valid || current.input_preloaded || current.weight_bank_reused ||
+                if (!pipeline_route || lookahead.valid || current.weight_bank_reused ||
                     current.weight_cache_hit || current.p2_residency_hit ||
                     current.weight_bytes < FPGA_P2_PACK_PARALLEL_MIN_BYTES ||
                     current.weight_bytes > P2_PIPELINE_WEIGHT_SLOT_BYTES ||
@@ -7919,13 +7567,6 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                         // it overlaps or must submit serially after drain.
                         g_p1_sched_summary.pingpong_pairs++;
                     }
-                    // P1 may overlap only the inactive-bank ACT/WEIGHT DMA.
-                    // It must not touch descriptor/config/CTRL/SPU windows or
-                    // the running job's read bank; all of those remain
-                    // deferred until N is fully retired below.
-                    if (g_p2_input_preload_enabled && !fpga_preload_q8_tile_inputs(prepared, *running, totals)) {
-                        return false;
-                    }
                     if (!fpga_wait_and_drain_q8_tile_job(*running, totals, tensor_name, layer_id, k, n, m, 0)) {
                         return false;
                     }
@@ -7952,24 +7593,8 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                             totals->scheduler_prepare_headroom_us += running->event_spu_finality_us - prepared.event_prep_done_us;
                         }
                     }
-                    if (totals && prepared.event_preload_begin_us > 0 && prepared.event_preload_done_us > 0 &&
-                        running->event_launch_us > 0 && running->event_spu_finality_us > 0) {
-                        const long long overlap_begin = std::max(prepared.event_preload_begin_us, running->event_launch_us);
-                        const long long overlap_end = std::min(prepared.event_preload_done_us, running->event_spu_finality_us);
-                        if (overlap_end > overlap_begin) {
-                            totals->scheduler_preload_overlap_us += overlap_end - overlap_begin;
-                            totals->scheduler_preload_overlap_jobs++;
-                        }
-                    }
                     prepared.handoff_prev_output_ready_us = running->event_spu_finality_us;
                     prepared.handoff_prev_retire_us = running->event_retire_us;
-                    // Hardware ownership was released above. With overlap,
-                    // A's DDR copy remains pending until after B is launched.
-                    if (prepared.input_preloaded) {
-                        prepared.preload_ready_to_launch_us = now_us();
-                    } else if (g_p1_sched_summary_enabled) {
-                        g_p1_sched_summary.serial_submit_after_no_preload++;
-                    }
                     if (pipeline_prepared && !fpga_p2_dma_pipeline_prepare_activation(prepared, totals)) {
                         return false;
                     }
@@ -8035,7 +7660,7 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                 }
 
                 // Submit has completed all required DMA and launched this job.
-                // A failed preload/drain/submit returns before publishing validity.
+                // A failed drain/submit returns before publishing validity.
                 weight_bank_loaded[bank] = true;
                 if (prepared.weight_bank_reused) {
                     ++reused_jobs;
@@ -8463,22 +8088,25 @@ int fpga_init(void) {
     g_p2_terminal_trace_enabled         = env_flag_enabled("FPGA_P2_TERMINAL_TRACE");
     g_p2_boundary_diagnostics_enabled   = false;
     g_p2_event_trace_enabled             = env_flag_enabled("FPGA_P2_EVENT_TRACE");
-    // P1 input preload is a production default for the normal admitted P2
-    // ping-pong route.  Preserve FPGA_P2_INPUT_PRELOAD=1 as an explicit
-    // compatibility setting, and use FPGA_P2_INPUT_PRELOAD=0 as the opt-out.
-    const bool p2_input_preload_enable_env  = env_flag_enabled("FPGA_P2_INPUT_PRELOAD");
-    const bool p2_input_preload_disable_env = env_flag_disabled("FPGA_P2_INPUT_PRELOAD");
-    g_p2_input_preload_enabled = !p2_input_preload_disable_env;
+    const char * const p2_pack_dma_pipeline_env = getenv("FPGA_P2_PACK_DMA_PIPELINE");
     const bool p2_pack_dma_pipeline_enable_env = env_flag_enabled("FPGA_P2_PACK_DMA_PIPELINE");
     const bool p2_pack_dma_pipeline_disable_env = env_flag_disabled("FPGA_P2_PACK_DMA_PIPELINE");
     if (p2_pack_dma_pipeline_enable_env && p2_pack_dma_pipeline_disable_env) {
         fpga_fatal(
             "FPGA_P2_PACK_DMA_PIPELINE=1 conflicts with FPGA_P2_PACK_DMA_PIPELINE=0; select exactly one pipeline policy");
     }
+    if (p2_pack_dma_pipeline_env && p2_pack_dma_pipeline_env[0] != '\0' &&
+        !p2_pack_dma_pipeline_enable_env && !p2_pack_dma_pipeline_disable_env) {
+        fpga_fatal(
+            "FPGA_P2_PACK_DMA_PIPELINE=%s is invalid; use 1 to request the pipeline or 0 to disable its default policy",
+            p2_pack_dma_pipeline_env);
+    }
+    // Keep the explicit request until the hardware capability gate below is
+    // known.  An unset variable becomes the production default only when the
+    // admitted P2 route can safely provide the two source slots.
     g_p2_pack_dma_pipeline_requested = p2_pack_dma_pipeline_enable_env;
     g_p2_pack_dma_pipeline_enabled = false;
     g_p2_result_overlap_enabled = !env_flag_disabled("FPGA_P2_RESULT_OVERLAP");
-    g_p1_preload_trace_enabled           = env_flag_enabled("FPGA_P1_PRELOAD_TRACE");
     g_p1_sched_summary_enabled           = env_flag_enabled("FPGA_P1_SCHED_SUMMARY");
     g_pingpong_timing_enabled            = env_flag_enabled("FPGA_PINGPONG_TIMING");
     g_bottleneck_summary_enabled         = !env_flag_disabled("FPGA_BOTTLENECK_SUMMARY");
@@ -8502,7 +8130,7 @@ int fpga_init(void) {
     if (g_bottleneck_summary_enabled) {
         LOGINIT(
             "BREAKDOWN_CONFIG enabled=1 mode=aggregate_per_sequence per_tile_logs=0 "
-            "metrics=prep_decomposition+scheduler_handoff+actual_preload_overlap+tensor_category+zdma_descriptors");
+            "metrics=prep_decomposition+scheduler_handoff+tensor_category+zdma_descriptors");
     }
     const char * const p2_pack_workers_env = getenv("FPGA_P2_PACK_WORKERS");
     int p2_pack_workers_requested = 2;
@@ -8518,7 +8146,6 @@ int fpga_init(void) {
                 p2_pack_workers_env);
         }
     }
-    g_p1_preload_breadcrumbs              = 0U;
     g_p2_trace_job_id                   = 0U;
     g_p2_trace_tile_id                  = 0U;
     g_p2_trace_bank                     = -1;
@@ -8687,17 +8314,6 @@ int fpga_init(void) {
     g_detail_every                  = env_int_value("FPGA_DETAIL_EVERY", FPGA_DEFAULT_DETAIL_EVERY, 0, 1000000);
     g_contract_check_limit          = env_int_value("FPGA_CONTRACT_CHECK", 0, 0, 1000000);
     g_pl_scale_contract_check_limit = env_int_value("FPGA_PL_SCALE_CONTRACT_CHECK", 0, 0, 1000000);
-    // Qualification must remain serialized unless the operator explicitly
-    // requests preload.  This keeps the primary command default-on while
-    // preserving the existing bounded contract behavior.
-    if ((g_contract_check_limit > 0 || g_pl_scale_contract_check_limit > 0) &&
-        !p2_input_preload_enable_env) {
-        g_p2_input_preload_enabled = false;
-        LOGINIT(
-            "P1 input preload default suppressed for qualification raw_contract=%d p2_contract=%d; "
-            "set FPGA_P2_INPUT_PRELOAD=1 only for an intentional preload qualification",
-            g_contract_check_limit, g_pl_scale_contract_check_limit);
-    }
     if (g_pl_scale_contract_check_limit > 1) {
         fpga_fatal(
             "FPGA_PL_SCALE_CONTRACT_CHECK=%d is unsupported by v58 tile qualification; set it to 1 and select the "
@@ -9000,30 +8616,30 @@ int fpga_init(void) {
     // FPGA_PIPELINE_DISABLE=1 is the explicit serialized-P2 opt-out.
     g_pingpong_scheduler_enabled = g_p2_init_requested && g_vpu_pingpong_supported && g_vpu_descriptor_supported &&
                                    raw_fpga_compatible && p2_admission_compatible && !pipeline_disable_env;
-    if (g_p2_input_preload_enabled &&
-        (!g_pingpong_scheduler_enabled || !g_spu_q8_scale_stream_supported || g_contract_check_limit > 0 ||
-         g_pl_scale_contract_check_limit > 0)) {
+    const bool p2_pack_dma_pipeline_compatible =
+        g_contract_check_limit == 0 && g_pl_scale_contract_check_limit == 0 && g_pingpong_scheduler_enabled &&
+        g_spu_q8_scale_stream_supported && g_p2_pack_workers_requested == 2;
+    if (p2_pack_dma_pipeline_enable_env && !p2_pack_dma_pipeline_compatible) {
         fpga_fatal(
-            "FPGA_P2_INPUT_PRELOAD=1 requires admitted P2 ping-pong production (not qualification): scheduler=%d "
-            "stream_supported=%d raw_contract_limit=%d p2_contract_limit=%d",
-            g_pingpong_scheduler_enabled ? 1 : 0, g_spu_q8_scale_stream_supported ? 1 : 0,
-            g_contract_check_limit, g_pl_scale_contract_check_limit);
+            "FPGA_P2_PACK_DMA_PIPELINE=1 requires admitted P2 ping-pong, no contract qualification, and "
+            "FPGA_P2_PACK_WORKERS=2; refusing an ambiguous shared-staging policy");
     }
+    // The pipeline is now the default only for the same production route that
+    // already proved its P2 scheduler, scale stream, and two-worker contract.
+    // Explicit zero is the only normal way to retain the serialized pack path.
+    g_p2_pack_dma_pipeline_requested = !p2_pack_dma_pipeline_disable_env && p2_pack_dma_pipeline_compatible;
     if (g_p2_pack_dma_pipeline_requested) {
-        if (p2_pack_dma_pipeline_disable_env || g_p2_input_preload_enabled || g_contract_check_limit > 0 ||
-            g_pl_scale_contract_check_limit > 0 || !g_pingpong_scheduler_enabled ||
-            !g_spu_q8_scale_stream_supported || g_p2_pack_workers_requested != 2) {
-            fpga_fatal(
-                "FPGA_P2_PACK_DMA_PIPELINE=1 requires FPGA_P2_INPUT_PRELOAD=0, admitted P2 ping-pong, no contract "
-                "qualification, and FPGA_P2_PACK_WORKERS=2; refusing an ambiguous shared-staging policy");
-        }
         LOGINIT(
-            "P2_PACK_DMA_PIPELINE requested=1 admission=waiting_for_persistent_helper mode=decode_direct_large_tiles "
-            "slots=2 weight_slot_bytes=%u scale_slot_bytes=%u callback_batch_pairs=%zu preload=0 residency_builds=deferred",
+            "P2_PACK_DMA_PIPELINE requested=1 source=%s admission=waiting_for_persistent_helper "
+            "mode=decode_direct_large_tiles "
+            "slots=2 weight_slot_bytes=%u scale_slot_bytes=%u callback_batch_pairs=%zu residency_builds=deferred",
+            p2_pack_dma_pipeline_enable_env ? "explicit" : "default",
             P2_PIPELINE_WEIGHT_SLOT_BYTES, P2_PIPELINE_SCALE_SLOT_BYTES, P2_PIPELINE_PACK_BATCH_PAIRS);
     } else {
         g_p2_pack_dma_pipeline_enabled = false;
-        LOGINIT("P2_PACK_DMA_PIPELINE enabled=0 default=off");
+        LOGINIT(
+            "P2_PACK_DMA_PIPELINE enabled=0 reason=%s",
+            p2_pack_dma_pipeline_disable_env ? "explicit_opt_out" : "incompatible_admission");
     }
     if (pl_scale_requested && !g_spu_q8_scale_stream_supported) {
         fpga_fatal(
@@ -9088,13 +8704,12 @@ int fpga_init(void) {
                                                    (g_contract_check_limit > 0 ? "contract_diagnostic" : "raw_fpga")));
     LOGINIT(
         "P2_CONFIG enabled=%d contract_limit=%d pipeline_default_on=%d pipeline_disable=%d scheduler=%d "
-        "input_preload=%d input_preload_policy=default_on_opt_out input_preload_disable_env=%d route=%s identity "
+        "route=%s identity "
         "protocol=0x%08x bitstream_id=0x%08x p2_abi=0x%08x stream_status=0x%08x spu_words=%u descriptor_cap=%d "
         "pingpong_cap=%d vpu_two_row_transport_cap=%d spu_q8_scale_pair_stream_cap=%d two_row_transport_ok=%d "
         "windows spu_param=0x%08x spu_out=0x%08x pack_dma_pipeline_requested=%d pack_dma_pipeline_enabled=%d",
         g_spu_q8_scale_stream_supported ? 1 : 0, g_pl_scale_contract_check_limit,
         pipeline_disable_env ? 0 : 1, pipeline_disable_env ? 1 : 0, g_pingpong_scheduler_enabled ? 1 : 0,
-        g_p2_input_preload_enabled ? 1 : 0, p2_input_preload_disable_env ? 1 : 0,
         g_pl_scale_contract_check_limit > 0 ? "p2_contract_cpu_shadow" :
                                               (g_pingpong_scheduler_enabled ? "pingpong_production" :
                                                                                (g_spu_q8_scale_stream_supported ? "serialized_p2" : "disabled")),
@@ -9120,8 +8735,8 @@ int fpga_init(void) {
 
     LOGINIT(
         "ready version=%s path=%s rows=%d host_row_limit=%d col_beats=%d cols=%d packed_q8=%d max_group_blocks=%d "
-        "result_words=%d zdma_max_transfer_bytes=%zu pingpong_cap=%d descriptor_cap=%d scheduler=%d input_preload=%d "
-        "scheduler_policy=default_on_opt_out input_preload_policy=default_on_opt_out pl_scale=%d "
+        "result_words=%d zdma_max_transfer_bytes=%zu pingpong_cap=%d descriptor_cap=%d scheduler=%d "
+        "scheduler_policy=default_on_opt_out pl_scale=%d "
         "pl_scale_policy=default_on_opt_out stream_protocol=0x%08x bitstream_id=0x%08x "
         "spu_silu=%d spu_rms=%d spu_rope=%d spu_softmax=%d weight_cache=%d activation_cache=%d "
         "input_integrity_check=%d vocab_cpu_bypass=%d legacy_raw_cpu_bypass=%d vocab_min_n=%lld contract_check=%d "
@@ -9132,7 +8747,7 @@ int fpga_init(void) {
         FPGA_HOST_TRACE_VERSION, path ? path : "dma(default)", g_vpu_max_rows, g_runtime_max_rows, g_vpu_max_beats,
         g_vpu_max_cols, g_packed_q8_supported, g_packed_q8_max_blocks, g_packed_q8_result_words,
         g_zdma_max_transfer_bytes, g_vpu_pingpong_supported ? 1 : 0, g_vpu_descriptor_supported ? 1 : 0,
-        g_pingpong_scheduler_enabled ? 1 : 0, g_p2_input_preload_enabled ? 1 : 0,
+        g_pingpong_scheduler_enabled ? 1 : 0,
         g_spu_q8_scale_stream_supported ? 1 : 0, g_stream_protocol_version,
         g_bitstream_id, g_spu_silu_supported ? 1 : 0, g_spu_rmsnorm_supported ? 1 : 0, g_spu_rope_supported ? 1 : 0,
         g_spu_softmax_supported ? 1 : 0, g_weight_cache_enabled ? 1 : 0, g_activation_cache_enabled ? 1 : 0,
@@ -9166,12 +8781,12 @@ int fpga_init(void) {
         "MANIFEST host_version=%s host_build=\"%s %s\" stream_protocol=%u bitstream_id=0x%08x "
         "p2_abi=0x%08x ddr_phys=[0x%llx,0x%llx) ddr_map_size=0x%zx "
         "dma_map_source=%s vpu_map_source=%s ddr_map_source=%s zdma_descriptor_bytes=%zu rows=%d workers=%d "
-        "pingpong=%d preload=%d vocab_cpu_bypass=%d",
+        "pingpong=%d vocab_cpu_bypass=%d",
         FPGA_HOST_TRACE_VERSION, __DATE__, __TIME__, g_stream_protocol_version, g_bitstream_id,
         g_p2_stream_abi_signature, (unsigned long long) DDR_BASE_PHYS,
         (unsigned long long) DDR_END_EXCLUSIVE, g_ddr_map_size, g_dma_map_source.c_str(), g_vpu_map_source.c_str(),
         g_ddr_map_source.c_str(), g_zdma_max_transfer_bytes, g_runtime_max_rows, g_p2_pack_workers_requested,
-        g_pingpong_scheduler_enabled ? 1 : 0, g_p2_input_preload_enabled ? 1 : 0,
+        g_pingpong_scheduler_enabled ? 1 : 0,
         g_vocab_projection_cpu_bypass ? 1 : 0);
     LOGINIT("bases my_ip=0x%llx reg=0x%llx lmm=0x%llx dma=0x%llx ddr=0x%llx", (unsigned long long) MY_IP_BASE_ADDRESS,
             (unsigned long long) REG_BASE_PHYS, (unsigned long long) LMM_BASE_PHYS, (unsigned long long) DMA_BASE_PHYS,
@@ -9255,7 +8870,7 @@ int fpga_init(void) {
         g_p2_pack_dma_pipeline_enabled = true;
         LOGINIT(
             "P2_PACK_DMA_PIPELINE enabled=1 mode=decode_direct_large_tiles slots=2 weight_slot_bytes=%u "
-            "scale_slot_bytes=%u callback_batch_pairs=%zu preload=0 residency_builds=deferred helper=ready",
+            "scale_slot_bytes=%u callback_batch_pairs=%zu residency_builds=deferred helper=ready",
             P2_PIPELINE_WEIGHT_SLOT_BYTES, P2_PIPELINE_SCALE_SLOT_BYTES, P2_PIPELINE_PACK_BATCH_PAIRS);
     }
     LOGINIT(
@@ -9891,8 +9506,6 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
     if (g_p1_sched_summary_enabled) {
         g_p1_sched_summary.matmuls++;
         g_p1_sched_summary.vpu_runs += totals.vpu_runs;
-        g_p1_sched_summary.input_preload_us += totals.input_preload_us;
-        g_p1_sched_summary.preload_launch_bubble_us += totals.preload_launch_bubble_us;
         g_p1_sched_summary.ip_compute_us += totals.ip_compute_us;
         g_p1_sched_summary.dma_act_us += totals.dma_act_us;
         g_p1_sched_summary.dma_weight_us += totals.dma_weight_us;
@@ -9912,9 +9525,6 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
     const double cache_lookup_ms = (double) totals.weight_cache_lookup_us / 1000.0;
     const double cache_crc_ms    = (double) totals.weight_cache_crc_us / 1000.0;
     const double weight_pack_ms  = (double) totals.weight_pack_us / 1000.0;
-    const double preload_ms      = (double) totals.input_preload_us / 1000.0;
-    const double preload_bubble_ms = (double) totals.preload_launch_bubble_us / 1000.0;
-
     const char * dominant    = "prep";
     double       dominant_ms = prep_ms;
     if (dma_in_ms > dominant_ms) {
@@ -9952,7 +9562,6 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
             "vpu_runs=%lld prep_ms=%.3f cache_lookup_ms=%.3f cache_crc_ms=%.3f weight_pack_ms=%.3f "
             "activation_scale_fp16_overflows=%lld dma_input_ms=%.3f act_dma_ms=%.3f weight_dma_ms=%.3f "
             "scale_dma_ms=%.3f ip_compute_ms=%.3f dma_output_ms=%.3f host_result_ms=%.3f host_accum_ms=%.3f "
-            "p1_input_preload=%d p1_preload_jobs=%lld p1_preload_ms=%.3f p1_free_to_start_ms=%.3f "
             "total_ms=%.3f dominant=%s pl_scale=%d raw_accum_fused=%d effective_GMAC/s=%.3f effective_GB/s=%.3f "
             "act_bytes=%zu weight_bytes=%zu scale_bytes=%zu result_bytes=%zu weight_cache_hits=%lld "
             "weight_cache_misses=%lld cycles_per_run=%.1f",
@@ -9960,8 +9569,7 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
             row_tiles, (q8_blocks + max_group_blocks - 1) / max_group_blocks, (long long) q8_blocks, totals.vpu_runs,
             prep_ms, cache_lookup_ms, cache_crc_ms, weight_pack_ms, totals.activation_scale_fp16_overflows, dma_in_ms,
             dma_act_ms, dma_weight_ms, dma_scale_ms, ip_ms, dma_out_ms, host_result_ms, host_accum_ms,
-            g_p2_input_preload_enabled ? 1 : 0, totals.input_preload_jobs, preload_ms, preload_bubble_ms, total_ms,
-            dominant, g_spu_q8_scale_stream_supported ? 1 : 0, g_fuse_raw_result_accum ? 1 : 0, gmac_s, gb_s,
+            total_ms, dominant, g_spu_q8_scale_stream_supported ? 1 : 0, g_fuse_raw_result_accum ? 1 : 0, gmac_s, gb_s,
             totals.activation_bytes, totals.weight_bytes, totals.scale_bytes, totals.result_bytes,
             totals.weight_cache_hits, totals.weight_cache_misses, cycles_per_run);
     }
@@ -10078,22 +9686,6 @@ static void fpga_log_line(bool enabled, const char * tag, bool force_flush, cons
     va_start(ap, fmt);
     fpga_log_vline(tag, force_flush, fmt, ap);
     va_end(ap);
-}
-
-static void fpga_p1_preload_breadcrumb(bool force, const char * fmt, ...) {
-    if (!force && (!g_p1_preload_trace_enabled || g_p1_preload_breadcrumbs >= FPGA_P1_PRELOAD_BREADCRUMB_LIMIT)) {
-        return;
-    }
-    ++g_p1_preload_breadcrumbs;
-
-    FILE * fp = fpga_log_fp();
-    fprintf(fp, "[P1_PRELOAD] ");
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(fp, fmt, ap);
-    va_end(ap);
-    fprintf(fp, "\n");
-    fpga_log_finish_line(fp, force);
 }
 
 static void log_uio_inventory_once(void) {
@@ -10840,18 +10432,12 @@ static void fpga_p1_sched_summary_emit(const char * reason) {
     // fence is associated with a scheduler summary.
     fpga_log_line(
         true, "P1_SCHED_SUMMARY", false,
-        "scope=graph_sequence reason=%s graph_seq=%d scheduler=%s preload_config=%d matmuls=%lld vpu_runs=%lld pingpong_pairs=%lld "
-        "preload_attempts=%lld preload_admitted_while_active=%lld preload_terminal_skip=%lld "
-        "serial_submit_after_no_preload=%lld input_preload_us=%lld preload_launch_bubble_us=%lld "
+        "scope=graph_sequence reason=%s graph_seq=%d scheduler=%s matmuls=%lld vpu_runs=%lld pingpong_pairs=%lld "
         "ip_compute_us=%lld dma_act_us=%lld dma_weight_us=%lld matrix_wall_us=%lld "
         "overlap_duration=not_measured",
         reason ? reason : "?", g_p1_sched_summary.graph_seq,
-        g_pingpong_scheduler_enabled ? "pingpong" : "single_bank", g_p2_input_preload_enabled ? 1 : 0,
-        g_p1_sched_summary.matmuls,
+        g_pingpong_scheduler_enabled ? "pingpong" : "single_bank", g_p1_sched_summary.matmuls,
         g_p1_sched_summary.vpu_runs, g_p1_sched_summary.pingpong_pairs,
-        g_p1_sched_summary.preload_attempts, g_p1_sched_summary.preload_admitted_while_active,
-        g_p1_sched_summary.preload_terminal_skip, g_p1_sched_summary.serial_submit_after_no_preload,
-        g_p1_sched_summary.input_preload_us, g_p1_sched_summary.preload_launch_bubble_us,
         g_p1_sched_summary.ip_compute_us, g_p1_sched_summary.dma_act_us, g_p1_sched_summary.dma_weight_us,
         g_p1_sched_summary.matrix_wall_us);
     g_p1_sched_summary = {};
@@ -10913,7 +10499,7 @@ static bool fpga_token_timing_emit(int next_graph_seq,
     const long long token_wall_us =
         end_mono_us >= g_token_timing.start_mono_us ? end_mono_us - g_token_timing.start_mono_us : 0;
     const long long h2ip_dma_us = g_token_timing.act_dma_us + g_token_timing.weight_dma_us +
-                                  g_token_timing.scale_dma_us + g_token_timing.preload_us;
+                                  g_token_timing.scale_dma_us;
     const long long token_read_us = g_token_timing.ip2host_dma_us + g_token_timing.host_read_us;
     const long long device_span_us =
         g_token_timing.first_ip_launch_mono_us > 0 &&
@@ -10958,9 +10544,6 @@ static bool fpga_token_timing_emit(int next_graph_seq,
         g_fpga_perf_decode.pingpong_prepare_overlap_us += g_token_timing.scheduler_prepare_overlap_us;
         g_fpga_perf_decode.pingpong_prepare_late_us += g_token_timing.scheduler_prepare_late_us;
         g_fpga_perf_decode.pingpong_prepare_late_jobs += g_token_timing.scheduler_prepare_late_jobs;
-        g_fpga_perf_decode.preload_dma_us += g_token_timing.preload_us;
-        g_fpga_perf_decode.preload_overlap_us += g_token_timing.scheduler_preload_overlap_us;
-        g_fpga_perf_decode.preload_overlap_jobs += g_token_timing.scheduler_preload_overlap_jobs;
     }
     const bool sampled_detail = g_summary_detail_after_error ||
                                 (decode_token &&
@@ -10974,7 +10557,7 @@ static bool fpga_token_timing_emit(int next_graph_seq,
             true, "TIMING", force_flush,
             "graph_seq=%d next_graph_seq=%d ubatch_tokens=%lld scope=%s reason=%s matmuls=%lld vpu_runs=%lld "
             "graph_wall_ms=%.3f device_first_start_to_last_output_ready_ms=%.3f fpga_matmul_wall_sum_ms=%.3f "
-            "host_to_ip_dma_ms=%.3f act_dma_ms=%.3f weight_dma_ms=%.3f scale_dma_ms=%.3f preload_dma_ms=%.3f "
+            "host_to_ip_dma_ms=%.3f act_dma_ms=%.3f weight_dma_ms=%.3f scale_dma_ms=%.3f "
             "ping_h2ip_ms=%.3f pong_h2ip_ms=%.3f ping_jobs=%lld pong_jobs=%lld "
             "ip_compute_sum_ms=%.3f ping_compute_ms=%.3f pong_compute_ms=%.3f "
             "ip_to_host_dma_ms=%.3f ping_ip2host_ms=%.3f pong_ip2host_ms=%.3f "
@@ -10986,7 +10569,7 @@ static bool fpga_token_timing_emit(int next_graph_seq,
             (double) device_span_us / 1000.0, (double) g_token_timing.matmul_wall_us / 1000.0,
             (double) h2ip_dma_us / 1000.0, (double) g_token_timing.act_dma_us / 1000.0,
             (double) g_token_timing.weight_dma_us / 1000.0, (double) g_token_timing.scale_dma_us / 1000.0,
-            (double) g_token_timing.preload_us / 1000.0, (double) g_token_timing.bank_h2ip_us[0] / 1000.0,
+            (double) g_token_timing.bank_h2ip_us[0] / 1000.0,
             (double) g_token_timing.bank_h2ip_us[1] / 1000.0, g_token_timing.bank_jobs[0],
             g_token_timing.bank_jobs[1], (double) g_token_timing.ip_compute_us / 1000.0,
             (double) g_token_timing.bank_compute_us[0] / 1000.0,
@@ -11012,11 +10595,6 @@ static bool fpga_token_timing_emit(int next_graph_seq,
         const double compute_util_pct = device_span_us > 0 ?
                                             100.0 * (double) g_token_timing.ip_compute_us / (double) device_span_us :
                                             0.0;
-        const double preload_admission_overlap_pct = g_token_timing.preload_us > 0 ?
-            std::clamp(100.0 * (double) g_token_timing.scheduler_preload_overlap_us /
-                           (double) g_token_timing.preload_us,
-                       0.0, 100.0) :
-            0.0;
         fpga_log_line(
             true, "BREAKDOWN", force_flush,
             "graph_seq=%d next_graph_seq=%d scope=%s graph_wall_ms=%.3f matmul_wall_ms=%.3f "
@@ -11024,7 +10602,6 @@ static bool fpga_token_timing_emit(int next_graph_seq,
             "compute_util_pct=%.2f prep_total_ms=%.3f prep_weight_select_ms=%.3f "
             "prep_direct_weight_pack_ms=%.3f prep_scale_pack_ms=%.3f prep_act_pack_ms=%.3f prep_other_ms=%.3f "
             "handoffs=%lld prep_overlap_ms=%.3f prep_late_jobs=%lld prep_late_ms=%.3f prep_headroom_ms=%.3f "
-            "preload_overlap_jobs=%lld preload_overlap_ms=%.3f preload_recorded_ms=%.3f preload_overlap_pct=%.2f "
             "output_ready_to_next_launch_ms=%.3f retire_to_next_launch_ms=%.3f",
             g_token_timing.graph_seq, next_graph_seq, scope, (double) token_wall_us / 1000.0,
             (double) g_token_timing.matmul_wall_us / 1000.0, (double) outside_matmul_us / 1000.0,
@@ -11037,9 +10614,6 @@ static bool fpga_token_timing_emit(int next_graph_seq,
             g_token_timing.scheduler_handoffs, (double) g_token_timing.scheduler_prepare_overlap_us / 1000.0,
             g_token_timing.scheduler_prepare_late_jobs, (double) g_token_timing.scheduler_prepare_late_us / 1000.0,
             (double) g_token_timing.scheduler_prepare_headroom_us / 1000.0,
-            g_token_timing.scheduler_preload_overlap_jobs,
-            (double) g_token_timing.scheduler_preload_overlap_us / 1000.0,
-            (double) g_token_timing.preload_us / 1000.0, preload_admission_overlap_pct,
             (double) g_token_timing.scheduler_output_to_launch_us / 1000.0,
             (double) g_token_timing.scheduler_retire_to_launch_us / 1000.0);
 
@@ -11141,7 +10715,6 @@ static void fpga_token_timing_accumulate(const fpga_stage_totals_t & totals, lon
     g_token_timing.act_dma_us += totals.dma_act_us;
     g_token_timing.weight_dma_us += totals.dma_weight_us;
     g_token_timing.scale_dma_us += totals.dma_scale_us;
-    g_token_timing.preload_us += totals.input_preload_us;
     g_token_timing.ip_compute_us += totals.ip_compute_us;
     g_token_timing.ip2host_dma_us += totals.dma_result_us;
     g_token_timing.host_read_us += totals.host_result_us;
@@ -11149,12 +10722,10 @@ static void fpga_token_timing_accumulate(const fpga_stage_totals_t & totals, lon
     g_token_timing.scheduler_prepare_overlap_us += totals.scheduler_prepare_overlap_us;
     g_token_timing.scheduler_prepare_late_us += totals.scheduler_prepare_late_us;
     g_token_timing.scheduler_prepare_headroom_us += totals.scheduler_prepare_headroom_us;
-    g_token_timing.scheduler_preload_overlap_us += totals.scheduler_preload_overlap_us;
     g_token_timing.scheduler_output_to_launch_us += totals.scheduler_output_to_launch_us;
     g_token_timing.scheduler_retire_to_launch_us += totals.scheduler_retire_to_launch_us;
     g_token_timing.scheduler_handoffs += totals.scheduler_handoffs;
     g_token_timing.scheduler_prepare_late_jobs += totals.scheduler_prepare_late_jobs;
-    g_token_timing.scheduler_preload_overlap_jobs += totals.scheduler_preload_overlap_jobs;
     g_token_timing.result_overlap_jobs += totals.result_overlap_jobs;
     g_token_timing.result_overlap_host_us += totals.result_overlap_host_us;
     const int category = (int) fpga_bottleneck_category(tensor_name);
@@ -11164,7 +10735,7 @@ static void fpga_token_timing_accumulate(const fpga_stage_totals_t & totals, lon
     g_token_timing.category_prep_us[category] += totals.prep_us;
     g_token_timing.category_compute_us[category] += totals.ip_compute_us;
     g_token_timing.category_dma_us[category] += totals.dma_act_us + totals.dma_weight_us + totals.dma_scale_us +
-                                                 totals.input_preload_us + totals.dma_result_us;
+                                                 totals.dma_result_us;
     for (int bank = 0; bank < 2; ++bank) {
         g_token_timing.bank_h2ip_us[bank] += totals.bank_h2ip_us[bank];
         g_token_timing.bank_compute_us[bank] += totals.bank_compute_us[bank];
@@ -12590,7 +12161,7 @@ static bool fpga_spu_q16_contribution(int32_t   raw,
 // Read DDR staging only: do not replay DMA, read IP memories, or repair results.
 static void fpga_p2_audit_failed_row(const fpga_tile_job_t & job, const void * weight_data_base,
                                      const char * tensor_name, int row, int64_t actual, uint64_t expected_bits) {
-    if (job.input_preloaded || job.weight_bank_reused) {
+    if (job.weight_bank_reused) {
         fpga_log_q16_audit("status=unavailable reason=inputs_reused job=%u", job.job_id);
         return;
     }
