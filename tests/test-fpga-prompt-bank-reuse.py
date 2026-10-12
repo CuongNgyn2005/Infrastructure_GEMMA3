@@ -695,7 +695,40 @@ int main() {
     assert(pipeline_activation_k == pipeline_consumed_k);
     assert(run_pipeline_case(256, 1152 / 32, false, false));
     assert(run_pipeline_case(256, 1152 / 32, true, true));
+
+    // A nonresident Gemma-shaped matrix has four row transitions into K=0.
+    // Every job except the final one should admit and consume its lookahead,
+    // including the 128-row final row whose 64-block tiles are 256 KiB.
+    assert(run_pipeline_case(1152, 216, true, false));
+    assert(launches == 20);
+    assert(pipeline_admitted_k.size() == 19);
+    assert(pipeline_consumed_k.size() == 19);
+    int cross_row_k0 = 0;
+    for (size_t i = 0; i < pipeline_admitted_rows.size(); ++i) {
+        if (pipeline_admitted_rows[i] > 0 && pipeline_admitted_k[i] == 0) ++cross_row_k0;
+    }
+    assert(cross_row_k0 == 4);
+
+    // A three-row tail has two row pairs and therefore remains eligible.  Its
+    // small 8 KiB and 3 KiB tiles must continue admitting the following groups.
+    assert(run_pipeline_case(259, 216, true, false));
+    assert(launches == 8);
+    assert(pipeline_admitted_k.size() == 7);
+    assert(pipeline_consumed_k.size() == 7);
+    bool tail_k0 = false, tail_k64 = false, tail_k128 = false, tail_k192 = false;
+    for (size_t i = 0; i < pipeline_admitted_rows.size(); ++i) {
+        if (pipeline_admitted_rows[i] != 256) continue;
+        tail_k0 |= pipeline_admitted_k[i] == 0;
+        tail_k64 |= pipeline_admitted_k[i] == 64;
+        tail_k128 |= pipeline_admitted_k[i] == 128;
+        tail_k192 |= pipeline_admitted_k[i] == 192;
+    }
+    assert(tail_k0 && tail_k64 && tail_k128 && tail_k192);
+
     assert(run_pipeline_case(257, 6912 / 32, true, false));
+    assert(launches == 8);
+    assert(pipeline_admitted_k.size() == 3);
+    assert(pipeline_consumed_k.size() == 3);
     for (size_t i = 0; i < pipeline_admitted_rows.size(); ++i) assert(pipeline_admitted_rows[i] < 256);
 
     std::printf("PASS: %d legacy scheduler cases; production pipeline rows/K transitions, disabled/resident/small-tail admission\n", cases);

@@ -7456,7 +7456,6 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
             const auto admit_next_tile = [&](const fpga_tile_job_t & current) {
                 if (!pipeline_route || lookahead.valid || current.weight_bank_reused ||
                     current.weight_cache_hit || current.p2_residency_hit ||
-                    current.weight_bytes < FPGA_P2_PACK_PARALLEL_MIN_BYTES ||
                     current.weight_bytes > P2_PIPELINE_WEIGHT_SLOT_BYTES ||
                     current.scale_bytes > P2_PIPELINE_SCALE_SLOT_BYTES || current.scale_bytes > P2_PIPELINE_PL_SCALE_BYTES ||
                     current.weight_src_off != WEIGHT_BASE +
