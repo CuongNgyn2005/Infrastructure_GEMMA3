@@ -55,7 +55,17 @@ static long long now_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
-static void mmio_fence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
+static std::atomic<long long> g_mono_counter{ 0 };
+static long long monotonic_now_us() {
+    return ++g_mono_counter;
+}
+static std::thread::id g_main_thread;
+static long long g_worker_fence_mono = 0;
+static void mmio_fence() {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const long long fence_mono = monotonic_now_us();
+    if (std::this_thread::get_id() != g_main_thread) g_worker_fence_mono = fence_mono;
+}
 '''
 harness += section("enum fpga_pack_detail_field {", "// Caller-owned counters")
 harness += "static std::array<long long, PACK_DETAIL_COUNT> g_pack_detail = {};\n"
@@ -82,6 +92,7 @@ for worker_function in (
 harness += r'''
 #undef pthread_cond_signal
 int main() {
+    g_main_thread = std::this_thread::get_id();
     constexpr int rows = 5, blocks = 3, beats = blocks * 2;
     constexpr size_t pairs = (rows + 1) / 2, words_per_pair = beats * 8;
     constexpr size_t words = pairs * words_per_pair;
@@ -92,6 +103,10 @@ int main() {
     std::vector<uint64_t> actual(words / 2 + 2), expected(words / 2 + 2);
     auto dst = reinterpret_cast<uint32_t *>(actual.data());
     auto ref = reinterpret_cast<uint32_t *>(expected.data());
+    long long invalid_service = 0, invalid_wait = 0, invalid_completion_mono = 123;
+    assert(!fpga_p2_pack_worker_wait(0, nullptr, &invalid_service, &invalid_wait, nullptr,
+                                     &invalid_completion_mono));
+    assert(invalid_completion_mono == 0);
     fpga_p2_pack_worker_task_t task = {
         &tensor, input.data(), 0, 0, rows, blocks, beats,
         1, pairs, dst, (pairs - 1) * words_per_pair, 1
@@ -123,7 +138,7 @@ int main() {
             std::fill(actual.begin(), actual.end(), UINT64_C(0xabababababababab));
             expected = actual;
             size_t ref_words = 0, main_words = 0, helper_words = 0;
-            long long service = 0, wait = 0;
+            long long service = 0, wait = 0, completion_mono = 0;
             assert(fpga_pack_direct_weight_pair_range(ref, &tensor, input.data(), 0, 0,
                 rows, blocks, beats, 0, pairs, false, &ref_words));
             assert(fpga_p2_pack_worker_next_generation(&generation));
@@ -135,11 +150,17 @@ int main() {
                 rows, blocks, beats, 0, 1, true, &main_words));
             mmio_fence();
             if (i % 3 == 1) std::this_thread::sleep_for(std::chrono::microseconds(20));
-            assert(fpga_p2_pack_worker_wait(generation, &helper_words, &service, &wait));
+            assert(fpga_p2_pack_worker_wait(generation, &helper_words, &service, &wait, nullptr, &completion_mono));
+            assert(completion_mono > 0);
+            assert(g_worker_fence_mono > 0 && completion_mono > g_worker_fence_mono);
             assert(main_words + helper_words == ref_words);
             assert(actual == expected); // Includes odd-row padding and tail canary.
-            if (generation > 1)
-                assert(!fpga_p2_pack_worker_wait(generation - 1, &helper_words, &service, &wait));
+            if (generation > 1) {
+                completion_mono = 123;
+                assert(!fpga_p2_pack_worker_wait(generation - 1, &helper_words, &service, &wait, nullptr,
+                                                 &completion_mono));
+                assert(completion_mono == 0);
+            }
         }
         // A failed range must publish a failed completion, never hang or pass.
         assert(fpga_p2_pack_worker_next_generation(&generation));
@@ -147,10 +168,14 @@ int main() {
         task.group_beats = 0;
         assert(fpga_p2_pack_worker_submit(task));
         size_t written = 0;
-        long long service = 0, wait = 0;
-        assert(!fpga_p2_pack_worker_wait(generation, &written, &service, &wait));
+        long long service = 0, wait = 0, completion_mono = 123;
+        assert(!fpga_p2_pack_worker_wait(generation, &written, &service, &wait, nullptr, &completion_mono));
+        assert(completion_mono == 0);
         task.group_beats = beats;
         assert(fpga_p2_pack_worker_stop());
+        pthread_mutex_lock(&g_p2_pack_worker_mutex);
+        assert(g_p2_pack_worker_completed_mono_us == 0);
+        pthread_mutex_unlock(&g_p2_pack_worker_mutex);
         assert(fpga_p2_pack_worker_stop());
         assert(!fpga_p2_pack_worker_submit(task));
     }
@@ -158,6 +183,9 @@ int main() {
     g_p2_pack_worker_next_generation = UINT64_MAX;
     assert(!fpga_p2_pack_worker_next_generation(&generation));
     assert(fpga_p2_pack_worker_stop());
+    pthread_mutex_lock(&g_p2_pack_worker_mutex);
+    assert(g_p2_pack_worker_completed_mono_us == 0);
+    pthread_mutex_unlock(&g_p2_pack_worker_mutex);
     puts("PASS: 6000 byte-exact parallel jobs (3000 pack, 3000 copy); wake races, stale/failed completion, admission, overflow, restart");
 }
 '''

@@ -61,6 +61,10 @@ static long long now_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+static long long monotonic_now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 static void mmio_fence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
 '''
 harness = harness.replace("#include <array>\n", "#include <array>\n#include <atomic>\n")

@@ -36,7 +36,7 @@
 __extension__ typedef unsigned __int128 fpga_uint128_t;
 __extension__ typedef __int128          fpga_int128_t;
 
-#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v94-p2-dma-pack-pipeline"
+#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v95-p2-dma-pack-pipeline"
 
 #define MY_IP_BASE_ADDRESS 0x00000000A0000000LL
 #define REG_BASE_PHYS      0x00000000A0000000LL
@@ -881,9 +881,12 @@ static long long          g_p2_pack_dma_pipeline_consumed_jobs            = 0;
 static uint64_t           g_p2_pack_dma_pipeline_callback_bytes           = 0;
 static long long          g_p2_pack_dma_pipeline_callback_us              = 0;
 static long long          g_p2_pack_dma_pipeline_helper_us                = 0;
+static long long          g_p2_pack_dma_pipeline_helper_wait_us            = 0;
 static long long          g_p2_pack_dma_pipeline_residual_us              = 0;
 static long long          g_p2_pack_dma_pipeline_residual_bytes           = 0;
 static long long          g_p2_pack_dma_pipeline_rejected_jobs            = 0;
+static long long          g_p2_pack_dma_pipeline_helper_publication_lead_us = 0;
+static long long          g_p2_pack_dma_pipeline_helper_early_completions  = 0;
 enum fpga_pack_detail_field {
     PACK_TOTAL, PACK_SERIAL, PACK_DISPATCH, PACK_MAIN, PACK_FENCE, PACK_WAIT,
     PACK_HELPER, PACK_SERIAL_JOBS, PACK_PARALLEL_JOBS,
@@ -943,6 +946,7 @@ static bool                   g_p2_pack_worker_completed_success = false;
 static size_t                 g_p2_pack_worker_completed_words = 0;
 static size_t                 g_p2_pack_worker_completed_scale_entries = 0;
 static long long              g_p2_pack_worker_completed_service_us = 0;
+static long long              g_p2_pack_worker_completed_mono_us = 0;
 static long long         g_p2_residency_avoided_cpu_pack_bytes        = 0;
 // Residency still transfers each selected tile from DDR to the IP.  Keep this
 // explicit so a diagnostic log never claims a traffic reduction it cannot
@@ -4006,7 +4010,6 @@ static void * fpga_p2_pack_worker_main(void *) {
         // stores are globally observed.  The caller performs its own DSB
         // before DMA.
         mmio_fence();
-
         pthread_mutex_lock(&g_p2_pack_worker_mutex);
         g_p2_pack_worker_busy = false;
         g_p2_pack_worker_completed_generation = task.generation;
@@ -4014,6 +4017,7 @@ static void * fpga_p2_pack_worker_main(void *) {
         g_p2_pack_worker_completed_words = written_words;
         g_p2_pack_worker_completed_scale_entries = written_scale_entries;
         g_p2_pack_worker_completed_service_us = now_us() - service0;
+        g_p2_pack_worker_completed_mono_us = monotonic_now_us();
         pthread_cond_broadcast(&g_p2_pack_worker_done_cv);
         pthread_mutex_unlock(&g_p2_pack_worker_mutex);
     }
@@ -4034,6 +4038,7 @@ static bool fpga_p2_pack_worker_start(void) {
     g_p2_pack_worker_completed_words = 0U;
     g_p2_pack_worker_completed_scale_entries = 0U;
     g_p2_pack_worker_completed_service_us = 0;
+    g_p2_pack_worker_completed_mono_us = 0;
     const int create_rc = pthread_create(&g_p2_pack_worker_thread, nullptr, fpga_p2_pack_worker_main, nullptr);
     if (create_rc == 0) {
         g_p2_pack_worker_created = true;
@@ -4099,7 +4104,11 @@ static bool fpga_p2_pack_worker_wait(uint64_t generation,
                                      size_t * words,
                                      long long * service_us,
                                      long long * wait_us,
-                                     size_t * scale_entries = nullptr) {
+                                     size_t * scale_entries = nullptr,
+                                     long long * completion_mono_us = nullptr) {
+    if (completion_mono_us) {
+        *completion_mono_us = 0;
+    }
     if (!words || !service_us || !wait_us || generation == 0U) {
         return false;
     }
@@ -4115,6 +4124,9 @@ static bool fpga_p2_pack_worker_wait(uint64_t generation,
         *scale_entries = g_p2_pack_worker_completed_scale_entries;
     }
     *service_us = g_p2_pack_worker_completed_service_us;
+    if (completion_mono_us && success) {
+        *completion_mono_us = g_p2_pack_worker_completed_mono_us;
+    }
     pthread_mutex_unlock(&g_p2_pack_worker_mutex);
     *wait_us = now_us() - wait0;
     return success;
@@ -4252,6 +4264,7 @@ static bool fpga_p2_pack_worker_stop(void) {
     g_p2_pack_worker_task_pending = false;
     g_p2_pack_worker_busy = false;
     g_p2_pack_worker_completed_scale_entries = 0U;
+    g_p2_pack_worker_completed_mono_us = 0;
     pthread_mutex_unlock(&g_p2_pack_worker_mutex);
     return true;
 }
@@ -6053,6 +6066,22 @@ static bool fpga_p2_dma_pipeline_geometry(size_t rows,
     return true;
 }
 
+// The DMA-pipeline caller also polls DMA and retires the previous result.  For
+// large lookahead tiles, leave it a bounded 3/8 prefix and give the persistent
+// helper the 5/8 suffix.  Smaller tiles retain the established half split.
+static size_t fpga_p2_dma_pipeline_main_pair_count(size_t pair_count, size_t weight_bytes) {
+    if (pair_count < 2U || weight_bytes < FPGA_P2_PACK_PARALLEL_MIN_BYTES) {
+        return pair_count / 2U;
+    }
+    if (pair_count > std::numeric_limits<size_t>::max() / 3U) {
+        return pair_count / 2U;
+    }
+    size_t main_pairs = (pair_count * 3U) / 8U;
+    main_pairs = std::max<size_t>(1U, main_pairs);
+    main_pairs = std::min(main_pairs, pair_count - 1U);
+    return main_pairs;
+}
+
 static bool fpga_p2_dma_pipeline_slot_ranges(uint32_t weight_src_off,
                                               uint32_t scale_src_off,
                                               size_t   weight_bytes,
@@ -6167,7 +6196,7 @@ static bool fpga_p2_dma_pipeline_admit(fpga_p2_dma_pipeline_lookahead_t & lookah
     candidate.generation             = 0U;
     candidate.source_epoch           = g_p2_weight_residency_epoch;
     candidate.pair_count             = pair_count;
-    candidate.helper_pair_begin      = pair_count / 2U;
+    candidate.helper_pair_begin      = fpga_p2_dma_pipeline_main_pair_count(pair_count, weight_bytes);
     candidate.main_pair_next         = 0U;
     candidate.words_per_pair         = words_per_pair;
     candidate.expected_words         = pair_count * words_per_pair;
@@ -6300,6 +6329,7 @@ static bool fpga_p2_dma_pipeline_finalize(fpga_p2_dma_pipeline_lookahead_t & loo
         return !lookahead.valid || lookahead.consumed;
     }
     const long long finalize0 = now_us();
+    const long long finalize_mono0 = monotonic_now_us();
     const long long residual0 = now_us();
     while (lookahead.main_pair_next < lookahead.helper_pair_begin) {
         const size_t pair_end = std::min(lookahead.main_pair_next + P2_PIPELINE_PACK_BATCH_PAIRS,
@@ -6313,8 +6343,9 @@ static bool fpga_p2_dma_pipeline_finalize(fpga_p2_dma_pipeline_lookahead_t & loo
     size_t helper_words = 0U;
     size_t helper_scales = 0U;
     long long helper_wait = 0;
+    long long helper_publication_mono_us = 0;
     if (!fpga_p2_pack_worker_wait(lookahead.generation, &helper_words, &lookahead.helper_service_us, &helper_wait,
-                                  &helper_scales)) {
+                                  &helper_scales, &helper_publication_mono_us)) {
         return false;
     }
     lookahead.worker_submitted = false;
@@ -6355,6 +6386,19 @@ static bool fpga_p2_dma_pipeline_finalize(fpga_p2_dma_pipeline_lookahead_t & loo
     g_p2_pack_dma_pipeline_residual_bytes += (long long) (total_main_bytes - lookahead.callback_bytes);
     g_p2_pack_dma_pipeline_helper_us += lookahead.helper_service_us;
     g_p2_pack_dma_pipeline_residual_us += lookahead.residual_us;
+    // This is caller-observed mutex/condition/scheduling elapsed time, not
+    // helper CPU service time; the latter is tracked separately above.
+    if (helper_wait >= 0 && g_p2_pack_dma_pipeline_helper_wait_us <= LLONG_MAX - helper_wait) {
+        g_p2_pack_dma_pipeline_helper_wait_us += helper_wait;
+    }
+    if (finalize_mono0 > 0 && helper_publication_mono_us > 0 && finalize_mono0 > helper_publication_mono_us) {
+        const long long publication_lead_us = finalize_mono0 - helper_publication_mono_us;
+        if (publication_lead_us > 0 &&
+            g_p2_pack_dma_pipeline_helper_publication_lead_us <= LLONG_MAX - publication_lead_us) {
+            g_p2_pack_dma_pipeline_helper_publication_lead_us += publication_lead_us;
+            ++g_p2_pack_dma_pipeline_helper_early_completions;
+        }
+    }
     if (lookahead.totals) {
         // Callback and helper service overlap the current DMA.  Count only
         // the host-side residual/finalization wall time in the ordinary prep
@@ -6363,7 +6407,6 @@ static bool fpga_p2_dma_pipeline_finalize(fpga_p2_dma_pipeline_lookahead_t & loo
         lookahead.totals->prep_direct_weight_pack_us += lookahead.residual_us;
         lookahead.totals->prep_us += finalize_wall_us;
     }
-    (void) helper_wait;
     return true;
 }
 
@@ -8166,9 +8209,12 @@ int fpga_init(void) {
     g_p2_pack_dma_pipeline_callback_bytes = 0;
     g_p2_pack_dma_pipeline_callback_us = 0;
     g_p2_pack_dma_pipeline_helper_us = 0;
+    g_p2_pack_dma_pipeline_helper_wait_us = 0;
     g_p2_pack_dma_pipeline_residual_us = 0;
     g_p2_pack_dma_pipeline_residual_bytes = 0;
     g_p2_pack_dma_pipeline_rejected_jobs = 0;
+    g_p2_pack_dma_pipeline_helper_publication_lead_us = 0;
+    g_p2_pack_dma_pipeline_helper_early_completions = 0;
     g_pack_detail.fill(0);
     g_pack_detail_snapshot.fill(0);
     g_pack_detail_decode.fill(0);
@@ -9015,7 +9061,8 @@ void fpga_cleanup(void) {
         "dma_pipeline_host_dma_includes_callback=1 dma_pipeline_eligible_jobs=%lld dma_pipeline_consumed_jobs=%lld "
         "dma_pipeline_callback_us=%lld "
         "dma_pipeline_callback_bytes=%llu dma_pipeline_helper_us=%lld dma_pipeline_residual_us=%lld "
-        "dma_pipeline_residual_bytes=%lld dma_pipeline_rejected_jobs=%lld",
+        "dma_pipeline_residual_bytes=%lld dma_pipeline_rejected_jobs=%lld dma_pipeline_helper_wait_us=%lld "
+        "dma_pipeline_helper_publication_lead_us=%lld dma_pipeline_helper_early_completions=%lld",
         g_p2_pack_workers_requested, g_p2_pack_workers_active, g_p2_pack_worker_created ? 0 : 1,
         FPGA_P2_PACK_PARALLEL_MIN_BYTES, g_p2_pack_parallel_jobs, (unsigned long long) g_p2_pack_parallel_bytes,
         g_p2_pack_serial_threshold_skips, g_p2_pack_main_us, g_p2_pack_helper_service_us, g_p2_pack_caller_wait_us,
@@ -9024,7 +9071,9 @@ void fpga_cleanup(void) {
          g_p2_pack_dma_pipeline_eligible_jobs, g_p2_pack_dma_pipeline_consumed_jobs,
          g_p2_pack_dma_pipeline_callback_us, (unsigned long long) g_p2_pack_dma_pipeline_callback_bytes,
          g_p2_pack_dma_pipeline_helper_us, g_p2_pack_dma_pipeline_residual_us,
-         g_p2_pack_dma_pipeline_residual_bytes, g_p2_pack_dma_pipeline_rejected_jobs);
+         g_p2_pack_dma_pipeline_residual_bytes, g_p2_pack_dma_pipeline_rejected_jobs,
+         g_p2_pack_dma_pipeline_helper_wait_us,
+         g_p2_pack_dma_pipeline_helper_publication_lead_us, g_p2_pack_dma_pipeline_helper_early_completions);
     fpga_log_pack_breakdown("decode_total", -1, g_fpga_perf_decode.decode_tokens,
                             fpga_pack_detail_record(g_pack_detail_decode));
     fpga_log_pack_breakdown("process_total_including_startup", -1, -1,
