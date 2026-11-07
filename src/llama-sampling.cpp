@@ -2667,11 +2667,6 @@ void llama_perf_sampler_print(const struct llama_sampler * chain) {
     fpga_perf_decode_data fpga_perf = {};
     if (fpga_perf_decode_get(&fpga_perf)) {
         const long long transfer_us = fpga_perf.h2ip_dma_us + fpga_perf.ip2host_dma_us;
-        const long long service_us = fpga_perf.ip_compute_us + transfer_us;
-        const double ip_only_tokens_per_second = fpga_perf.ip_compute_us > 0 ?
-            (double) fpga_perf.decode_tokens * 1000000.0 / (double) fpga_perf.ip_compute_us : 0.0;
-        const double service_tokens_per_second = service_us > 0 ?
-            (double) fpga_perf.decode_tokens * 1000000.0 / (double) service_us : 0.0;
         const double end_to_end_tokens_per_second = fpga_perf.decode_wall_us > 0 ?
             (double) fpga_perf.decode_tokens * 1000000.0 / (double) fpga_perf.decode_wall_us : 0.0;
         const double direct_weight_pack_pct = fpga_perf.preparation_us > 0 ?
@@ -2684,6 +2679,11 @@ void llama_perf_sampler_print(const struct llama_sampler * chain) {
 
         printf("\n[IP]\n");
         if (fpga_perf.ip_compute_timing_valid && fpga_perf.ip_compute_us > 0) {
+            const long long service_us = fpga_perf.ip_compute_us + transfer_us;
+            const double ip_only_tokens_per_second =
+                (double) fpga_perf.decode_tokens * 1000000.0 / (double) fpga_perf.ip_compute_us;
+            const double service_tokens_per_second = service_us > 0 ?
+                (double) fpga_perf.decode_tokens * 1000000.0 / (double) service_us : 0.0;
             printf("%-28s = %10.2f tokens/s\n", "IP-only compute speed", ip_only_tokens_per_second);
             printf("%-28s = %10.2f tokens/s\n", "IP + DMA speed", service_tokens_per_second);
         } else {
