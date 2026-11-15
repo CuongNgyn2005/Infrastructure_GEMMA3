@@ -23,8 +23,12 @@
 #include "fpga_log.h"
 #include "fpga_q8_layout.h"
 #include "fpga_q8_pack.h"
+#include "fpga_attention_contract.h"
+#include "fpga_attention_abi.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "quants.h"
 
 #include <dirent.h>
@@ -51,6 +55,7 @@
 #include <cstring>
 #include <ctime>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -579,6 +584,9 @@ typedef struct {
     uint32_t                          scale_words;
     uint32_t                          weight_src_off;
     uint32_t                          scale_src_off;
+    // Zero/default preserves the established CPU-produced ACT path.
+    uint32_t                          retained_act_src_off;
+    bool                              retained_activation;
     bool                              weight_cache_hit;
     bool                              p2_residency_hit;
     uint32_t                          p2_residency_slot;
@@ -750,6 +758,25 @@ static fpga_weight_path_bench_trace_t g_weight_path_bench = {};
 // mapping: exact UIO is preferred, with /dev/mem compatibility using O_SYNC.
 static fpga_mapping_kind                      g_ddr_mapping_kind = fpga_mapping_kind::UNKNOWN;
 static pthread_mutex_t                        g_mutex            = PTHREAD_MUTEX_INITIALIZER;
+
+namespace attention_abi = fpga_attention_abi;
+struct fpga_attention_layer_state {
+    fpga_attention::kv_mirror mirror;
+};
+static bool g_attention_enabled = false;
+static bool g_attention_admitted = false;
+static std::vector<attention_abi::layer_layout> g_attention_layouts;
+static std::vector<std::unique_ptr<fpga_attention_layer_state>> g_attention_layers;
+static fpga_attention::retained_q8_state g_attention_retained;
+static fpga_attention::retained_q8_handle g_attention_handle;
+static attention_abi::command g_attention_command;
+static uint64_t g_attention_next_query = 1;
+
+static void fpga_attention_invalidate_host_state() {
+    g_attention_retained.invalidate();
+    g_attention_handle = fpga_attention::retained_q8_handle();
+    for (const auto & layer : g_attention_layers) { layer->mirror.invalidate(); }
+}
 static fpga_scratch_t                         g_scratch;
 static std::vector<fpga_weight_cache_entry_t> g_weight_cache;
 
@@ -1385,6 +1412,14 @@ static void fpga_fatal(const char * fmt, ...) {
     abort();
 }
 
+int fpga_attention_requested(void) {
+    const char * value = getenv("FPGA_ATTENTION");
+    if (!value || !value[0] || strcmp(value, "0") == 0) { return 0; }
+    if (strcmp(value, "1") == 0) { return 1; }
+    fpga_fatal("FPGA_ATTENTION must be 0 or 1");
+    return 0;
+}
+
 static inline void mmio_fence(void) {
 #if defined(__aarch64__) || defined(__arm__)
     // The ZCU104 host is Arm.  A compiler/CPU fence alone does not guarantee
@@ -1448,6 +1483,35 @@ static inline uint32_t vpu_rd32(uint32_t off) {
 
 static inline void vpu_wr32(uint32_t off, uint32_t val) {
     *(volatile uint32_t *) (g_vpu + off) = val;
+}
+
+struct fpga_attention_transport {
+    uint32_t read(uint32_t reg) { return vpu_rd32(reg); }
+    void write(uint32_t reg, uint32_t value) { vpu_wr32(reg, value); }
+    void fence() { mmio_fence(); }
+    int64_t now_us() { return monotonic_now_us(); }
+    void yield() { sched_yield(); }
+};
+
+static bool fpga_attention_register_admission(std::string & error) {
+    if (!vpu_is_mapped() || g_vpu_map_size < attention_abi::CAPS + sizeof(uint32_t)) {
+        return fpga_attention::fail(error, "attention registers exceed mapped MY_IP aperture");
+    }
+    fpga_attention_transport io;
+    return attention_abi::admit(io, error);
+}
+
+static bool fpga_attention_retained_dma_source(uint64_t source, size_t bytes) {
+    fpga_attention::retained_q8_handle current;
+    if (!g_attention_admitted || !g_attention_retained.lookup(g_attention_handle.generation,
+                                                            g_attention_handle.query_id, current) ||
+        source < DDR_BASE_PHYS + current.data_offset || bytes == 0 ||
+        source - (DDR_BASE_PHYS + current.data_offset) > current.data_bytes ||
+        bytes > current.data_bytes - (source - (DDR_BASE_PHYS + current.data_offset))) {
+        return false;
+    }
+    fpga_attention_transport io;
+    return attention_abi::retained(io, g_attention_command);
 }
 
 static uint32_t fpga_next_job_id(void) {
@@ -3177,7 +3241,8 @@ static bool fpga_dma_copy_one(uint64_t                         src_phys,
                               uint64_t                         dst_phys,
                               size_t                           bytes,
                               const char *                     tag,
-                              const fpga_dma_poll_hook_t *     poll_hook = nullptr) {
+                              const fpga_dma_poll_hook_t *     poll_hook = nullptr,
+                              bool                             device_produced_source = false) {
     fpga_dma_profile_transfer profile(tag, bytes);
     if (!dma_is_mapped()) {
         LOGE("ZDMA is not mapped for tag=%s", tag ? tag : "?");
@@ -3185,6 +3250,12 @@ static bool fpga_dma_copy_one(uint64_t                         src_phys,
     }
     if (bytes == 0 || bytes > UINT32_MAX) {
         LOGE("invalid ZDMA byte count tag=%s bytes=%zu", tag ? tag : "?", bytes);
+        return false;
+    }
+    if (device_produced_source &&
+        (!p2_physical_ddr_mapping_active() || !fpga_attention_retained_dma_source(src_phys, bytes) ||
+         dst_phys < LMM_BASE_PHYS + ACT_BASE || dst_phys + bytes > LMM_BASE_PHYS + ACT_END)) {
+        LOGE("retained attention ACT source ownership/range rejected before DMA");
         return false;
     }
 
@@ -3231,11 +3302,17 @@ static bool fpga_dma_copy_one(uint64_t                         src_phys,
     if (phys_to_ddr_offset(src_phys, bytes, &src_ddr_off)) {
         if (p2_transfer_detail) {
             fpga_p2_dma_breadcrumb(
-                "step=source_sync edge=before tag=%s direction=cpu_to_device offset=0x%08x bytes=%zu map_kind=%s "
-                "action=no_msync ordering=dsb_readback",
-                tag ? tag : "?", src_ddr_off, bytes, fpga_mapping_kind_name(g_ddr_mapping_kind));
+                "step=source_sync edge=before tag=%s direction=%s offset=0x%08x bytes=%zu map_kind=%s "
+                "action=no_msync ordering=%s",
+                tag ? tag : "?", device_produced_source ? "device_to_device" : "cpu_to_device",
+                src_ddr_off, bytes, fpga_mapping_kind_name(g_ddr_mapping_kind),
+                device_produced_source ? "axi_completion_then_dsb" : "dsb_readback");
         }
-        if (!fpga_p2_ddr_sync(src_ddr_off, bytes, false, tag)) {
+        // Attention DONE is published only after every AXI write response. Its
+        // retained handle proves device ownership; do not read Q8 bytes on CPU.
+        // Ordinary CPU-produced ACT/WEIGHT/SCALE keep their readback commit.
+        if (device_produced_source) { mmio_fence(); }
+        if (!device_produced_source && !fpga_p2_ddr_sync(src_ddr_off, bytes, false, tag)) {
             if (p2_transfer_detail) {
                 fpga_p2_dma_breadcrumb(
                     "step=source_sync edge=fail tag=%s direction=cpu_to_device offset=0x%08x bytes=%zu map_kind=%s "
@@ -3246,9 +3323,11 @@ static bool fpga_dma_copy_one(uint64_t                         src_phys,
         }
         if (p2_transfer_detail) {
             fpga_p2_dma_breadcrumb(
-                "step=source_sync edge=after tag=%s direction=cpu_to_device offset=0x%08x bytes=%zu map_kind=%s "
-                "action=no_msync ordering=dsb_readback",
-                tag ? tag : "?", src_ddr_off, bytes, fpga_mapping_kind_name(g_ddr_mapping_kind));
+                "step=source_sync edge=after tag=%s direction=%s offset=0x%08x bytes=%zu map_kind=%s "
+                "action=no_msync ordering=%s",
+                tag ? tag : "?", device_produced_source ? "device_to_device" : "cpu_to_device",
+                src_ddr_off, bytes, fpga_mapping_kind_name(g_ddr_mapping_kind),
+                device_produced_source ? "axi_completion_then_dsb" : "dsb_readback");
         }
     }
 
@@ -3391,7 +3470,8 @@ static bool fpga_dma_copy(uint64_t                     src_phys,
                           uint64_t                     dst_phys,
                           size_t                       bytes,
                           const char *                 tag,
-                          const fpga_dma_poll_hook_t * poll_hook = nullptr);
+                          const fpga_dma_poll_hook_t * poll_hook = nullptr,
+                          bool                         device_produced_source = false);
 
 static bool fpga_p2_dma_pipeline_poll(void * context, long long elapsed_us);
 
@@ -3477,7 +3557,8 @@ static bool fpga_dma_copy(uint64_t                     src_phys,
                           uint64_t                     dst_phys,
                           size_t                       bytes,
                           const char *                 tag,
-                          const fpga_dma_poll_hook_t * poll_hook) {
+                          const fpga_dma_poll_hook_t * poll_hook,
+                          bool                         device_produced_source) {
     if (bytes == 0U || bytes > UINT32_MAX) {
         LOGE("invalid ZDMA byte count tag=%s bytes=%zu", tag ? tag : "?", bytes);
         return false;
@@ -3512,7 +3593,7 @@ static bool fpga_dma_copy(uint64_t                     src_phys,
             snprintf(chunk_tag, sizeof(chunk_tag), "%s[%zu/%zu]", tag ? tag : "?", chunk + 1U, chunk_count);
         }
         if (!fpga_dma_copy_one(src_phys + (uint64_t) offset, dst_phys + (uint64_t) offset, this_bytes, chunk_tag,
-                               poll_hook)) {
+                               poll_hook, device_produced_source)) {
             return false;
         }
     }
@@ -5961,7 +6042,8 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
                                      fpga_stage_totals_t *             totals,
                                      fpga_prompt_weight_staging_t *    staging = nullptr,
                                      uint32_t                          weight_stage_off = WEIGHT_BASE,
-                                     uint32_t                          scale_stage_off = SPU_PARAM_BASE);
+                                     uint32_t                          scale_stage_off = SPU_PARAM_BASE,
+                                     uint32_t                          retained_act_src_off = 0);
 
 static bool fpga_p2_dma_pipeline_admit(fpga_p2_dma_pipeline_lookahead_t & lookahead,
                                        const struct ggml_tensor *         src0,
@@ -6668,6 +6750,8 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
         g_p2_first_act_dma_trace_active = true;
     }
     const bool act_dma_ok =
+        job.retained_activation ? fpga_dma_copy(DDR_BASE_PHYS + job.retained_act_src_off,
+                                                LMM_BASE_PHYS + ACT_BASE, job.act_bytes, "ATTENTION_ACT", nullptr, true) :
         poll_hook ? fpga_dma_copy(DDR_BASE_PHYS + (uint64_t) ACT_BASE, LMM_BASE_PHYS + (uint64_t) ACT_BASE,
                                   job.act_bytes, "ACT", poll_hook) :
                     fpga_dma_write_to_ip(ACT_BASE, job.act_bytes, "ACT");
@@ -7985,6 +8069,249 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip(const struct ggml_tensor * src0,
     return true;
 }
 
+static bool fpga_attention_tensor_storage(const ggml_tensor * tensor, size_t & available, std::string & error) {
+    if (!tensor || !tensor->data) { return fpga_attention::fail(error, "attention tensor has no data"); }
+    const ggml_tensor * owner = tensor;
+    size_t depth = 0;
+    while (!owner->buffer && owner->view_src && ++depth < 64) { owner = owner->view_src; }
+    if (!owner->buffer || !ggml_backend_buffer_is_host(owner->buffer) ||
+        ggml_backend_buffer_get_type(owner->buffer) != ggml_backend_cpu_buffer_type()) {
+        return fpga_attention::fail(error, "attention requires ordinary CPU buffers, without repacked weights");
+    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(owner->buffer));
+    const uintptr_t data = reinterpret_cast<uintptr_t>(tensor->data);
+    const size_t bytes = ggml_backend_buffer_get_size(owner->buffer);
+    if (data < base || data - base > bytes) { return fpga_attention::fail(error, "attention tensor is outside its CPU buffer"); }
+    available = bytes - size_t(data - base);
+    return true;
+}
+
+static bool fpga_attention_view(const ggml_tensor * tensor, fpga_attention::tensor_view & view, std::string & error) {
+    size_t available;
+    if (!tensor || (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16)) {
+        return fpga_attention::fail(error, "attention tensor view requires F32 or F16");
+    }
+    if (!fpga_attention_tensor_storage(tensor, available, error)) { return false; }
+    view.data = tensor->data;
+    view.type = tensor->type == GGML_TYPE_F32 ? fpga_attention::scalar_type::f32 : fpga_attention::scalar_type::f16;
+    view.storage_bytes = available;
+    for (int i = 0; i < 4; ++i) { view.ne[i] = tensor->ne[i]; view.nb[i] = tensor->nb[i]; }
+    return true;
+}
+
+static bool fpga_attention_publish_bytes(uint32_t offset, const void * source, size_t bytes) {
+    if (!source || !ddr_range_fits(offset, bytes) || bytes == 0 ||
+        bytes > UINT32_MAX - offset - 3U) { return false; }
+    // Readback applies only to these CPU-produced Q/mask/K/V writes. Its
+    // aligned range may contain adjacent bytes but never crosses the buffer.
+    const uint32_t sync_offset = offset & ~uint32_t(3);
+    const size_t sync_bytes = ((size_t(offset & 3U) + bytes + 3U) & ~size_t(3));
+    if (!ddr_range_fits(sync_offset, sync_bytes)) { return false; }
+    const uint8_t * input = static_cast<const uint8_t *>(source);
+    size_t i = 0;
+    for (; i < bytes && ((offset + i) & 3U); ++i) { *reinterpret_cast<volatile uint8_t *>(g_ddr + offset + i) = input[i]; }
+    for (; bytes - i >= 4; i += 4) {
+        uint32_t word;
+        memcpy(&word, input + i, sizeof(word));
+        *reinterpret_cast<volatile uint32_t *>(g_ddr + offset + i) = word;
+    }
+    for (; i < bytes; ++i) { *reinterpret_cast<volatile uint8_t *>(g_ddr + offset + i) = input[i]; }
+    return fpga_p2_ddr_sync(sync_offset, sync_bytes, false, "ATTENTION_INPUT");
+}
+
+static bool fpga_attention_prepare_pool(size_t layer, size_t nlayer, const fpga_attention::packed_attention & packed,
+                                         std::string & error) {
+    std::vector<attention_abi::layer_layout> old = g_attention_layouts;
+    if (old.size() != nlayer) { old.assign(nlayer, attention_abi::layer_layout()); }
+    std::vector<attention_abi::layer_layout> next;
+    if (!attention_abi::plan_pool(old, layer, uint32_t(packed.d), uint32_t(packed.hkv), uint32_t(packed.n),
+                                  g_ddr_map_size, next, error)) { return false; }
+    bool changed = g_attention_layouts.size() != next.size();
+    for (size_t i = 0; !changed && i < next.size(); ++i) {
+        const auto & a = g_attention_layouts[i]; const auto & b = next[i];
+        changed = a.d != b.d || a.hkv != b.hkv || a.capacity != b.capacity ||
+                  a.k_offset != b.k_offset || a.v_offset != b.v_offset;
+    }
+    if (changed) {
+        // Any relocation invalidates all shadows. Refill from the authoritative
+        // CPU views on subsequent invocations, never infer cache token positions.
+        fpga_attention_invalidate_host_state();
+        if (g_attention_layers.size() != nlayer) {
+            g_attention_layers.clear();
+            for (size_t i = 0; i < nlayer; ++i) {
+                g_attention_layers.emplace_back(new fpga_attention_layer_state());
+            }
+        }
+        g_attention_layouts.swap(next);
+    }
+    return true;
+}
+
+static bool fpga_attention_upload_kv(size_t layer, const fpga_attention::packed_attention & packed,
+                                    size_t & written_bytes, std::string & error) {
+    const auto & layout = g_attention_layouts[layer];
+    fpga_attention::kv_mirror & mirror = g_attention_layers[layer]->mirror;
+    fpga_attention::upload_plan upload;
+    const size_t capacity_bytes = size_t(layout.capacity)*layout.d*layout.hkv*2;
+    if (!mirror.prepare(packed, capacity_bytes, 65536, upload, error)) { return false; }
+    for (const fpga_attention::upload_span & span : upload.spans()) {
+        const auto & source = span.values ? upload.values() : upload.keys();
+        const uint32_t base = span.values ? layout.v_offset : layout.k_offset;
+        if (span.offset > capacity_bytes || span.bytes > capacity_bytes - span.offset ||
+            !fpga_attention_publish_bytes(base + uint32_t(span.offset), source.data() + span.offset/2, span.bytes)) {
+            mirror.complete(upload, false, error);
+            return fpga_attention::fail(error, "attention KV publication failed");
+        }
+        written_bytes += span.bytes;
+    }
+    return mirror.complete(upload, true, error);
+}
+
+static bool fpga_attention_scale_valid(uint16_t bits) {
+    // The engine emits nonnegative amax/127, encoded as IEEE binary16.
+    // Compare encodings, not VPU_FP16_MAX_FINITE (a floating point value).
+    return bits <= UINT16_C(0x7bff);
+}
+
+static bool fpga_attention_project_retained(const ggml_tensor * wo, ggml_tensor * dst, size_t query,
+                                           int layer, std::string & error) {
+    const size_t blocks = g_attention_handle.data_bytes/VPU_QK8_0;
+    std::vector<block_q8_0_t> scales_only(blocks); // qs are never packed or uploaded
+    if (!fpga_p2_ddr_sync(uint32_t(g_attention_handle.scales_offset), g_attention_handle.scales_bytes,
+                          true, "ATTENTION_SCALE_METADATA")) { return fpga_attention::fail(error, "attention scale visibility failed"); }
+    const volatile uint16_t * scales = reinterpret_cast<const volatile uint16_t *>(g_ddr + g_attention_handle.scales_offset);
+    for (size_t b = 0; b < blocks; ++b) {
+        const uint16_t bits = scales[b];
+        if (!fpga_attention_scale_valid(bits)) { return fpga_attention::fail(error, "invalid hardware Q8 scale metadata"); }
+        scales_only[b].d = bits;
+    }
+    fpga_stage_totals_t totals = {};
+    uint32_t tile_id = 0, weight_tile = 0;
+    std::vector<float> accum;
+    for (int64_t row0 = 0; row0 < wo->ne[1]; row0 += g_vpu_max_rows) {
+        const int rows = int(std::min<int64_t>(g_vpu_max_rows, wo->ne[1] - row0));
+        accum.assign(size_t(rows), 0.0f);
+        for (size_t block0 = 0; block0 < blocks;) {
+            const int group_blocks = packed_q8_group_blocks_for_rows(rows, int(blocks - block0));
+            if (group_blocks <= 0) { return fpga_attention::fail(error, "invalid retained Wo tile geometry"); }
+            fpga_tile_job_t job = {};
+            if (!fpga_prepare_q8_tile_job(job, wo, wo->data, scales_only.data() + block0,
+                                          row0, rows, int64_t(block0), group_blocks, 0,
+                                          weight_tile, nullptr, tile_id, int(tile_id & 1), &totals,
+                                          nullptr, WEIGHT_BASE, SPU_PARAM_BASE,
+                                          uint32_t(g_attention_handle.data_offset + block0*VPU_QK8_0)) ||
+                !fpga_submit_q8_tile_job(job, &totals, wo->name, layer, wo->ne[0], wo->ne[1], 1, 0) ||
+                !fpga_wait_and_drain_q8_tile_job(job, &totals, wo->name, layer, wo->ne[0], wo->ne[1], 1, 0) ||
+                !fpga_accumulate_pl_scaled_q8_tile_job(job, accum, &totals)) {
+                return fpga_attention::fail(error, "retained attention Wo P2 transfer/compute/retirement failed");
+            }
+            ++g_pl_scale_jobs; ++g_pl_scale_banks;
+            ++tile_id; ++weight_tile;
+            block0 += size_t(group_blocks);
+        }
+        for (int row = 0; row < rows; ++row) { store_dst_value(dst, row0 + row, int64_t(query), accum[size_t(row)]); }
+    }
+    return true;
+}
+
+static bool fpga_attention_compute(ggml_tensor * dst, uintptr_t identity, std::string & error) {
+    const size_t layer_plus_one = identity & 0xffffU;
+    const size_t nlayer = (identity >> 16) & 0x7fffU;
+    const bool v_transposed = (identity & (uintptr_t(1) << 31)) != 0;
+    if (identity > UINT32_MAX || layer_plus_one == 0 || layer_plus_one > nlayer || nlayer == 0 ||
+        !g_attention_admitted || !g_attention_enabled || !g_spu_q8_scale_stream_supported ||
+        !g_pingpong_scheduler_enabled || !dst || dst->type != GGML_TYPE_F32 || !dst->src[4]) {
+        return fpga_attention::fail(error, "invalid fused attention graph/host identity");
+    }
+    const size_t layer = layer_plus_one - 1;
+    fpga_attention::tensor_view q, k, v, mask, output;
+    if (!fpga_attention_view(dst->src[0], q, error) || !fpga_attention_view(dst->src[1], k, error) ||
+        !fpga_attention_view(dst->src[2], v, error) || !fpga_attention_view(dst->src[3], mask, error) ||
+        !fpga_attention_view(dst, output, error) || !fpga_attention::validate_view(output, error)) { return false; }
+    if (k.ne[1] <= 0 || k.ne[1] > attention_abi::MAX_N) { return fpga_attention::fail(error, "attention context exceeds ABI limit"); }
+    fpga_attention::packed_attention packed;
+    if (!fpga_attention::pack(q, k, v, v_transposed ? fpga_attention::value_layout::n_d_h_s :
+                              fpga_attention::value_layout::d_n_h_s, &mask, packed, error)) { return false; }
+    const ggml_tensor * wo = dst->src[4];
+    size_t weight_storage, weight_bytes;
+    if (wo->type != GGML_TYPE_Q8_0 || !ggml_is_contiguous(wo) ||
+        wo->ne[0] != int64_t(packed.d*packed.hq) || wo->ne[1] <= 0 || wo->ne[2] != 1 || wo->ne[3] != 1 ||
+        wo->nb[0] != sizeof(block_q8_0_t) ||
+        !fpga_attention_tensor_storage(wo, weight_storage, error) ||
+        !fpga_attention::checked_mul(size_t(wo->ne[0]/32), sizeof(block_q8_0_t), weight_bytes) ||
+        !fpga_attention::checked_mul(weight_bytes, size_t(wo->ne[1]), weight_bytes) || weight_bytes > weight_storage ||
+        dst->ne[0] != wo->ne[1] || dst->ne[1] != int64_t(packed.t) || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return fpga_attention::fail(error, "invalid plain Q8 Wo or destination storage");
+    }
+    if (!fpga_contract_validate_weight_scales(wo, wo->data, wo->name, int(layer)) ||
+        !fpga_attention_register_admission(error) || !fpga_enforce_p2_stream_mode("retained attention Wo")) { return false; }
+    fpga_attention_transport io;
+    if (!attention_abi::release(io, error) || !fpga_attention_prepare_pool(layer, nlayer, packed, error)) { return false; }
+    size_t kv_written = 0;
+    if (!fpga_attention_upload_kv(layer, packed, kv_written, error)) { return false; }
+    if (g_next_matmul_call_id == 0 || g_next_matmul_call_id == ULLONG_MAX) {
+        return fpga_attention::fail(error, "attention Wo telemetry identity exhausted");
+    }
+    g_active_matmul_call_id = g_next_matmul_call_id++;
+    g_active_matmul_graph_seq = g_current_seq_pos;
+    g_active_matmul_layer_id = int(layer);
+    g_active_matmul_shape_k = wo->ne[0]; g_active_matmul_shape_n = wo->ne[1];
+    g_active_matmul_shape_m = 1;
+    g_active_matmul_cpu_shadow = false; g_active_matmul_pingpong = true;
+    g_active_matmul_tensor_name = wo->name;
+    const auto & layout = g_attention_layouts[layer];
+    for (size_t query = 0; query < packed.t; ++query) {
+        if (g_attention_next_query == 0 || g_attention_next_query > UINT32_MAX) {
+            return fpga_attention::fail(error, "attention command tag exhausted");
+        }
+        const uint64_t query_id = g_attention_next_query++;
+        const uint64_t generation = g_attention_retained.begin(query_id);
+        if (generation == 0 || generation > UINT32_MAX) { return fpga_attention::fail(error, "attention generation exhausted"); }
+        attention_abi::command command;
+        command.tag = uint32_t(query_id); command.generation = uint32_t(generation);
+        command.d = uint32_t(packed.d); command.hq = uint32_t(packed.hq);
+        command.hkv = uint32_t(packed.hkv); command.n = uint32_t(packed.n);
+        command.k = attention_abi::DDR_BASE + layout.k_offset;
+        command.v = attention_abi::DDR_BASE + layout.v_offset;
+        if (!attention_abi::validate(command, g_ddr_map_size, error) ||
+            !fpga_attention_publish_bytes(attention_abi::Q_OFFSET, packed.q.data() + query*packed.hq*packed.d,
+                                           packed.hq*packed.d*sizeof(float)) ||
+            !fpga_attention_publish_bytes(attention_abi::MASK_OFFSET, packed.visible.data() + query*packed.n, packed.n) ||
+            !attention_abi::execute(io, command, g_ddr_map_size, g_ip_timeout_us, error)) { return false; }
+        g_attention_command = command;
+        if (!g_attention_retained.publish(generation, query_id, packed.d, packed.hq,
+                                          attention_abi::Q8_OFFSET, attention_abi::SCALE_OFFSET,
+                                          g_ddr_map_size, true, error) ||
+            !g_attention_retained.lookup(generation, query_id, g_attention_handle) ||
+            !fpga_attention_project_retained(wo, dst, query, int(layer), error) ||
+            !attention_abi::release(io, error)) { return false; }
+        g_attention_retained.invalidate();
+        g_attention_handle = fpga_attention::retained_q8_handle();
+    }
+    LOGI("ATTENTION_FPGA layer=%zu queries=%zu D=%zu Hq=%zu Hkv=%zu N=%zu kv_upload_bytes=%zu "
+         "route=attention_retained_q8_to_p2_wo full_attention_output_cpu_reads=0",
+         layer, packed.t, packed.d, packed.hq, packed.hkv, packed.n, kv_written);
+    return true;
+}
+
+void fpga_attention_wo_callback(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    // This GGML revision calls CUSTOM from every worker even when n_tasks=1
+    // was requested for planning. The graph's following barrier publishes dst.
+    if (ith != 0) { return; }
+    if (nth < 1 || !fpga_attention_requested()) {
+        fpga_fatal("invalid FPGA attention custom callback task/opt-in state");
+    }
+    if (fpga_init() != 0) { fpga_fatal("FPGA attention initialization failed; no CPU fallback"); }
+    pthread_mutex_lock(&g_mutex);
+    std::string error;
+    bool completed = false;
+    try { completed = fpga_attention_compute(dst, reinterpret_cast<uintptr_t>(userdata), error); }
+    catch (const std::exception & exception) { error = exception.what(); }
+    if (!completed) { fpga_attention_invalidate_host_state(); }
+    pthread_mutex_unlock(&g_mutex);
+    if (!completed) { fpga_fatal("FPGA attention/Wo failed: %s; no CPU fallback", error.c_str()); }
+}
+
 int fpga_init(void) {
     pthread_mutex_lock(&g_mutex);
     const bool weight_path_bench_requested = env_flag_enabled("FPGA_WEIGHT_PATH_BENCH");
@@ -8000,6 +8327,9 @@ int fpga_init(void) {
     // or change ZDMA ownership.  The marker intentionally uses only retained
     // host state, so re-entry itself performs no board access.
     if (g_fpga_init_complete) {
+        if (bool(fpga_attention_requested()) != g_attention_enabled) {
+            fpga_fatal("FPGA_ATTENTION cannot change after host initialization");
+        }
         if (g_weight_path_bench.passive_mapping) {
             if (!weight_path_bench_requested || dma_mapped || !vpu_mapped || !ddr_mapped) {
                 fpga_fatal("WEIGHT_PATH_BENCH_REENTRY_FAIL requested=%d dma_mapped=%d vpu_mapped=%d ddr_mapped=%d "
@@ -8028,6 +8358,10 @@ int fpga_init(void) {
             "FPGA_INIT_REENTRY_PARTIAL_FAIL init_complete=0 dma_mapped=%d vpu_mapped=%d ddr_mapped=%d "
             "action=fail_closed_no_config_mmio_dma_map_change",
             dma_mapped ? 1 : 0, vpu_mapped ? 1 : 0, ddr_mapped ? 1 : 0);
+    }
+    g_attention_enabled = fpga_attention_requested() != 0;
+    if (g_attention_enabled && (weight_path_bench_requested || fpga_source_audit_only_requested())) {
+        fpga_fatal("FPGA_ATTENTION requires hardware execution, not benchmark capture or source-audit mode");
     }
     if (!fpga_compute_watch_configure()) {
         fpga_fatal("Invalid FPGA compute watcher policy; initialization stopped before hardware mapping");
@@ -8448,8 +8782,26 @@ int fpga_init(void) {
     if (!configure_ddr_mapping_policy()) {
         fpga_fatal("DDR cache/mapping policy is invalid; refusing FPGA initialization");
     }
+    if (g_attention_enabled) {
+        if (!g_p2_init_requested || g_contract_check_limit || g_pl_scale_contract_check_limit ||
+            g_contract_cpu_shadow_dst || g_contract_raw_repair_enabled || g_weight_cache_budget_mb > 32) {
+            fpga_fatal("FPGA_ATTENTION requires production P2 and a weight region ending at or below DDR+0x03000000");
+        }
+        // The same reserved-memory/UIO-size preflight still admits this range.
+        // No larger mapping is requested when FPGA_ATTENTION is off.
+        g_ddr_requested_map_size = DDR_REGION_SIZE;
+        LOGINIT("ATTENTION_DDR_CONFIG requested_size=0x%zx pool_base=0x%08x", g_ddr_requested_map_size,
+                attention_abi::KV_POOL_OFFSET);
+    }
     if (!map_registers_dma_ddr()) {
         fpga_fatal("ZDMA DDR-to-IP FPGA init failed; refusing CPU fallback");
+    }
+    if (g_attention_enabled) {
+        std::string error;
+        fpga_attention_transport io;
+        if (!fpga_attention_register_admission(error) || !attention_abi::release(io, error)) {
+            fpga_fatal("FPGA attention admission failed before data-plane traffic: %s", error.c_str());
+        }
     }
     if (g_p2_init_requested &&
         g_ddr_mapping_kind != fpga_mapping_kind::UIO_PHYSICAL &&
@@ -8636,10 +8988,15 @@ int fpga_init(void) {
     if (g_p2_weight_residency_requested) {
         const size_t expected_map = (size_t) WEIGHT_CACHE_BASE +
                                     (size_t) g_p2_weight_residency_budget_mb * 1024U * 1024U;
+        // Attention owns a separate pool above the fixed residency window.
+        // A larger admitted mapping does not enlarge the weight cache budget.
+        const bool residency_mapping_fits = g_attention_enabled ?
+            (expected_map <= attention_abi::KV_POOL_OFFSET && g_ddr_map_size >= expected_map) :
+            g_ddr_map_size == expected_map;
         const bool residency_admitted = g_p2_init_requested && raw_fpga_compatible && p2_admission_compatible &&
                                         g_spu_q8_scale_stream_supported &&
                                         g_ddr_mapping_kind == fpga_mapping_kind::UIO_PHYSICAL &&
-                                        g_ddr_map_size == expected_map && g_ddr_advertised_size >= expected_map;
+                                        residency_mapping_fits && g_ddr_advertised_size >= expected_map;
         if (!residency_admitted) {
             fpga_fatal(
                 "P2 residency admission failed requested=1 map_kind=%s map_size=0x%zx expected_map=0x%zx "
@@ -8850,6 +9207,14 @@ int fpga_init(void) {
         "helper_owns=no_dma_no_vpu_no_spu_no_descriptor",
         g_p2_pack_workers_requested, g_p2_pack_workers_active, FPGA_P2_PACK_PARALLEL_MIN_BYTES);
 
+    if (g_attention_enabled) {
+        if (!g_spu_q8_scale_stream_supported || !g_pingpong_scheduler_enabled) {
+            fpga_fatal("FPGA attention requires admitted P2 scale stream and bank descriptors");
+        }
+        g_attention_admitted = true;
+        LOGINIT("ATTENTION_CONFIG enabled=1 abi=0x%08x retained_q8=1 max_n=%u", attention_abi::SIGNATURE,
+                attention_abi::MAX_N);
+    }
     g_fpga_init_complete = true;
     fpga_p2_init_breadcrumb("phase=ready route=%s init_data_plane=none pack_workers_requested=%d active=%d",
                             g_pl_scale_contract_check_limit > 0 ? "p2_tile_qualification" :
@@ -8867,6 +9232,14 @@ void fpga_cleanup(void) {
         return;
     }
     g_cleanup_done = true;
+    if (g_attention_admitted && vpu_is_mapped()) {
+        std::string error;
+        fpga_attention_transport io;
+        if (!attention_abi::release(io, error)) { fpga_fatal("attention cleanup leaves mappings owned: %s", error.c_str()); }
+    }
+    fpga_attention_invalidate_host_state();
+    g_attention_layers.clear(); g_attention_layouts.clear();
+    g_attention_admitted = false;
     fpga_compute_watch_shutdown();
     LOGPROOF(
         "cleanup begin lifecycle=explicit-before-backend-free ddr_mapped=%d vpu_mapped=%d dma_mapped=%d "
@@ -9580,11 +9953,19 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
 }
 
 extern "C" void fpga_reset_kv_cache(void) {
+    pthread_mutex_lock(&g_mutex);
+    if (g_attention_admitted && vpu_is_mapped()) {
+        std::string error;
+        fpga_attention_transport io;
+        if (!attention_abi::release(io, error)) { fpga_fatal("attention reset failed: %s", error.c_str()); }
+    }
+    fpga_attention_invalidate_host_state();
     if (g_token_timing_collection_enabled && g_token_timing.active) {
         fpga_token_timing_emit(g_token_timing.graph_seq, 0, "kv_cache_reset_incomplete", monotonic_now_us());
     }
     g_current_seq_pos                = 0;
     g_scratch.activation_cache_valid = false;
+    pthread_mutex_unlock(&g_mutex);
 }
 
 // Private implementation body for fpga_host.cpp. This file is deliberately
@@ -9910,7 +10291,8 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
                                      fpga_stage_totals_t *             totals,
                                      fpga_prompt_weight_staging_t *    staging,
                                      uint32_t                          weight_stage_off,
-                                     uint32_t                          scale_stage_off) {
+                                     uint32_t                          scale_stage_off,
+                                     uint32_t                          retained_act_src_off) {
     const bool reuse_direct_weight = staging && staging->valid &&
         staging->src0 == src0 && staging->data == weight_data_base && staging->ddr == g_ddr &&
         staging->row0 == row0 && staging->rows == rows && staging->k_block0 == k_block0 &&
@@ -9946,6 +10328,11 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
     const size_t result_bytes     = (size_t) result_words * 16U;
     const size_t scale_bytes      = (size_t) result_words * 16U;
     const size_t spu_result_bytes = (size_t) rows * 16U;
+    if (retained_act_src_off != 0 &&
+        (!act_group || !fpga_attention_retained_dma_source(DDR_BASE_PHYS + retained_act_src_off, act_bytes))) {
+        LOGE("retained attention activation rejected before P2 preparation");
+        return false;
+    }
     if (!range_fits(ACT_BASE, act_bytes, ACT_BASE, ACT_END) ||
         !range_fits(WEIGHT_BASE, weight_bytes, WEIGHT_BASE, WEIGHT_END) ||
         !range_fits(RESULT_BASE, result_bytes, RESULT_BASE, RESULT_END) ||
@@ -9999,6 +10386,8 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
     job.scale_words      = result_words;
     job.weight_src_off   = weight_stage_off;
     job.scale_src_off    = scale_stage_off;
+    job.retained_activation = retained_act_src_off != 0;
+    job.retained_act_src_off = retained_act_src_off;
     job.p2_residency_slot = P2_WEIGHT_RESIDENCY_NO_SLOT;
     job.act_group        = act_group;
     job.src0             = src0;
@@ -10338,7 +10727,7 @@ static bool fpga_prepare_q8_tile_job(fpga_tile_job_t &                 job,
     }
 
     const long long act_pack0 = now_us();
-    for (int gb = 0; gb < group_blocks; ++gb) {
+    for (int gb = 0; !job.retained_activation && gb < group_blocks; ++gb) {
         const block_q8_0_t & act = act_group[gb];
         for (int beat = 0; beat < VPU_BLOCK_BEATS; ++beat) {
             const uint32_t word_index = (uint32_t) gb * (uint32_t) VPU_BLOCK_BEATS + (uint32_t) beat;

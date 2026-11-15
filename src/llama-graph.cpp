@@ -9,12 +9,17 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
 
+#ifdef USE_FPGA
+#include "../ggml/src/ggml-cpu/fpga_host.h"
+#endif
+
 #include<chrono> 
 #include<map> 
 #include<string> 
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
 
 // bien toan cuc luu tru thoi gian
@@ -579,6 +584,16 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
+#ifdef USE_FPGA
+        if (fpga_attention_requested() && arch != LLM_ARCH_GEMMA3) {
+            GGML_ABORT("FPGA_ATTENTION=1 supports only the Gemma3 ISWA attention graph");
+        }
+#else
+        const char * fpga_attention = std::getenv("FPGA_ATTENTION");
+        if (fpga_attention && fpga_attention[0] && std::strcmp(fpga_attention, "0") != 0) {
+            GGML_ABORT("FPGA_ATTENTION requires a USE_FPGA=ON build");
+        }
+#endif
         res->set_params(params);
     }
 
@@ -1314,6 +1329,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
                float   kq_scale,
                  int   il) const {
+#ifdef USE_FPGA
+    if (fpga_attention_requested()) {
+        GGML_ABORT("FPGA_ATTENTION=1 reached an unsupported attention graph; no CPU fallback");
+    }
+#endif
       // ======================== TINH TOAN THOI GIAN THUC THI CUA BUILD_ATTN_NHA ====================
       auto start_attn = std::chrono::steady_clock::now();
 
@@ -1647,6 +1667,39 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+#ifdef USE_FPGA
+    if (fpga_attention_requested()) {
+        if (arch != LLM_ARCH_GEMMA3 || !wo || wo->type != GGML_TYPE_Q8_0 || !ggml_is_contiguous(wo) ||
+            wo_b || kq_b || sinks || v_mla || (loras && !loras->empty()) || hparams.attn_soft_cap ||
+            hparams.f_max_alibi_bias != 0.0f || kq_scale != 1.0f ||
+            q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+            !kq_mask || (kq_mask->type != GGML_TYPE_F32 && kq_mask->type != GGML_TYPE_F16) ||
+            q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
+            q->ne[0] <= 0 || q->ne[0] > 256 || q->ne[0] % 32 ||
+            q->ne[1] <= 0 || q->ne[1] > 4 || k->ne[1] <= 0 || k->ne[1] > 4 ||
+            q->ne[1] % k->ne[1] || wo->ne[0] != q->ne[0]*q->ne[1] ||
+            wo->ne[2] != 1 || wo->ne[3] != 1 || n_layer == 0 || n_layer > 0x7fff ||
+            il < 0 || uint32_t(il) >= n_layer) {
+            GGML_ABORT("FPGA_ATTENTION=1 unsupported Gemma3 attention/Wo contract; no CPU fallback");
+        }
+        const bool v_transposed = v->nb[1] > v->nb[2];
+        // Preserve the same post-permute views used by native attention. CPU
+        // cache writes above are already expanded before this fused consumer.
+        q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+        const uintptr_t identity = (uintptr_t(n_layer) << 16) | uintptr_t(il + 1) |
+                                   (v_transposed ? uintptr_t(1) << 31 : 0);
+        ggml_tensor * args[] = { q, k, v, kq_mask, wo };
+        ggml_tensor * cur = ggml_custom_4d(ctx0, GGML_TYPE_F32, wo->ne[1], q->ne[1], 1, 1,
+                                          args, 5, fpga_attention_wo_callback, 1, reinterpret_cast<void *>(identity));
+        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+        cb(cur, "fpga_attention_wo", il);
+        ggml_build_forward_expand(gf, cur);
+        return cur;
+    }
+#endif
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);

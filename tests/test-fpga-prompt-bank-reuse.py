@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
 """Exercise the production P2 scheduler with RAM-only hardware stubs."""
 
+import math
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import time
+
+
+timeout_setting = os.environ.get("FPGA_SCHED_TEST_TIMEOUT_SECONDS", "90")
+try:
+    execution_timeout = float(timeout_setting)
+except ValueError:
+    raise SystemExit("FPGA_SCHED_TEST_TIMEOUT_SECONDS must be a positive finite number")
+if not math.isfinite(execution_timeout) or execution_timeout <= 0:
+    raise SystemExit("FPGA_SCHED_TEST_TIMEOUT_SECONDS must be a positive finite number")
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +51,14 @@ release = extract_definition("static bool fpga_release_pl_scaled_q8_tile_job(")
 accumulate = extract_definition("static bool fpga_accumulate_pl_scaled_q8_tile_job(")
 residency_align = extract_definition("static bool fpga_p2_residency_align_up(")
 residency_end = extract_definition("static bool fpga_p2_residency_range_end(")
+invalidate = extract_definition("static void fpga_p2_dma_pipeline_invalidate(")
+scope_guard = extract_definition("struct fpga_p2_dma_pipeline_scope_guard") + ";"
+# Observe even successful no-op admissions without replacing scheduler logic.
+assert scheduler.count("const auto admit_next_tile = [&](const fpga_tile_job_t & current) {") == 1
+scheduler = scheduler.replace(
+    "const auto admit_next_tile = [&](const fpga_tile_job_t & current) {",
+    "const auto admit_next_tile = [&](const fpga_tile_job_t & current) { observe_admission(current);",
+)
 
 # Keep the test tied to the production handoff order.  Runtime assertions below
 # execute the extracted scheduler; these guards only make an accidental source
@@ -221,7 +241,8 @@ void fpga_fatal(const char *, ...) { assert(false); }
 void mmio_fence() {}
 
 long long operations = 0, fail_at = 0;
-bool step() { return ++operations != fail_at; }
+bool failed = false;
+bool step() { assert(!failed); failed = ++operations == fail_at; return !failed; }
 bool dma_success = true;
 int active = -1, loads = 0, activations = 0, scales = 0, launches = 0, reused = 0;
 long long pending_result = -1;
@@ -241,6 +262,36 @@ std::vector<int> reads, stores;
 Key banks[2];
 bool valid[2] = {};
 Key key(const fpga_tile_job_t & j) { return {j.row0, j.rows, j.k_block0, j.group_blocks}; }
+
+struct Event { const char * name; uint32_t tile; bool pending; int active_bank; };
+std::vector<Event> events;
+uint64_t next_generation = 0, pending_generation = 0;
+int helper_submissions = 0, helper_completions = 0;
+fpga_tile_job_t * active_job = nullptr;
+fpga_tile_job_t active_snapshot;
+fpga_tile_job_t admission_current;
+bool stale_consume = false;
+void event(const char * name, uint32_t tile) {
+    events.push_back({name, tile, pending_generation != 0, active});
+}
+void observe_admission(const fpga_tile_job_t & current) {
+    event("attempt", current.tile_id);
+    admission_current = current;
+    assert(!pending_generation);
+}
+bool fpga_p2_pack_worker_wait(uint64_t generation, size_t * words, long long * service,
+                              long long * wait, size_t * entries = nullptr) {
+    assert(generation != 0 && generation == pending_generation);
+    event("join", (uint32_t) generation);
+    pending_generation = 0;
+    ++helper_completions;
+    *words = 0; *service = 0; *wait = 0;
+    if (entries) *entries = 0;
+    return true;
+}
+'''
+harness += invalidate + "\n" + scope_guard
+harness += r'''
 
 size_t allocation_bytes(int rows, int blocks) {
     const size_t weights = ((size_t) rows + 1U) / 2U * (size_t) blocks * 64U;
@@ -274,9 +325,6 @@ bool fpga_p2_dma_pipeline_geometry(size_t rows, size_t groups, int beats, size_t
     return *pairs > 0 && *weight_bytes > 0 && *scale_bytes > 0;
 }
 bool fpga_p2_dma_pipeline_slot_ranges(uint32_t, uint32_t, size_t, size_t) { return true; }
-void fpga_p2_dma_pipeline_invalidate(fpga_p2_dma_pipeline_lookahead_t * lookahead) {
-    if (lookahead) { lookahead->valid = false; lookahead->worker_submitted = false; lookahead->consumed = false; }
-}
 
 bool fpga_p2_residency_contains(const ggml_tensor *, int64_t, int, int64_t, int, int, size_t) {
     return pipeline_resident;
@@ -286,11 +334,28 @@ bool fpga_p2_dma_pipeline_admit(fpga_p2_dma_pipeline_lookahead_t & lookahead, co
                                 const void * weight_data_base, const block_q8_0_t * act_group, int64_t row0,
                                 int rows, int64_t k_block0, int groups, int64_t col, uint32_t tile_id, int bank,
                                 fpga_stage_totals_t * totals, uint32_t weight_src_off, uint32_t scale_src_off) {
+    event("admit", tile_id);
+    if (!step()) return false;
+    assert(!pending_generation);
+    if (active_job && active != -1) {
+        assert(&lookahead.job != active_job && bank == active);
+        assert(key(*active_job) == key(active_snapshot) && active_job->job_id == active_snapshot.job_id);
+    }
+    assert(weight_src_off == WEIGHT_BASE + (tile_id & 1U) * P2_PIPELINE_WEIGHT_SLOT_BYTES);
+    assert(scale_src_off == SPU_PARAM_BASE + (tile_id & 1U) * P2_PIPELINE_SCALE_SLOT_BYTES);
+    assert(bank != admission_current.bank);
+    assert(weight_src_off + P2_PIPELINE_WEIGHT_SLOT_BYTES <= admission_current.weight_src_off ||
+           admission_current.weight_src_off + admission_current.weight_bytes <= weight_src_off);
+    assert(scale_src_off + P2_PIPELINE_SCALE_SLOT_BYTES <= admission_current.scale_src_off ||
+           admission_current.scale_src_off + admission_current.scale_bytes <= scale_src_off);
     size_t weight_bytes = 0, scale_bytes = 0, pairs = 0, words = 0, entries = 0;
     if (!fpga_p2_dma_pipeline_geometry((size_t) rows, (size_t) groups, groups * VPU_BLOCK_BEATS,
                                         &weight_bytes, &scale_bytes, &pairs, &words, &entries)) return false;
     lookahead = {};
     lookahead.valid = true;
+    lookahead.worker_submitted = true;
+    lookahead.generation = pending_generation = ++next_generation;
+    ++helper_submissions;
     lookahead.source_epoch = g_p2_weight_residency_epoch;
     lookahead.pair_count = pairs;
     lookahead.helper_pair_begin = pairs / 2U;
@@ -336,6 +401,9 @@ bool fpga_p2_dma_pipeline_consume(fpga_p2_dma_pipeline_lookahead_t & lookahead, 
                                   fpga_stage_totals_t * totals, const ggml_tensor * src0, const void * weights,
                                   int64_t row0, int rows, int64_t k_block0, int groups, int64_t col,
                                   uint32_t tile_id) {
+    event("consume", tile_id);
+    if (!step()) return false;
+    if (stale_consume) ++lookahead.source_epoch;
     if (!lookahead.valid || lookahead.consumed || lookahead.worker_submitted || lookahead.totals != totals ||
         lookahead.source_epoch != g_p2_weight_residency_epoch || lookahead.job.src0 != src0 ||
         lookahead.weight_data_base != weights || lookahead.job.row0 != row0 || lookahead.job.rows != rows ||
@@ -351,6 +419,8 @@ bool fpga_p2_dma_pipeline_consume(fpga_p2_dma_pipeline_lookahead_t & lookahead, 
     return true;
 }
 bool fpga_p2_dma_pipeline_prepare_activation(fpga_tile_job_t & job, fpga_stage_totals_t *) {
+    event("act", job.tile_id);
+    if (!step()) return false;
     assert(active == -1);
     assert(expected_pipeline_act_base != nullptr);
     assert(job.act_group == expected_pipeline_act_base + job.k_block0);
@@ -360,18 +430,18 @@ bool fpga_p2_dma_pipeline_prepare_activation(fpga_tile_job_t & job, fpga_stage_t
     return true;
 }
 bool fpga_p2_dma_pipeline_finalize(fpga_p2_dma_pipeline_lookahead_t & lookahead) {
+    event("finalize", lookahead.job.tile_id);
+    if (!step()) return false;
     if (!lookahead.valid || lookahead.consumed) return false;
+    assert(lookahead.worker_submitted && pending_generation == lookahead.generation);
+    assert(pending_result == -1);
+    size_t words = 0; long long service = 0, wait = 0;
+    assert(fpga_p2_pack_worker_wait(lookahead.generation, &words, &service, &wait));
     ++pipeline_finalized;
     lookahead.worker_submitted = false;
     return true;
 }
 bool fpga_p2_dma_pipeline_poll(void *, long long) { return true; }
-struct fpga_p2_dma_pipeline_scope_guard {
-    fpga_p2_dma_pipeline_lookahead_t * lookahead;
-    ~fpga_p2_dma_pipeline_scope_guard() {
-        if (lookahead && (lookahead->valid || lookahead->worker_submitted)) fpga_p2_dma_pipeline_invalidate(lookahead);
-    }
-};
 
 void store_dst_value(const ggml_tensor *, int64_t row, int64_t col, float value) {
     assert(row >= 0 && row < test_rows && col >= 0 && col < test_columns);
@@ -386,6 +456,7 @@ int64_t raw_result(int64_t row, int64_t col, int64_t block) {
     return base + ((row * 100 + col * 10 + block + 1) << 16);
 }
 int64_t ddr_read_spu_q16_row(uint32_t off, uint16_t * row_id) {
+    event("read", returned.tile_id);
     assert(pending_result == returned.job_id);
     const unsigned row = (off - SPU_OUT_BASE) / 16U;
     assert(row < (unsigned) returned.rows);
@@ -440,6 +511,7 @@ bool fpga_prepare_q8_tile_job(fpga_tile_job_t & job, const ggml_tensor * src0, c
                               int64_t col, uint32_t, const fpga_weight_cache_entry_t *, uint32_t id, int bank,
                               fpga_stage_totals_t *, fpga_prompt_weight_staging_t *, uint32_t weight_stage_off,
                               uint32_t scale_stage_off) {
+    event("prepare", id);
     if (!step()) return false;
     assert(bank != active);
     if (row0 > 0 && ib0 == 0 && col == 0) {
@@ -477,6 +549,10 @@ bool fpga_prepare_q8_tile_job(fpga_tile_job_t & job, const ggml_tensor * src0, c
 }
 bool fpga_wait_and_drain_q8_tile_job(fpga_tile_job_t & job, fpga_stage_totals_t *, const char *, int,
                                      int64_t, int64_t, int64_t, int) {
+    event("drain", job.tile_id);
+    assert(&job == active_job && key(job) == key(active_snapshot));
+    assert(job.job_id == active_snapshot.job_id && job.weight_src_off == active_snapshot.weight_src_off &&
+           job.scale_src_off == active_snapshot.scale_src_off);
     if (!step()) return false;
     assert(active == job.bank);
     assert(pending_result == -1);
@@ -490,6 +566,7 @@ bool fpga_wait_and_drain_q8_tile_job(fpga_tile_job_t & job, fpga_stage_totals_t 
     return true;
 }
 bool fpga_write_post_spu_descriptor(const fpga_tile_job_t & job, int, int, unsigned, const char *, bool, bool force) {
+    event("release", job.tile_id);
     if (!step()) return false;
     assert(active == job.bank);
     assert(job.output_dma_ready);
@@ -500,6 +577,7 @@ bool fpga_write_post_spu_descriptor(const fpga_tile_job_t & job, int, int, unsig
 }
 bool fpga_submit_q8_tile_job(fpga_tile_job_t & job, fpga_stage_totals_t *, const char *, int,
                              int64_t, int64_t, int64_t, int, const fpga_dma_poll_hook_t * poll_hook) {
+    event("submit", job.tile_id);
     if (!step()) return false;
     assert(active == -1);
     assert(transfer(job));
@@ -509,6 +587,8 @@ bool fpga_submit_q8_tile_job(fpga_tile_job_t & job, fpga_stage_totals_t *, const
     ++launches;
     reused += job.weight_bank_reused ? 1 : 0;
     active = job.bank;
+    active_job = &job;
+    active_snapshot = job;
     return true;
 }
 void fpga_log_prompt_weight_reuse(const char *, int64_t, long long jobs, uint64_t bytes) {
@@ -521,6 +601,8 @@ harness += release + "\n" + accumulate + "\n" + scheduler
 harness += r'''
 
 bool run_legacy(int columns, bool overlap, int failure, int rows = 7, int blocks = 5, int cache = 0) {
+    assert(pending_generation == 0);
+    failed = false; events.clear(); active_job = nullptr;
     active = -1; valid[0] = valid[1] = false;
     loads = activations = scales = launches = reused = 0;
     operations = 0; fail_at = failure; logged_jobs = -1; logged_bytes = 0;
@@ -583,18 +665,24 @@ bool run_legacy(int columns, bool overlap, int failure, int rows = 7, int blocks
     return ok;
 }
 
-bool run_pipeline_case(int rows, int blocks, bool enabled, bool resident) {
+bool run_pipeline_case(int rows, int blocks, bool enabled, bool resident, int failure = 0,
+                       bool stale = false, bool overlap = true) {
+    assert(pending_generation == 0);
+    failed = false; events.clear(); active_job = nullptr;
+    helper_submissions = helper_completions = 0;
+    stale_consume = stale;
     active = -1; valid[0] = valid[1] = false;
     loads = activations = scales = launches = reused = 0;
-    operations = 0; fail_at = 0; pending_result = -1; consumed_jobs = 0;
+    operations = 0; fail_at = failure; pending_result = -1; consumed_jobs = 0;
     overlap_reads = release_writes = 0; prepared_order.clear(); consumed_order.clear();
     pipeline_admitted_k.clear(); pipeline_consumed_k.clear(); pipeline_activation_k.clear();
     pipeline_admitted_rows.clear(); pipeline_consumed_rows.clear(); pipeline_finalized = 0;
     pipeline_resident = resident;
     test_columns = 1; test_rows = rows; test_blocks = blocks;
     g_vpu_max_rows = 256; max_blocks = 64;
+    g_packed_q8_max_blocks = 64; g_packed_q8_result_words = 4096;
     g_p2_pack_dma_pipeline_enabled = enabled;
-    g_p2_result_overlap_enabled = true;
+    g_p2_result_overlap_enabled = overlap;
     g_vpu_descriptor_supported = true;
     g_p2_weight_residency_enabled = resident;
     g_p2_residency_next_slot = 0;
@@ -616,7 +704,30 @@ bool run_pipeline_case(int rows, int blocks, bool enabled, bool resident) {
     fpga_stage_totals_t totals = {};
     const bool ok = fpga_hw_q8_0_matmul_dma_to_ip_pipelined(
         &tensor, &tensor, acts, act_scales, nullptr, &totals, "pipeline", 0, blocks * 32, rows, 1, blocks, values);
-    assert(ok);
+    assert(pending_generation == 0 && helper_submissions == helper_completions);
+    if (failure || stale) {
+        assert(!ok);
+        return false;
+    }
+    assert(ok && !failed);
+    // Each consumed B with a running A attempts C exactly once, before A's
+    // drain, even when final/tail/row-carry exclusions make admission a no-op.
+    for (size_t i = 0; i < events.size(); ++i) {
+        if (std::strcmp(events[i].name, "consume") != 0) continue;
+        const uint32_t b = events[i].tile;
+        size_t attempt = events.size(), drain = events.size(), act = events.size();
+        int attempts = 0;
+        for (size_t j = i + 1; j < events.size(); ++j) {
+            if (events[j].tile == b && std::strcmp(events[j].name, "attempt") == 0) {
+                attempt = j; ++attempts;
+            }
+            if (events[j].tile + 1 == b && std::strcmp(events[j].name, "drain") == 0) drain = j;
+            if (events[j].tile == b && std::strcmp(events[j].name, "act") == 0) act = j;
+        }
+        assert(attempts == 1 && act < events.size());
+        if (events[i].active_bank != -1) assert(attempt < drain && drain < act);
+        else assert(act < attempt);
+    }
     assert(active == -1 && pending_result == -1 && consumed_jobs == launches && release_writes == launches);
     for (int count : stores) assert(count == 1);
     if (!enabled || resident) {
@@ -640,6 +751,16 @@ int main() {
     assert(!weight_transfer(job));
     dma_success = true;
     int cases = 0;
+    const char * phase = "legacy sweep";
+    const auto report_progress = [&]() {
+        std::fprintf(stderr, "scheduler phase=%s completed counted cases=%d\n", phase, cases);
+        std::fflush(stderr);
+    };
+    const auto completed_case = [&]() {
+        ++cases;
+        if (cases % 4096 == 0) report_progress();
+    };
+    report_progress();
     configured_max_rows = 3;
     configured_max_blocks = 2;
     for (bool descriptors : {false, true}) {
@@ -647,17 +768,19 @@ int main() {
         for (bool overlap : {false, true}) for (int columns : {1, 2, 3, 4, 5, 46})
         for (int blocks : {1, 2, 5})
         for (int cache : {0, 1, 2, 3, 4, 5, 6}) {
-            assert(run_legacy(columns, overlap, 0, 7, blocks, cache)); ++cases;
+            assert(run_legacy(columns, overlap, 0, 7, blocks, cache)); completed_case();
             const int count = (int) operations;
             for (int fail = 1; fail <= count; ++fail) {
-                assert(!run_legacy(columns, overlap, fail, 7, blocks, cache)); ++cases;
+                assert(!run_legacy(columns, overlap, fail, 7, blocks, cache)); completed_case();
             }
-            assert(run_legacy(columns, overlap, 0, 7, blocks, cache)); ++cases;
+            assert(run_legacy(columns, overlap, 0, 7, blocks, cache)); completed_case();
         }
     }
 
     // Retain the production Gemma geometry check from the original test:
     // 85 jobs/layer and 78 cross-row opportunities with descriptor overlap.
+    phase = "Gemma geometry";
+    report_progress();
     configured_max_rows = 256;
     configured_max_blocks = 64;
     configured_descriptor = true;
@@ -670,22 +793,26 @@ int main() {
             handoffs += overlap_reads;
         }
         assert(jobs * 26 == 2210 && handoffs * 26 == (overlap ? 2028 : 0));
-        ++cases;
+        completed_case();
     }
 
     // Boundary sweep for full rows, odd rows, small tails, and residency
     // capacity decisions.  Pipeline is disabled here so this remains the
     // original scheduler/cache regression.
+    phase = "boundary sweep";
+    report_progress();
     for (int rows : {1, 255, 256, 257, 512, 513, 769})
         for (int blocks : {1, 36, 64, 65, 216})
             for (int cache : {0, 1, 2, 3, 4, 5, 6}) {
                 assert(run_legacy(1, true, 0, rows, blocks, cache));
-                ++cases;
+                completed_case();
             }
 
     // Production scheduler cases with the opt-in P2 pipeline enabled.  These
     // assertions observe real scheduler admission/consume calls, not a tile
     // model or a copied loop.
+    phase = "pipeline cases";
+    report_progress();
     assert(run_pipeline_case(512, 1152 / 32, true, false));
     assert(!pipeline_consumed_rows.empty());
     assert(std::find(pipeline_consumed_rows.begin(), pipeline_consumed_rows.end(), 256) != pipeline_consumed_rows.end());
@@ -731,7 +858,43 @@ int main() {
     assert(pipeline_consumed_k.size() == 3);
     for (size_t i = 0; i < pipeline_admitted_rows.size(); ++i) assert(pipeline_admitted_rows[i] < 256);
 
-    std::printf("PASS: %d legacy scheduler cases; production pipeline rows/K transitions, disabled/resident/small-tail admission\n", cases);
+    // With row carry disabled, admission stops at each row boundary. K-group
+    // overlap still exercises an early successful no-op on the final group.
+    assert(run_pipeline_case(512, 216, true, false, 0, false, false));
+    assert(pipeline_admitted_k.size() == 6);
+    assert(run_pipeline_case(256, 216, true, false, 0, true) == false);
+    assert(helper_submissions == 1 && helper_completions == 1 && launches == 1);
+
+    // Sweep every fallible operation with the pipeline active, including
+    // admission/consume/ACT/finalize and all A result reads. Cleanup executes
+    // production invalidation and the production scope guard. step() rejects
+    // any later operation (including a launch) after the injected failure.
+    phase = "pipeline failure sweep";
+    report_progress();
+    assert(run_pipeline_case(259, 216, true, false));
+    const int pipeline_operations = (int) operations;
+    bool pending_drain = false, pending_release = false, pending_act = false;
+    bool pending_submit = false, pending_finalize = false, failed_early_admit = false;
+    for (int failure = 1; failure <= pipeline_operations; ++failure) {
+        assert(!run_pipeline_case(259, 216, true, false, failure));
+        // Cleanup may append a join, so locate the last operation event.
+        size_t last = events.size();
+        while (last && std::strcmp(events[last - 1].name, "join") == 0) --last;
+        assert(last);
+        const Event & e = events[last - 1];
+        pending_drain |= e.pending && std::strcmp(e.name, "drain") == 0;
+        pending_release |= e.pending && std::strcmp(e.name, "release") == 0;
+        pending_act |= e.pending && std::strcmp(e.name, "act") == 0;
+        pending_submit |= e.pending && e.tile > 0 && std::strcmp(e.name, "submit") == 0;
+        pending_finalize |= e.pending && e.tile >= 2 && std::strcmp(e.name, "finalize") == 0;
+        failed_early_admit |= e.active_bank != -1 && std::strcmp(e.name, "admit") == 0;
+        completed_case();
+    }
+    assert(pending_drain && pending_release && pending_act && pending_submit && pending_finalize && failed_early_admit);
+    phase = "complete";
+    report_progress();
+
+    std::printf("PASS: %d scheduler cases; early helper order, pending-helper cleanup, stale consume, rows/K/tails, disabled/resident paths\n", cases);
 }
 '''
 
@@ -739,9 +902,23 @@ with tempfile.TemporaryDirectory(prefix="fpga-bank-reuse-") as directory:
     cpp = Path(directory) / "test.cpp"
     exe = Path(directory) / "test"
     cpp.write_text(harness)
-    subprocess.run([
-        os.environ.get("CXX", "c++"), "-std=c++17", "-O1", "-Wall", "-Wextra",
-        "-fsanitize=undefined", "-fno-sanitize-recover=all", "-I" + str(ROOT / "ggml/src/ggml-cpu"),
-        str(cpp), str(ROOT / "ggml/src/ggml-cpu/fpga_q8_layout.cpp"), "-o", str(exe)
-    ], check=True, timeout=90)
-    subprocess.run([str(exe)], check=True, timeout=90)
+    compile_start = time.monotonic()
+    print("scheduler compile start: budget=90s", file=sys.stderr, flush=True)
+    try:
+        subprocess.run([
+            os.environ.get("CXX", "c++"), "-std=c++17", "-O1", "-Wall", "-Wextra",
+            "-fsanitize=undefined", "-fno-sanitize-recover=all", "-I" + str(ROOT / "ggml/src/ggml-cpu"),
+            str(cpp), str(ROOT / "ggml/src/ggml-cpu/fpga_q8_layout.cpp"), "-o", str(exe)
+        ], check=True, timeout=90)
+    finally:
+        print(f"scheduler compile end: elapsed={time.monotonic() - compile_start:.3f}s",
+              file=sys.stderr, flush=True)
+    execution_start = time.monotonic()
+    print(f"scheduler execution start: budget={execution_timeout:g}s", file=sys.stderr, flush=True)
+    try:
+        subprocess.run([str(exe)], check=True, timeout=execution_timeout)
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f"scheduler execution exceeded budget={execution_timeout:g}s; no PASS")
+    finally:
+        print(f"scheduler execution end: budget={execution_timeout:g}s "
+              f"elapsed={time.monotonic() - execution_start:.3f}s", file=sys.stderr, flush=True)

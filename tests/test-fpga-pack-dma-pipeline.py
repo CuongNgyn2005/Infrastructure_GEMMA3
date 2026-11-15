@@ -213,6 +213,24 @@ static uint64_t g_p2_pack_dma_pipeline_callback_bytes = 0;
 static long long g_p2_pack_dma_pipeline_callback_us = 0;
 static long long g_p2_pack_dma_pipeline_consumed_jobs = 0;
 
+// Measurement stubs are observers only: do not advance the host clock or
+// change the synthetic registers used by the production wait-loop checks.
+static unsigned profile_pack_begins = 0, profile_pack_ends = 0, profile_productive = 0;
+static unsigned profile_finalizes = 0;
+static std::vector<unsigned> profile_observations;
+static void fpga_dma_profile_observe(bool error, bool done, bool enabled) {
+    profile_observations.push_back((error ? 4U : 0U) | (done ? 2U : 0U) | (enabled ? 1U : 0U));
+}
+static void fpga_dma_profile_pack_begin() { ++profile_pack_begins; }
+static void fpga_dma_profile_pack_end(bool ok, size_t before, size_t after) {
+    ++profile_pack_ends;
+    if (ok && after > before) ++profile_productive;
+}
+static void fpga_dma_profile_finalize_begin() {}
+static void fpga_dma_profile_finalize_end(long long, long long, long long, size_t, size_t) {
+    ++profile_finalizes;
+}
+
 static bool dma_is_mapped() { return g_dma != nullptr && g_dma_map_base != nullptr; }
 static long long now_us() { return ++g_clock; }
 static void mmio_fence() { ++g_fences; }
@@ -535,11 +553,13 @@ static void test_completion_telemetry() {
     const long long lead_before_failure = g_p2_pack_dma_pipeline_helper_publication_lead_us;
     const long long early_before_failure = g_p2_pack_dma_pipeline_helper_early_completions;
     const long long wait_before_failure = g_p2_pack_dma_pipeline_helper_wait_us;
+    const unsigned finalizes_before_failure = profile_finalizes;
     g_mono_clock = 500;
     assert(!run_finalize(1, false));
     assert(g_p2_pack_dma_pipeline_helper_publication_lead_us == lead_before_failure);
     assert(g_p2_pack_dma_pipeline_helper_early_completions == early_before_failure);
     assert(g_p2_pack_dma_pipeline_helper_wait_us == wait_before_failure);
+    assert(profile_finalizes == finalizes_before_failure);
 }
 
 static void test_real_poll_and_cleanup() {
@@ -560,10 +580,18 @@ static void test_real_poll_and_cleanup() {
     lookahead.generation = 7;
     g_p2_pack_dma_pipeline_callback_bytes = 0;
     g_p2_pack_dma_pipeline_callback_us = 0;
+    profile_pack_begins = profile_pack_ends = profile_productive = 0;
     while (lookahead.main_pair_next < lookahead.helper_pair_begin)
         assert(fpga_p2_dma_pipeline_poll(&lookahead, 1));
     assert(lookahead.main_pair_next == lookahead.helper_pair_begin);
     assert(lookahead.callback_bytes > 0 && g_p2_pack_dma_pipeline_callback_bytes == lookahead.callback_bytes);
+    assert(profile_productive > 0 && profile_productive == profile_pack_begins &&
+           profile_pack_begins == profile_pack_ends);
+    const unsigned productive_before_noop = profile_productive;
+    assert(fpga_p2_dma_pipeline_poll(&lookahead, 1));
+    assert(profile_pack_begins == productive_before_noop && profile_pack_ends == productive_before_noop);
+    assert(!fpga_p2_dma_pipeline_poll(nullptr, 1));
+    assert(profile_pack_begins == productive_before_noop);
 
     lookahead.valid = true;
     lookahead.main_pair_next = 0;
@@ -660,6 +688,7 @@ static void reset_dma() {
     g_clock = 0;
     g_dma_timeout_us = 100;
     g_log_errors = g_dump_count = 0;
+    profile_observations.clear();
 }
 static int g_hook_calls = 0;
 static bool complete_hook(void *, long long) {
@@ -682,12 +711,14 @@ static void test_zdma_wait_order() {
     g_hook_calls = 0;
     assert(zdma_wait_transfer_complete("done", &info, &hook, 1));
     assert(info.saw_enabled && g_hook_calls == 1 && info.isr == ZDMA_ISR_DMA_DONE && info.ctrl2 == 0);
+    assert((profile_observations == std::vector<unsigned>{1, 2}));
 
     reset_dma();
     g_dma->ZDMA_CH_ISR = ZDMA_ISR_DMA_DONE;
     g_hook_calls = 0;
     assert(zdma_wait_transfer_complete("immediate", &info, &hook, 1));
     assert(g_hook_calls == 0 && !info.saw_enabled);
+    assert((profile_observations == std::vector<unsigned>{2}));
 
     reset_dma();
     g_dma->ZDMA_CH_CTRL2 = ZDMA_CTRL2_EN;
@@ -695,6 +726,21 @@ static void test_zdma_wait_order() {
     g_hook_calls = 0;
     assert(!zdma_wait_transfer_complete("error", &info, &hook, 1));
     assert(g_hook_calls == 0 && g_log_errors == 1);
+    assert((profile_observations == std::vector<unsigned>{5}));
+
+    // DONE with EN still set must reach the original callback; an error wins
+    // over DONE/EN clear. Instrumentation must not change either decision.
+    reset_dma();
+    g_dma->ZDMA_CH_CTRL2 = ZDMA_CTRL2_EN;
+    g_dma->ZDMA_CH_ISR = ZDMA_ISR_DMA_DONE;
+    g_hook_calls = 0;
+    assert(zdma_wait_transfer_complete("done-enabled", &info, &hook, 1));
+    assert(g_hook_calls == 1 && (profile_observations == std::vector<unsigned>{3, 2}));
+    reset_dma();
+    g_dma->ZDMA_CH_ISR = ZDMA_ISR_DMA_DONE | 1U;
+    g_hook_calls = 0;
+    assert(!zdma_wait_transfer_complete("done-error", &info, &hook, 1));
+    assert(g_hook_calls == 0 && (profile_observations == std::vector<unsigned>{6}));
 
     reset_dma();
     g_dma_timeout_us = 2;
@@ -705,6 +751,7 @@ static void test_zdma_wait_order() {
     g_hook_calls = 0;
     assert(!zdma_wait_transfer_complete("timeout", &info, &hook, 1));
     assert(g_hook_calls == 0 && g_dump_count == 1);
+    assert((profile_observations == std::vector<unsigned>{1}));
 
     reset_dma();
     g_dma->ZDMA_CH_CTRL2 = ZDMA_CTRL2_EN;
@@ -712,6 +759,7 @@ static void test_zdma_wait_order() {
     fpga_dma_poll_hook_t fail{failing_hook_quiesced, nullptr};
     assert(!zdma_wait_transfer_complete("callback", &info, &fail, 1));
     assert(g_hook_calls == 1 && g_log_errors == 1 && (g_dma->ZDMA_CH_CTRL2 & ZDMA_CTRL2_EN) == 0U);
+    assert((profile_observations == std::vector<unsigned>{1}));
 
     reset_dma();
     g_dma_timeout_us = 2;
