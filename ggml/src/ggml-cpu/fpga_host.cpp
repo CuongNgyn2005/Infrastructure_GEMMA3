@@ -1,5 +1,5 @@
 /*
- * ZCU104 Linux host bridge: Q8_0 model weights x F32 activations -> F32 output.
+ * KR260 Linux host bridge: Q8_0 model weights x F32 activations -> F32 output.
  *
  * P2: FPGA scale-and-accumulate path. The VPU (vector processing unit) computes
  * integer dot products; the SPU scaling unit applies paired FP16
@@ -75,10 +75,10 @@ __extension__ typedef __int128          fpga_int128_t;
 #define DMA_MMAP_SIZE 0x0000000000001000LL
 
 // FPGA staging DDR must be real, installed PS DDR and excluded from Linux
-// during boot.  For the current ZCU104 image, reserve the top 256 MiB of low
-// DDR: [0x70000000, 0x80000000).
-static constexpr uint64_t DDR_BASE_PHYS     = 0x0000000070000000ULL;
-static constexpr size_t   DDR_REGION_SIZE   = 0x0000000010000000ULL;  // 256 MiB
+// during boot.  The KR260 address report reserves the 2 GiB high-DDR
+// window [0x800000000, 0x880000000), exposed by the ddr_high UIO resource.
+static constexpr uint64_t DDR_BASE_PHYS     = 0x0000000800000000ULL;
+static constexpr size_t   DDR_REGION_SIZE   = 0x0000000080000000ULL;  // 2 GiB
 static constexpr uint64_t DDR_END_EXCLUSIVE = DDR_BASE_PHYS + (uint64_t) DDR_REGION_SIZE;
 
 static int                g_log_flush_every                   = 256;
@@ -235,8 +235,8 @@ static constexpr uint32_t P2_WEIGHT_RESIDENCY_END = 0x03000000;
 static constexpr size_t   WEIGHT_CACHE_ALIGN     = 4096;
 static_assert((DDR_BASE_PHYS & 0xFFFULL) == 0ULL, "DDR_BASE_PHYS must be page aligned");
 static_assert((DDR_REGION_SIZE & 0xFFFULL) == 0ULL, "DDR_REGION_SIZE must be page aligned");
-static_assert(DDR_END_EXCLUSIVE <= 0x0000000080000000ULL,
-              "ZCU104 FPGA DDR carveout must stay inside installed low DDR");
+static_assert(DDR_BASE_PHYS >= 0x0000000800000000ULL && DDR_END_EXCLUSIVE <= 0x0000000880000000ULL,
+              "KR260 FPGA DDR carveout must stay inside reserved high DDR");
 static_assert(DDR_REQUIRED_BYTES <= DDR_REGION_SIZE, "FPGA scratch windows exceed the reserved DDR carveout");
 static_assert((uint64_t) WEIGHT_CACHE_BASE < (uint64_t) DDR_REGION_SIZE,
               "weight-cache base lies outside the reserved DDR carveout");
@@ -2364,10 +2364,9 @@ static bool map_uio_region(const char *        uio_name,
             resolved_name = uio_name;
         }
     }
-    // The low-DDR overlay is a distinct production resource.  Do not accept
-    // an address-only alias for it: the post-overlay command must resolve the
-    // named fpga_ddr_low UIO node, never the retired ddr_high resource.
-    if (strcmp(uio_name, "fpga_ddr_low") == 0 && resolved_name != uio_name) {
+    // The KR260 reserved DDR is a distinct production resource.  Do not
+    // accept an address-only alias: require the named ddr_high UIO node.
+    if (strcmp(uio_name, "ddr_high") == 0 && resolved_name != uio_name) {
         LOGE("UIO %s for %s resolved_name=%s; require exact resource name=%s", dev_path.c_str(), tag,
              resolved_name.c_str(), uio_name);
         return false;
@@ -2561,8 +2560,8 @@ static bool map_registers_dma_ddr(void) {
         return false;
     }
     g_ddr_mapping_kind = fpga_mapping_kind::UNKNOWN;
-    if (!map_region_prefer_uio("fpga_ddr_low", "FPGA_DDR_UIO", DDR_BASE_PHYS, DDR_REGION_SIZE, DDR_REGION_SIZE, DDR_REQUIRED_BYTES,
-                               "fpga_ddr_low", g_ddr_requested_map_size, g_allow_devmem_fallback, "uio_required",
+    if (!map_region_prefer_uio("ddr_high", "FPGA_DDR_UIO", DDR_BASE_PHYS, DDR_REGION_SIZE, DDR_REGION_SIZE, DDR_REQUIRED_BYTES,
+                               "ddr_high", g_ddr_requested_map_size, g_allow_devmem_fallback, "uio_required",
                                &g_ddr_map_base, &g_ddr_map_size, &g_ddr_advertised_size, &g_ddr_map_source,
                                &g_ddr_mapping_kind)) {
         return false;
@@ -2658,7 +2657,7 @@ static bool fpga_weight_path_bench_environment_allowed(void) {
 static bool configure_ddr_mapping_policy(void) {
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
-        LOGE("cannot determine page size for fpga_ddr_low mapping");
+        LOGE("cannot determine page size for ddr_high mapping");
         return false;
     }
 
@@ -2704,7 +2703,7 @@ static bool configure_ddr_mapping_policy(void) {
         LOGE(
             "refusing unconfirmed large weight cache: FPGA_WEIGHT_CACHE_MB=%lld exceeds default_max_mb=%lld; "
             "requested_phys=[0x%llx,0x%llx). No DDR mapping or cache write was performed. Run the read-only "
-            "fpga_ddr_low/reserved-memory preflight and graduated cache tests first; FPGA_WEIGHT_CACHE_LARGE_CONFIRMED is "
+            "ddr_high/reserved-memory preflight and graduated cache tests first; FPGA_WEIGHT_CACHE_LARGE_CONFIRMED is "
             "an operator acknowledgement, not a safety check",
             cache_mb, WEIGHT_CACHE_DEFAULT_MAX_MB, (unsigned long long) cache_start, (unsigned long long) cache_end);
         return false;
@@ -2737,7 +2736,7 @@ static void configure_weight_cache(void) {
     }
     if (!ddr_is_mapped() || g_ddr_map_size <= WEIGHT_CACHE_BASE) {
         g_weight_cache_enabled = false;
-        LOGE("weight tile cache disabled: fpga_ddr_low size=0x%zx is too small for base=0x%08x", g_ddr_map_size,
+        LOGE("weight tile cache disabled: ddr_high size=0x%zx is too small for base=0x%08x", g_ddr_map_size,
              WEIGHT_CACHE_BASE);
         return;
     }
@@ -2780,7 +2779,7 @@ static bool msync_ddr_range(uint32_t off, size_t bytes, bool invalidate, const c
     const size_t    len           = align_up_size((size_t) (end - aligned_begin), (size_t) page);
     const int       flags         = MS_SYNC | (invalidate ? MS_INVALIDATE : 0);
     mmio_fence();
-    // A UIO fpga_ddr_low mapping on this board reports EINVAL for msync.  Keep
+    // The previous ZCU104 UIO mapping reported EINVAL for msync.  Keep
     // v16's conservative per-tile attempt for ordinary ACT/WEIGHT/RESULT DMA
     // ranges, but do not repeat that unsupported call for one large cache
     // payload (potentially 1.1 GiB) during warm-up.
@@ -2796,7 +2795,7 @@ static bool msync_ddr_range(uint32_t off, size_t bytes, bool invalidate, const c
             (saved_errno == EINVAL || saved_errno == ENODEV)) {
             if (!g_ddr_msync_unsupported_logged) {
                 LOGI(
-                    "msync unsupported for fpga_ddr_low source=%s errno=%d (%s); generic-uio physical maps are normally "
+                    "msync unsupported for ddr_high source=%s errno=%d (%s); generic-uio physical maps are normally "
                     "non-cached, but cacheability is kernel-owned. Continuing with ordered volatile DDR accesses; this "
                     "message alone does not prove a cache fault.",
                     g_ddr_map_source.c_str(), saved_errno, strerror(saved_errno));
@@ -2809,14 +2808,14 @@ static bool msync_ddr_range(uint32_t off, size_t bytes, bool invalidate, const c
         if ((saved_errno == EINVAL || saved_errno == ENODEV) && g_strict_coherency &&
             g_coherency_platform_whitelisted) {
             LOGI(
-                "strict coherency whitelist accepts unsupported msync for fpga_ddr_low source=%s; CPU barriers remain "
+                "strict coherency whitelist accepts unsupported msync for ddr_high source=%s; CPU barriers remain "
                 "enabled",
                 g_ddr_map_source.c_str());
             mmio_fence();
             return true;
         }
         LOGE(
-            "msync fpga_ddr_low tag=%s off=0x%08x bytes=%zu invalidate=%d errno=%d (%s) source=%s aligned=0x%llx len=0x%zx "
+            "msync ddr_high tag=%s off=0x%08x bytes=%zu invalidate=%d errno=%d (%s) source=%s aligned=0x%llx len=0x%zx "
             "flags=0x%x",
             tag, off, bytes, invalidate ? 1 : 0, saved_errno, strerror(saved_errno), g_ddr_map_source.c_str(),
             (unsigned long long) aligned_begin, len, flags);
@@ -2864,14 +2863,14 @@ static bool fpga_p2_ddr_sync(uint32_t off, size_t bytes, bool device_to_cpu, con
     }
     if (!p2_physical_ddr_mapping_active()) {
         LOGE(
-            "P2 DDR sync requires an admitted physical fpga_ddr_low mapping tag=%s map_kind=%s; refusing before "
+            "P2 DDR sync requires an admitted physical ddr_high mapping tag=%s map_kind=%s; refusing before "
             "data-plane transfer",
             tag ? tag : "?", fpga_mapping_kind_name(g_ddr_mapping_kind));
         return false;
     }
     if (p2_msync_or_stress_requested()) {
         LOGE(
-            "P2 rejects FPGA_STRICT_COHERENCY/FPGA_STRICT_MSYNC/FPGA_COHERENCY_STRESS for admitted physical fpga_ddr_low "
+            "P2 rejects FPGA_STRICT_COHERENCY/FPGA_STRICT_MSYNC/FPGA_COHERENCY_STRESS for admitted physical ddr_high "
             "tag=%s; no msync syscall or data-plane transfer was issued",
             tag ? tag : "?");
         return false;
@@ -4678,8 +4677,8 @@ static void fpga_stage_q8_group_payload(const block_q8_0_t * weight_snapshot,
     mmio_fence();
 }
 
-// fpga_ddr_low is exposed through UIO/O_SYNC, but this board reports EINVAL for
-// msync().  A DSB followed by reads from both ends of the written range drains
+// The previous ZCU104 UIO/O_SYNC mapping reported EINVAL for msync().
+// A DSB followed by reads from both ends of the written range drains
 // posted PS stores before ZDMA becomes the reader.  The full C0 audit below is
 // stronger; this bounded fence remains enabled in normal execution.
 static void fpga_ddr_staging_readback_commit(uint32_t off, size_t bytes) {
@@ -8360,6 +8359,9 @@ int fpga_init(void) {
             dma_mapped ? 1 : 0, vpu_mapped ? 1 : 0, ddr_mapped ? 1 : 0);
     }
     g_attention_enabled = fpga_attention_requested() != 0;
+    if (g_attention_enabled && DDR_BASE_PHYS != (uint64_t) attention_abi::DDR_BASE) {
+        fpga_fatal("FPGA_ATTENTION uses a 32-bit low-DDR ABI incompatible with KR260 high DDR; refusing initialization");
+    }
     if (g_attention_enabled && (weight_path_bench_requested || fpga_source_audit_only_requested())) {
         fpga_fatal("FPGA_ATTENTION requires hardware execution, not benchmark capture or source-audit mode");
     }
@@ -8594,7 +8596,7 @@ int fpga_init(void) {
         !env_flag_enabled("FPGA_VPU_UIO_REQUIRED") && !env_flag_disabled("FPGA_VPU_DEVMEM_COMPAT");
     if (g_p2_init_requested) {
         // Prefer exact UIO resources when Linux exposes them. If they are
-        // absent, the fixed ZCU104 board contract may use bounded /dev/mem
+        // absent, the fixed KR260 board contract may use bounded /dev/mem
         // mappings. DDR still passes the /proc/iomem System RAM overlap
         // preflight before any direct mapping or data-plane transfer.
         const bool p2_devmem_compat = !env_flag_disabled("FPGA_P2_DEVMEM_COMPAT");
@@ -11764,8 +11766,8 @@ static bool map_weight_path_bench_vpu_ddr(void) {
     g_vpu = (volatile uint8_t *) g_vpu_map_base;
 
     if (!fpga_ddr_iomem_preflight() ||
-        !map_uio_region("fpga_ddr_low", "FPGA_DDR_UIO", DDR_BASE_PHYS, DDR_REGION_SIZE, DDR_REQUIRED_BYTES,
-                        "fpga_ddr_low passive benchmark", DDR_REQUIRED_BYTES, &g_ddr_map_base, &g_ddr_map_size,
+        !map_uio_region("ddr_high", "FPGA_DDR_UIO", DDR_BASE_PHYS, DDR_REGION_SIZE, DDR_REQUIRED_BYTES,
+                        "ddr_high passive benchmark", DDR_REQUIRED_BYTES, &g_ddr_map_base, &g_ddr_map_size,
                         &g_ddr_advertised_size, &g_ddr_map_source, &g_ddr_mapping_kind)) {
         if (g_vpu_map_base && g_vpu_map_base != MAP_FAILED) {
             munmap(g_vpu_map_base, g_vpu_map_size);
