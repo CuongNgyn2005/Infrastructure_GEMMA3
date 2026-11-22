@@ -62,7 +62,7 @@
 __extension__ typedef unsigned __int128 fpga_uint128_t;
 __extension__ typedef __int128          fpga_int128_t;
 
-#define FPGA_HOST_TRACE_VERSION "zcu104-gemma3-q8-v95-p2-dma-pack-pipeline"
+#define FPGA_HOST_TRACE_VERSION "kr260-gemma3-q8-v97-host-stream"
 
 #define MY_IP_BASE_ADDRESS 0x00000000A0000000LL
 #define REG_BASE_PHYS      0x00000000A0000000LL
@@ -627,6 +627,7 @@ typedef struct {
     uint32_t                          spu_stream_error_before;
     // Valid only within the pipelined scheduler's current weight-tile column loop.
     bool                              weight_bank_reused;
+    bool                              act_bank_reused;
 } fpga_tile_job_t;
 
 // A bounded lookahead owns only the next tile's immutable identity and the
@@ -831,6 +832,9 @@ static bool     g_spu_rope_supported            = false;
 static bool     g_spu_softmax_supported         = false;
 static bool     g_pingpong_scheduler_enabled    = false;
 static bool     g_p2_result_overlap_enabled     = true;
+static bool     g_p2_act_bank_reuse_enabled     = true;
+static uint64_t g_p2_act_bank_reused_jobs       = 0;
+static uint64_t g_p2_act_bank_avoided_bytes     = 0;
 // File-only aggregate telemetry for a completed graph sequence.  This is
 // opt-in because even a host timestamp belongs outside the production fast
 // path unless the owner is actively measuring scheduler behavior.
@@ -1408,6 +1412,9 @@ static void fpga_fatal(const char * fmt, ...) {
     if (g_token_timing_collection_enabled && g_token_timing.active) {
         fpga_token_timing_emit(g_token_timing.graph_seq, 0, "error", monotonic_now_us());
     }
+    fpga_dma_profile_log_config();
+    fpga_log_startup_begin();
+    fflush(fpga_log_fp());
     fpga_p2_init_breadcrumb("phase=failure reason=fpga_fatal");
     abort();
 }
@@ -2252,6 +2259,7 @@ static bool find_uio_device(const char * wanted_name, std::string * dev_path, si
 }
 
 static bool find_uio_device_by_addr(uint64_t      wanted_addr,
+                                    const char *  wanted_name,
                                     std::string * dev_path,
                                     size_t *      map_size,
                                     std::string * resolved_name) {
@@ -2279,11 +2287,12 @@ static bool find_uio_device_by_addr(uint64_t      wanted_addr,
             continue;
         }
 
+        if (!read_text_file("/sys/class/uio/" + uio + "/name", resolved_name) ||
+            *resolved_name != wanted_name) {
+            continue;
+        }
         *dev_path = "/dev/" + uio;
         *map_size = size;
-        if (!read_text_file("/sys/class/uio/" + uio + "/name", resolved_name)) {
-            *resolved_name = "?";
-        }
         found = true;
         break;
     }
@@ -2354,15 +2363,12 @@ static bool map_uio_region(const char *        uio_name,
         LOGINIT("using %s=%s for %s resolved_dev=%s resolved_name=%s", env_name, override_ref, tag, dev_path.c_str(),
                 resolved_name.c_str());
     } else {
-        if (!find_uio_device(uio_name, &dev_path, &uio_size)) {
-            if (!find_uio_device_by_addr(phys, &dev_path, &uio_size, &resolved_name)) {
-                return false;
-            }
-            LOGINIT("using UIO addr match for %s expected_name=%s phys=0x%llx resolved_dev=%s resolved_name=%s", tag,
-                    uio_name, (unsigned long long) phys, dev_path.c_str(), resolved_name.c_str());
-        } else {
-            resolved_name = uio_name;
+        // Multiple DMA channels share a name; select the exact physical channel.
+        if (!find_uio_device_by_addr(phys, uio_name, &dev_path, &uio_size, &resolved_name)) {
+            return false;
         }
+        LOGINIT("using UIO name/address match for %s expected_name=%s phys=0x%llx resolved_dev=%s resolved_name=%s", tag,
+                uio_name, (unsigned long long) phys, dev_path.c_str(), resolved_name.c_str());
     }
     // The KR260 reserved DDR is a distinct production resource.  Do not
     // accept an address-only alias: require the named ddr_high UIO node.
@@ -2513,7 +2519,7 @@ static bool map_region_prefer_uio(const char *        uio_name,
             tag, (unsigned long long) phys, devmem_size);
     } else {
         LOGE(
-            "DIAGNOSTIC ONLY: FPGA_ALLOW_DEVMEM=1 permits /dev/mem mapping for %s; this is not a production-safe "
+            "DIAGNOSTIC ONLY: enabled compatibility policy permits /dev/mem mapping for %s; this is not a production-safe "
             "mapping policy",
             tag);
     }
@@ -3580,6 +3586,10 @@ static bool fpga_dma_copy(uint64_t                     src_phys,
         return false;
     }
 
+    if (bytes <= g_zdma_max_transfer_bytes) {
+        return fpga_dma_copy_one(src_phys, dst_phys, bytes, tag ? tag : "?", poll_hook, device_produced_source);
+    }
+
     const size_t chunk_bytes = std::min(bytes, g_zdma_max_transfer_bytes);
     const size_t chunk_count = bytes / chunk_bytes + (bytes % chunk_bytes != 0U ? 1U : 0U);
     for (size_t chunk = 0U; chunk < chunk_count; ++chunk) {
@@ -3991,7 +4001,14 @@ static const block_q8_0_t * weight_block(const struct ggml_tensor * src0, int64_
 // P2 requires stream mode 0.  The register write is accepted only while the
 // stream FIFO and command-mode SPU are idle, so verify both before writing and
 // read the mode back before any P2 staging or DMA.
-static bool fpga_enforce_p2_stream_mode(const char * context) {
+struct fpga_stream_mode_report_t {
+    bool recorded = false;
+    uint32_t status = 0;
+};
+
+static bool fpga_enforce_p2_stream_mode(const char * context,
+                                      fpga_stream_mode_report_t * deferred = nullptr) {
+    if (deferred) *deferred = {};
     if (g_committed_stream_mode == 0) {
         return true;
     }
@@ -4025,8 +4042,13 @@ static bool fpga_enforce_p2_stream_mode(const char * context) {
         return false;
     }
     g_committed_stream_mode = 0;
-    LOGI("P2_STREAM_MODE_PASS context=%s mode=0 stream_status=0x%08x",
-         context ? context : "?", stream_after);
+    if (deferred) {
+        deferred->recorded = true;
+        deferred->status = stream_after;
+    } else {
+        LOGI("P2 STREAM MODE PASS\n  Ngữ cảnh = %s | Chế độ = 0 | Trạng thái stream = 0x%08x",
+             context ? context : "?", stream_after);
+    }
     return true;
 }
 
@@ -4144,7 +4166,7 @@ static bool fpga_p2_pack_worker_start(void) {
     return create_rc == 0;
 }
 
-static bool fpga_p2_pack_worker_next_generation(uint64_t * generation) {
+static bool fpga_p2_pack_worker_next_generation(uint64_t * generation, bool record_dispatch = true) {
     if (!generation) {
         return false;
     }
@@ -4160,7 +4182,7 @@ static bool fpga_p2_pack_worker_next_generation(uint64_t * generation) {
     const long long unlock0 = now_us();
     pthread_mutex_unlock(&g_p2_pack_worker_mutex);
     const long long unlocked = now_us();
-    if (ready) {
+    if (ready && record_dispatch) {
         g_pack_detail[PACK_RESERVE_LOCK] += locked - lock0;
         g_pack_detail[PACK_RESERVE_BODY] += unlock0 - locked;
         g_pack_detail[PACK_RESERVE_UNLOCK] += unlocked - unlock0;
@@ -4168,7 +4190,7 @@ static bool fpga_p2_pack_worker_next_generation(uint64_t * generation) {
     return ready;
 }
 
-static bool fpga_p2_pack_worker_submit(const fpga_p2_pack_worker_task_t & task) {
+static bool fpga_p2_pack_worker_submit(const fpga_p2_pack_worker_task_t & task, bool record_dispatch = true) {
     const long long lock0 = now_us();
     pthread_mutex_lock(&g_p2_pack_worker_mutex);
     const long long locked = now_us();
@@ -4190,10 +4212,12 @@ static bool fpga_p2_pack_worker_submit(const fpga_p2_pack_worker_task_t & task) 
     pthread_cond_signal(&g_p2_pack_worker_task_cv);
     const long long signaled = now_us();
     // Elapsed intervals may include OS descheduling; these are not CPU-only costs.
-    g_pack_detail[PACK_SUBMIT_LOCK] += locked - lock0;
-    g_pack_detail[PACK_SUBMIT_BODY] += unlock0 - locked;
-    g_pack_detail[PACK_SUBMIT_SIGNAL] += signaled - unlocked;
-    g_pack_detail[PACK_SUBMIT_UNLOCK] += unlocked - unlock0;
+    if (record_dispatch) {
+        g_pack_detail[PACK_SUBMIT_LOCK] += locked - lock0;
+        g_pack_detail[PACK_SUBMIT_BODY] += unlock0 - locked;
+        g_pack_detail[PACK_SUBMIT_SIGNAL] += signaled - unlocked;
+        g_pack_detail[PACK_SUBMIT_UNLOCK] += unlocked - unlock0;
+    }
     return true;
 }
 
@@ -5628,6 +5652,49 @@ static void fpga_p2_residency_poison_slot(uint32_t slot, const char * reason) {
     g_p2_residency_host_metadata_invalidations++;
 }
 
+// Use aligned scalar device accesses; memcpy only moves ordinary local words.
+// Prefix/tail bytes keep accesses bounded for unaligned or short spans.
+static void fpga_p2_residency_store(volatile uint8_t * dst, const uint8_t * src, size_t bytes) {
+    size_t i = 0;
+    for (; i < bytes && ((uintptr_t) (dst + i) & 7U); ++i) dst[i] = src[i];
+    for (; bytes - i >= sizeof(uint64_t); i += sizeof(uint64_t)) {
+        uint64_t word;
+        memcpy(&word, src + i, sizeof(word));
+        *reinterpret_cast<volatile uint64_t *>(dst + i) = word;
+    }
+    for (; i < bytes; ++i) dst[i] = src[i];
+}
+
+// Return the first mismatching byte, or bytes after exact whole-span readback.
+static size_t fpga_p2_residency_mismatch(const volatile uint8_t * src, const uint8_t * expected,
+                                        size_t bytes, uint8_t * actual) {
+    size_t i = 0;
+    for (; i < bytes && ((uintptr_t) (src + i) & 7U); ++i) {
+        *actual = src[i];
+        if (*actual != expected[i]) return i;
+    }
+    for (; bytes - i >= sizeof(uint64_t); i += sizeof(uint64_t)) {
+        const uint64_t word = *reinterpret_cast<const volatile uint64_t *>(src + i);
+        uint64_t wanted;
+        memcpy(&wanted, expected + i, sizeof(wanted));
+        if (word != wanted) {
+            uint8_t observed[sizeof(word)];
+            memcpy(observed, &word, sizeof(word));
+            for (size_t j = 0; j < sizeof(word); ++j) {
+                if (observed[j] != expected[i + j]) {
+                    *actual = observed[j];
+                    return i + j;
+                }
+            }
+        }
+    }
+    for (; i < bytes; ++i) {
+        *actual = src[i];
+        if (*actual != expected[i]) return i;
+    }
+    return bytes;
+}
+
 // Select an exact sealed slot or construct one in an unused range. No
 // descriptor, bank selector, START, or DMA programming occurs here.
 // A residency validation failure returns INVALID_SLOT so the caller fails
@@ -5878,8 +5945,8 @@ static uint32_t fpga_p2_residency_select_or_build_impl(const struct ggml_tensor 
     }
     volatile uint8_t * dst_qs = (volatile uint8_t *) ddr_ptr(pending.qs_off, qs_bytes);
     volatile uint8_t * dst_scales = (volatile uint8_t *) ddr_ptr(pending.scale_off, scale_bytes);
-    for (size_t i = 0; i < qs_bytes; ++i) dst_qs[i] = expected_qs[i];
-    for (size_t i = 0; i < scale_bytes; ++i) dst_scales[i] = expected_scales[i];
+    fpga_p2_residency_store(dst_qs, expected_qs.data(), qs_bytes);
+    fpga_p2_residency_store(dst_scales, expected_scales.data(), scale_bytes);
     // Keep the odd-row companion explicit even though expected_qs was
     // zero-initialized: no prior resident payload may leak into VPU2's pair.
     fpga_weight_layout_zero_padded_companion(pending.qs_off, rows, group_beats);
@@ -5898,11 +5965,13 @@ static uint32_t fpga_p2_residency_select_or_build_impl(const struct ggml_tensor 
                           pending.qs_off, qs_bytes, pending.scale_off, scale_bytes);
     const volatile uint8_t * verify_qs = (volatile const uint8_t *) ddr_ptr(pending.qs_off, qs_bytes);
     const volatile uint8_t * verify_scales = (volatile const uint8_t *) ddr_ptr(pending.scale_off, scale_bytes);
-    for (size_t i = 0; i < qs_bytes; ++i) {
-        if (verify_qs[i] != expected_qs[i]) {
+    {
+        uint8_t actual = 0;
+        const size_t i = fpga_p2_residency_mismatch(verify_qs, expected_qs.data(), qs_bytes, &actual);
+        if (i != qs_bytes) {
             g_p2_residency_build_us += now_us() - build0;
             fpga_p2_residency_log(true, "VERIFY_FAIL", "kind=qs offset=%zu expected=0x%02x actual=0x%02x", i,
-                                  expected_qs[i], verify_qs[i]);
+                                  expected_qs[i], actual);
             fpga_p2_residency_poison_slot(slot, "qs_readback_mismatch");
             g_p2_residency_build_failures++;
             g_p2_residency_misses++;
@@ -5911,11 +5980,13 @@ static uint32_t fpga_p2_residency_select_or_build_impl(const struct ggml_tensor 
             return P2_WEIGHT_RESIDENCY_NO_SLOT;
         }
     }
-    for (size_t i = 0; i < scale_bytes; ++i) {
-        if (verify_scales[i] != expected_scales[i]) {
+    {
+        uint8_t actual = 0;
+        const size_t i = fpga_p2_residency_mismatch(verify_scales, expected_scales.data(), scale_bytes, &actual);
+        if (i != scale_bytes) {
             g_p2_residency_build_us += now_us() - build0;
             fpga_p2_residency_log(true, "VERIFY_FAIL", "kind=scale offset=%zu expected=0x%02x actual=0x%02x", i,
-                                  expected_scales[i], verify_scales[i]);
+                                  expected_scales[i], actual);
             fpga_p2_residency_poison_slot(slot, "scale_readback_mismatch");
             g_p2_residency_build_failures++;
             g_p2_residency_misses++;
@@ -5987,8 +6058,16 @@ static bool fpga_p2_residency_contains(const struct ggml_tensor * src0,
         return false;
     }
     const size_t scale_bytes = (size_t) rows * (size_t) group_blocks * sizeof(uint16_t);
-    for (const fpga_p2_resident_tile_t & tile : g_p2_resident_tiles) {
-        if (!tile.enabled || tile.building || !tile.sealed || tile.poisoned || tile.epoch != g_p2_weight_residency_epoch ||
+    const uint64_t key_hash =
+        fpga_p2_residency_key_hash(src0, row0, rows, k_block0, group_blocks, group_beats, weight_bytes, scale_bytes);
+    const size_t bucket = fpga_p2_residency_bucket(key_hash);
+    for (size_t probe = 0; probe < P2_WEIGHT_RESIDENCY_INDEX_MAX_PROBES; ++probe) {
+        const uint32_t slot = g_p2_residency_index[(bucket + probe) & (P2_WEIGHT_RESIDENCY_INDEX_BUCKETS - 1U)];
+        if (slot == P2_WEIGHT_RESIDENCY_NO_SLOT) return false;
+        if (slot >= g_p2_resident_tiles.size()) return false;
+        const fpga_p2_resident_tile_t & tile = g_p2_resident_tiles[slot];
+        if (tile.key_hash != key_hash || !tile.enabled || tile.building || !tile.sealed || tile.poisoned ||
+            tile.epoch != g_p2_weight_residency_epoch ||
             tile.stream_protocol != g_stream_protocol_version || tile.bitstream_id != g_bitstream_id ||
             tile.p2_abi != g_p2_stream_abi_signature) {
             continue;
@@ -6321,7 +6400,7 @@ static bool fpga_p2_dma_pipeline_admit(fpga_p2_dma_pipeline_lookahead_t & lookah
         return false;
     }
     uint64_t generation = 0U;
-    if (!fpga_p2_pack_worker_next_generation(&generation)) {
+    if (!fpga_p2_pack_worker_next_generation(&generation, false)) {
         ++g_p2_pack_dma_pipeline_rejected_jobs;
         return false;
     }
@@ -6342,7 +6421,7 @@ static bool fpga_p2_dma_pipeline_admit(fpga_p2_dma_pipeline_lookahead_t & lookah
     task.scale_words            = candidate.scale_words;
     task.expected_scale_entries = helper_rows * (size_t) group_blocks;
     task.fused_scale            = true;
-    if (!fpga_p2_pack_worker_submit(task)) {
+    if (!fpga_p2_pack_worker_submit(task, false)) {
         ++g_p2_pack_dma_pipeline_rejected_jobs;
         return false;
     }
@@ -6749,6 +6828,7 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
         g_p2_first_act_dma_trace_active = true;
     }
     const bool act_dma_ok =
+        job.act_bank_reused ? true :
         job.retained_activation ? fpga_dma_copy(DDR_BASE_PHYS + job.retained_act_src_off,
                                                 LMM_BASE_PHYS + ACT_BASE, job.act_bytes, "ATTENTION_ACT", nullptr, true) :
         poll_hook ? fpga_dma_copy(DDR_BASE_PHYS + (uint64_t) ACT_BASE, LMM_BASE_PHYS + (uint64_t) ACT_BASE,
@@ -6763,7 +6843,8 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
     }
     const long long event_dma_act_done = p2_event_now_us();
     p2_trace_first_tile(job, "ACT_DMA", "after");
-    p2_event_trace(job, "ACT_DMA_DONE", event_dma_act_done, "act_dma_us", event_dma_act_done - event_dma_act0);
+    p2_event_trace(job, "ACT_DMA_DONE", event_dma_act_done, "act_dma_us",
+                   job.act_bank_reused ? 0 : event_dma_act_done - event_dma_act0);
     const long long dma_act1 = now_us();
 
     const long long dma_weight0       = now_us();
@@ -6809,7 +6890,7 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
                    event_dma_scale_done - job.event_input_transfer_begin_us);
     const long long dma_scale1 = now_us();
 
-    job.dma_act_us              = dma_act1 - dma_act0;
+    job.dma_act_us              = job.act_bank_reused ? 0 : dma_act1 - dma_act0;
     job.dma_weight_us           = job.weight_bank_reused ? 0 : dma_weight1 - dma_weight0;
     job.dma_scale_us            = dma_scale1 - dma_scale0;
     job.spu_stream_count_before = vpu_rd32(REG_SPU_STREAM_COUNT);
@@ -6826,7 +6907,7 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
         totals->dma_result_us += g_clear_result_before_run ? job.result_clear_us : 0;
         totals->bank_h2ip_us[bank_index] += h2ip_us;
         totals->bank_jobs[bank_index]++;
-        totals->activation_bytes += job.act_bytes;
+        totals->activation_bytes += job.act_bank_reused ? 0 : job.act_bytes;
         totals->weight_bytes += job.weight_bank_reused ? 0 : job.weight_bytes;
         totals->scale_bytes += job.scale_bytes;
         totals->result_bytes += job.spu_result_bytes;
@@ -6841,7 +6922,7 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
             job.graph_seq, layer_id, tensor_name ? tensor_name : "?", job.tile_id, job.job_id, bank_index,
             p2_bank_label(bank_index), (double) h2ip_us / 1000.0,
             (double) job.dma_act_us / 1000.0, (double) job.dma_weight_us / 1000.0,
-            (double) job.dma_scale_us / 1000.0, job.act_bytes,
+            (double) job.dma_scale_us / 1000.0, job.act_bank_reused ? 0 : job.act_bytes,
             job.weight_bank_reused ? 0 : job.weight_bytes, job.scale_bytes);
     }
 
@@ -7021,12 +7102,39 @@ static bool fpga_accumulate_pl_scaled_q8_tile_job(fpga_tile_job_t & job,
         LOGE("P2 result ownership violation before consume job=%u", job.job_id);
         return false;
     }
+    if (job.rows <= 0 || (size_t) job.rows > (SPU_OUT_END - SPU_OUT_BASE) / 16U ||
+        (size_t) job.rows * 16U > job.spu_result_bytes || job.col < 0 ||
+        (size_t) job.rows > accum.size() ||
+        (uint64_t) job.col > (accum.size() - (size_t) job.rows) / (size_t) job.rows) {
+        LOGE("P2 result span rejected job=%u", job.job_id);
+        return false;
+    }
     const long long result0   = now_us();
     const long long event_host_read_accum0 = p2_event_now_us();
     float *         accum_col = &accum[(size_t) (job.col * job.rows)];
+    const volatile uint32_t * result_src = reinterpret_cast<const volatile uint32_t *>(
+        ddr_ptr(SPU_OUT_BASE, (size_t) job.rows * 16U));
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    const bool wide_result = (reinterpret_cast<uintptr_t>(result_src) & 7U) == 0U;
+#else
+    (void) result_src;
+#endif
     for (int row = 0; row < job.rows; ++row) {
-        uint16_t      row_id = 0xffffU;
-        const int64_t q16    = ddr_read_spu_q16_row(SPU_OUT_BASE + (uint32_t) row * 16U, &row_id);
+        uint16_t row_id = 0xffffU;
+        int64_t q16;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        if (wide_result) {
+            const volatile uint64_t * wide = reinterpret_cast<const volatile uint64_t *>(result_src) + (size_t) row * 2U;
+            const uint64_t low = wide[0];
+            const uint64_t high = wide[1];
+            row_id = (uint16_t) low;
+            const uint64_t bits = (low >> 16U) | (high << 48U);
+            memcpy(&q16, &bits, sizeof(q16));
+        } else
+#endif
+        {
+            q16 = ddr_read_spu_q16_row(SPU_OUT_BASE + (uint32_t) row * 16U, &row_id);
+        }
         if (row_id != (uint16_t) row) {
             LOGE("SPU_OUT row mismatch job=%u tile=%u bank=%d row=%d got_row=%u q16=%lld", job.job_id, job.tile_id,
                  job.bank, row, (unsigned) row_id, (long long) q16);
@@ -7474,6 +7582,12 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
     long long reused_jobs = 0;
     uint64_t avoided_weight_bytes = 0;
     const bool overlap_results = g_p2_result_overlap_enabled && g_vpu_descriptor_supported;
+    // Both banks retain the same complete decode vector across row tiles.
+    // The largest row tile sets the tightest single-group result limit.
+    const bool reuse_act = g_p2_act_bank_reuse_enabled && !g_attention_enabled && m == 1 &&
+        n > 0 && nb > 0 && nb <= INT_MAX && g_vpu_max_rows > 0 &&
+        packed_q8_group_blocks_for_rows((int) std::min<int64_t>(g_vpu_max_rows, n), (int) nb) == nb;
+    bool act_bank_valid[2] = { false, false };
     // B's input transfers do not touch A's completed DDR result. The single
     // host thread consumes A before returning to any drain of B. No new DMA
     // buffer, worker, or concurrent register owner is introduced.
@@ -7655,6 +7769,7 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                 }
 
                 prepared.weight_bank_reused = m > 1 && weight_bank_loaded[bank];
+                prepared.act_bank_reused = reuse_act && !prepared.retained_activation && act_bank_valid[bank];
 
                 // Consumed B is finalized; C may pack into A's old input slot
                 // while A drains to disjoint SPU output. Keep C metadata in lookahead.
@@ -7765,6 +7880,11 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                 // Submit has completed all required DMA and launched this job.
                 // A failed drain/submit returns before publishing validity.
                 weight_bank_loaded[bank] = true;
+                act_bank_valid[bank] = reuse_act && !prepared.retained_activation;
+                if (prepared.act_bank_reused) {
+                    ++g_p2_act_bank_reused_jobs;
+                    g_p2_act_bank_avoided_bytes += prepared.act_bytes;
+                }
                 if (prepared.weight_bank_reused) {
                     ++reused_jobs;
                     avoided_weight_bytes += prepared.weight_bytes;
@@ -8372,6 +8492,7 @@ int fpga_init(void) {
         fpga_fatal("Invalid FPGA DMA profiling policy; initialization stopped before hardware mapping");
     }
     if (weight_path_bench_requested) {
+        fpga_dma_profile_log_config();
         if (!fpga_weight_path_bench_environment_allowed() || !fpga_p2_scale_layout_self_test() ||
             !fpga_weight_path_bench_host_self_test() || !map_weight_path_bench_vpu_ddr() ||
             !fpga_weight_path_bench_read_capabilities()) {
@@ -8450,6 +8571,9 @@ int fpga_init(void) {
     g_p2_pack_dma_pipeline_requested = p2_pack_dma_pipeline_enable_env;
     g_p2_pack_dma_pipeline_enabled = false;
     g_p2_result_overlap_enabled = !env_flag_disabled("FPGA_P2_RESULT_OVERLAP");
+    g_p2_act_bank_reuse_enabled = !env_flag_disabled("FPGA_P2_ACT_BANK_REUSE");
+    g_p2_act_bank_reused_jobs = 0;
+    g_p2_act_bank_avoided_bytes = 0;
     g_p1_sched_summary_enabled           = env_flag_enabled("FPGA_P1_SCHED_SUMMARY");
     g_pingpong_timing_enabled            = env_flag_enabled("FPGA_PINGPONG_TIMING");
     g_bottleneck_summary_enabled         = !env_flag_disabled("FPGA_BOTTLENECK_SUMMARY");
@@ -9060,7 +9184,8 @@ int fpga_init(void) {
          p2_two_row_transport_compatible ? 1 : 0, SPU_PARAM_BASE, SPU_OUT_BASE,
          g_p2_pack_dma_pipeline_requested ? 1 : 0, g_p2_pack_dma_pipeline_enabled ? 1 : 0);
     // Establish and read back P2 mode 0 before any self-test or model transfer.
-    if (!fpga_enforce_p2_stream_mode("P2 route baseline")) {
+    fpga_stream_mode_report_t baseline_stream_report;
+    if (!fpga_enforce_p2_stream_mode("P2 route baseline", &baseline_stream_report)) {
         fpga_fatal("stream mode-0 baseline was not quiescent/readable; refusing P2 data-plane traffic");
     }
     if (!g_p2_init_requested) {
@@ -9113,17 +9238,26 @@ int fpga_init(void) {
     LOGINIT(
         "DMA max_transfer_bytes=%zu larger_transfers=chunked",
         g_zdma_max_transfer_bytes);
+    fpga_log_section("Thông tin chung");
     LOGI(
-        "MANIFEST host_version=%s host_build=\"%s %s\" stream_protocol=%u bitstream_id=0x%08x "
-        "p2_abi=0x%08x ddr_phys=[0x%llx,0x%llx) ddr_map_size=0x%zx "
-        "dma_map_source=%s vpu_map_source=%s ddr_map_source=%s zdma_descriptor_bytes=%zu rows=%d workers=%d "
-        "pingpong=%d vocab_cpu_bypass=%d",
+        "MANIFEST\n"
+        "Thông tin bản build\n"
+        "  Phiên bản host = %s | Bản build host = \"%s %s\"\n"
+        "Phần cứng\n"
+        "  Phiên bản giao thức stream = %u | Mã bitstream = 0x%08x | ABI P2 = 0x%08x | Dải địa chỉ vật lý DDR = [0x%llx,0x%llx)\n"
+        "  Kích thước ánh xạ DDR = 0x%zx | Nguồn ánh xạ DMA = %s | Nguồn ánh xạ VPU = %s | Nguồn ánh xạ DDR = %s\n"
+        "Cấu hình thực thi\n"
+        "  Số byte mỗi descriptor ZDMA = %zu | Số hàng = %d | Số worker = %d | Chế độ ping pong = %d | Chuyển vocab sang CPU = %d",
         FPGA_HOST_TRACE_VERSION, __DATE__, __TIME__, g_stream_protocol_version, g_bitstream_id,
         g_p2_stream_abi_signature, (unsigned long long) DDR_BASE_PHYS,
         (unsigned long long) DDR_END_EXCLUSIVE, g_ddr_map_size, g_dma_map_source.c_str(), g_vpu_map_source.c_str(),
         g_ddr_map_source.c_str(), g_zdma_max_transfer_bytes, g_runtime_max_rows, g_p2_pack_workers_requested,
         g_pingpong_scheduler_enabled ? 1 : 0,
         g_vocab_projection_cpu_bypass ? 1 : 0);
+    if (baseline_stream_report.recorded) {
+        LOGI("P2 STREAM MODE PASS\n  Ngữ cảnh = Nhánh P2 cơ sở | Chế độ = 0 | Trạng thái stream = 0x%08x",
+             baseline_stream_report.status);
+    }
     LOGINIT("bases my_ip=0x%llx reg=0x%llx lmm=0x%llx dma=0x%llx ddr=0x%llx", (unsigned long long) MY_IP_BASE_ADDRESS,
             (unsigned long long) REG_BASE_PHYS, (unsigned long long) LMM_BASE_PHYS, (unsigned long long) DMA_BASE_PHYS,
             (unsigned long long) DDR_BASE_PHYS);
@@ -9152,6 +9286,7 @@ int fpga_init(void) {
     if (!fpga_weight_layout_host_self_test()) {
         fpga_fatal("P2 pair-interleaved padded WEIGHT host self-test failed; refusing all launches");
     }
+    fpga_dma_profile_log_config();
     if (g_pl_scale_contract_check_limit > 0 && !fpga_p2_cumulative_tile_limit_host_self_test()) {
         fpga_fatal("P2 cumulative tile-limit host self-test failed; refusing qualification traffic");
     }
@@ -9234,6 +9369,11 @@ void fpga_cleanup(void) {
         return;
     }
     g_cleanup_done = true;
+    fpga_log_line(true, "P2_ACT_BANK_REUSE", true,
+                  "enabled=%d reused_jobs=%llu avoided_bytes=%llu",
+                  g_p2_act_bank_reuse_enabled ? 1 : 0,
+                  (unsigned long long) g_p2_act_bank_reused_jobs,
+                  (unsigned long long) g_p2_act_bank_avoided_bytes);
     if (g_attention_admitted && vpu_is_mapped()) {
         std::string error;
         fpga_attention_transport io;
@@ -9244,8 +9384,9 @@ void fpga_cleanup(void) {
     g_attention_admitted = false;
     fpga_compute_watch_shutdown();
     LOGPROOF(
-        "cleanup begin lifecycle=explicit-before-backend-free ddr_mapped=%d vpu_mapped=%d dma_mapped=%d "
-        "weight_cache_entries=%zu weight_path_bench_passive=%d",
+        "Bắt đầu dọn dẹp tài nguyên\n"
+        "  Thời điểm trong vòng đời = trước khi giải phóng backend | DDR đã ánh xạ = %d | VPU đã ánh xạ = %d | DMA đã ánh xạ = %d\n"
+        "  Số mục weight cache = %zu | Chế độ thụ động của benchmark đường weight = %d",
         ddr_is_mapped() ? 1 : 0, vpu_is_mapped() ? 1 : 0, dma_is_mapped() ? 1 : 0, g_weight_cache.size(),
         g_weight_path_bench.passive_mapping ? 1 : 0);
     if (g_p1_sched_summary_enabled) {
@@ -9254,6 +9395,7 @@ void fpga_cleanup(void) {
     if (g_token_timing_collection_enabled && g_token_timing.active) {
         fpga_token_timing_emit_final(monotonic_now_us());
     }
+    fpga_log_section("Dọn dẹp tài nguyên và số liệu tổng kết cuối cùng");
     fpga_dma_profile_finish();
 
     // No local source establishes a safe software abort/reset sequence for an
@@ -9297,7 +9439,7 @@ void fpga_cleanup(void) {
             }
         }
         if (!g_weight_cache.empty()) {
-            LOGI("weight tile cache metadata invalidated entries=%zu; payload was left intact", g_weight_cache.size());
+            LOGI("Đã vô hiệu hóa metadata của weight tile cache | Số mục = %zu | Dữ liệu được giữ nguyên", g_weight_cache.size());
         }
         g_weight_cache.clear();
     }
@@ -9355,20 +9497,29 @@ void fpga_cleanup(void) {
                 ((double) g_p2_residency_direct_weight_pack_us * 1000.0) :
             0.0;
     LOGPROOF(
-        "FPGA_GEMV_COVERAGE hook_calls=%lld q8_candidates=%lld q8_expected_fpga=%lld q8_hw_completed=%lld "
-        "q8_intentional_cpu_bypass=%lld q8_unavailable_cpu_fallback=%lld routing_verdict=%s fpga_block_gemv=%s",
+        "FPGA GEMV COVERAGE\n"
+        "  Số lần gọi hook = %lld | Số ứng viên Q8 = %lld | Số phép Q8 dự kiến chạy FPGA = %lld\n"
+        "  Số phép Q8 phần cứng đã hoàn tất = %lld | Số phép Q8 chủ động chuyển sang CPU = %lld\n"
+        "  Số phép Q8 fallback về CPU do FPGA không khả dụng = %lld | Kết luận định tuyến = %s | Trạng thái block GEMV FPGA = %s",
         hook_calls, q8_candidates, q8_expected_fpga, g_fpga_count, q8_intentional_cpu, q8_unavailable_cpu,
-        q8_coverage_complete ? "complete" : "incomplete", fpga_block_gemv_mode);
+        q8_coverage_complete ? "đầy đủ" : "chưa đầy đủ",
+        strcmp(fpga_block_gemv_mode, "active") == 0 ? "đang hoạt động" :
+        strcmp(fpga_block_gemv_mode, "not_applicable") == 0 ? "không áp dụng" :
+        strcmp(fpga_block_gemv_mode, "cpu_quarantine") == 0 ? "cách ly sang CPU" : "chưa đầy đủ");
     LOGPROOF(
-        "P2_PACK_SUMMARY requested_workers=%d active_workers=%d helper_stopped=%d parallel_min_bytes=%zu "
-        "parallel_jobs=%lld parallel_bytes=%llu serial_threshold_skips=%lld main_pack_us=%lld "
-        "helper_service_us=%lld caller_wait_us=%lld fused_jobs=%lld fused_us=%lld fused_scale_entries=%lld "
-        "fused_direct_pack_includes_scale=1 dma_pipeline_requested=%d dma_pipeline_enabled=%d "
-        "dma_pipeline_host_dma_includes_callback=1 dma_pipeline_eligible_jobs=%lld dma_pipeline_consumed_jobs=%lld "
-        "dma_pipeline_callback_us=%lld "
-        "dma_pipeline_callback_bytes=%llu dma_pipeline_helper_us=%lld dma_pipeline_residual_us=%lld "
-        "dma_pipeline_residual_bytes=%lld dma_pipeline_rejected_jobs=%lld dma_pipeline_helper_wait_us=%lld "
-        "dma_pipeline_helper_publication_lead_us=%lld dma_pipeline_helper_early_completions=%lld",
+        "P2 PACK SUMMARY\n"
+        "  Số worker yêu cầu = %d | Số worker hoạt động = %d | Helper đã dừng = %d | Ngưỡng byte tối thiểu để xử lý song song = %zu\n"
+        "  Số công việc song song = %lld | Số byte xử lý song song = %llu | Số lần bỏ qua xử lý song song do ngưỡng = %lld\n"
+        "  Thời gian đóng gói trên luồng chính(us) = %lld | Thời gian phục vụ của helper(us) = %lld\n"
+        "  Thời gian chờ của luồng gọi(us) = %lld | Số công việc hợp nhất = %lld | Thời gian xử lý hợp nhất(us) = %lld\n"
+        "  Số mục scale hợp nhất = %lld | Đóng gói trực tiếp hợp nhất có bao gồm scale = 1 | Đã yêu cầu DMA pipeline = %d\n"
+        "  Đã bật DMA pipeline = %d | Thời gian DMA phía host trong pipeline có bao gồm callback = 1\n"
+        "  Số công việc đủ điều kiện DMA pipeline = %lld | Số công việc đã xử lý trong DMA pipeline = %lld\n"
+        "  Thời gian callback trong DMA pipeline(us) = %lld | Số byte callback trong DMA pipeline = %llu\n"
+        "  Thời gian helper trong DMA pipeline(us) = %lld | Thời gian xử lý phần còn lại trong DMA pipeline(us) = %lld\n"
+        "  Số byte còn lại trong DMA pipeline = %lld | Số công việc DMA pipeline bị từ chối = %lld\n"
+        "  Thời gian chờ helper trong DMA pipeline(us) = %lld | Thời gian helper công bố trước trong DMA pipeline(us) = %lld\n"
+        "  Số lần helper hoàn tất sớm trong DMA pipeline = %lld",
         g_p2_pack_workers_requested, g_p2_pack_workers_active, g_p2_pack_worker_created ? 0 : 1,
         FPGA_P2_PACK_PARALLEL_MIN_BYTES, g_p2_pack_parallel_jobs, (unsigned long long) g_p2_pack_parallel_bytes,
         g_p2_pack_serial_threshold_skips, g_p2_pack_main_us, g_p2_pack_helper_service_us, g_p2_pack_caller_wait_us,
@@ -9385,16 +9536,28 @@ void fpga_cleanup(void) {
     fpga_log_pack_breakdown("process_total_including_startup", -1, -1,
                             fpga_pack_detail_record(g_pack_detail));
     if (fpga_p2_residency_has_reportable_activity()) {
-        fpga_log_line(true, "P2_RESIDENCY_SUMMARY", true,
-            "forced=1 enabled=%d diagnostic=%d trace=%d verify_metadata=%d slots=%zu/%zu index_buckets=%zu max_probes=%zu probes=%lld "
-            "probe_exhausted_direct_stage=%lld hits=%lld misses=%lld host_metadata_hits=%lld host_metadata_invalidations=%lld "
-            "volatile_ddr_reads=%lld build_us=%lld select_us=%lld metadata_validate_us=%lld resident_param_us=%lld "
-             "direct_weight_pack_us=%lld direct_weight_pack_bytes=%llu direct_weight_pack_GB_s=%.3f "
-             "direct_pack_includes_fused_scale=1 "
-            "avoided_cpu_pack_bytes=%lld avoided_ddr_to_ip_bytes=%lld "
-            "miss_alignment=%lld miss_shape=%lld miss_collision=%lld miss_poison=%lld miss_stale=%lld miss_mismatch=%lld "
-            "miss_capacity=%lld miss_quiescence=%lld miss_range=%lld miss_verify=%lld builds=%lld build_failures=%lld logical_bytes=%lld "
-            "allocated_bytes=%llu remaining_bytes=%llu budget_bytes=%llu",
+        fpga_log_line(true, "P2 RESIDENCY SUMMARY", true,
+            "Cấu hình\n"
+        "  Bắt buộc bật = 1 | Được bật = %d | Chế độ chẩn đoán = %d | Theo dõi chi tiết = %d | Kiểm tra metadata = %d\n"
+        "  Số slot = %zu/%zu | Số bucket chỉ mục = %zu | Số lần dò tối đa = %zu\n"
+        "Tra cứu\n"
+        "  Số lần dò = %lld | Số lần hết lượt dò và chuyển sang staging trực tiếp = %lld | Số lần trúng = %lld | Số lần trượt = %lld\n"
+        "  Số lần trúng metadata trên host = %lld | Số lần vô hiệu hóa metadata trên host = %lld | Số lần đọc DDR volatile = %lld\n"
+        "Thời gian\n"
+        "  Thời gian xây dựng(us) = %lld | Thời gian lựa chọn(us) = %lld | Thời gian kiểm tra metadata(us) = %lld\n"
+        "  Thời gian xử lý tham số thường trú(us) = %lld | Thời gian đóng gói weight trực tiếp(us) = %lld\n"
+        "  Số byte đóng gói weight trực tiếp = %llu | Tốc độ đóng gói weight trực tiếp suy ra(GB/s) = %.3f\n"
+        "  Đóng gói trực tiếp có bao gồm scale hợp nhất = 1\n"
+        "Dữ liệu tránh xử lý\n"
+        "  Số byte tránh phải đóng gói trên CPU = %lld | Số byte tránh phải truyền từ DDR đến IP = %lld\n"
+        "Nguyên nhân trượt\n"
+        "  Số lần trượt do căn chỉnh = %lld | Số lần trượt do kích thước = %lld | Số lần trượt do xung đột = %lld\n"
+        "  Số lần trượt do đánh dấu không hợp lệ = %lld | Số lần trượt do dữ liệu cũ = %lld | Số lần trượt do không khớp = %lld\n"
+        "  Số lần trượt do dung lượng = %lld | Số lần trượt do chưa ở trạng thái yên = %lld | Số lần trượt do phạm vi = %lld\n"
+        "  Số lần trượt do kiểm tra = %lld\n"
+        "Dung lượng và xây dựng\n"
+        "  Số lần xây dựng = %lld | Số lần xây dựng thất bại = %lld | Số byte logic = %lld | Số byte đã cấp phát = %llu\n"
+        "  Số byte còn lại = %llu | Ngân sách bộ nhớ(byte) = %llu",
             g_p2_weight_residency_enabled ? 1 : 0, g_p2_weight_residency_diagnostic ? 1 : 0,
             g_p2_residency_trace_enabled ? 1 : 0, g_p2_residency_verify_metadata ? 1 : 0, g_p2_resident_tile_count,
             g_p2_resident_tiles.size(), g_p2_residency_index.size(), P2_WEIGHT_RESIDENCY_INDEX_MAX_PROBES,
@@ -9414,19 +9577,31 @@ void fpga_cleanup(void) {
             (unsigned long long) p2_residency_budget_bytes);
     }
     fpga_log_line(true, "CLEANUP", true,
-        "complete fpga_calls=%lld vpu_runs=%lld rejects=%lld attention_cpu_bypass=%lld "
-        "vocab_projection_cpu_bypass=%lld legacy_raw_cpu_bypass=%lld elapsed_s=%.3f pingpong_cap=%d descriptor_cap=%d "
-        "scheduler=%d activation_cache_enabled=%d activation_cache_hits=%lld misses=%lld weight_cache_builds=%lld "
-        "hits=%lld misses=%lld bytes=%lld cache_lookup_ms=%.3f cache_crc_ms=%.3f weight_pack_ms=%.3f "
-        "activation_scale_fp16_overflows=%lld input_integrity_checks=%lld input_integrity_failures=%lld "
-        "contract_checks=%lld contract_limit_cpu_bypass=%lld raw_mismatches=%lld raw_repairs=%lld "
-        "value_mismatches=%lld contract_cpu_shadow_dst_values=%lld staging_restages=%lld q8_source_audit_checks=%lld "
-        "q8_source_audit_failures=%lld p2_matrix_contract_checks=%lld p2_tile_q16_checks=%lld p2_tile_limit=%d "
-        "p2_tile_boundary=%d matrix_value_contract=%s p2_contract_jobs=%lld p2_contract_banks=%lld p2_stream_drops=%lld "
-        "p2_stream_errors=%lld p2_residency_enabled=%d p2_residency_slots=%zu/%zu p2_residency_builds=%lld "
-        "p2_residency_hits=%lld p2_residency_direct_stage_misses=%lld p2_residency_build_failures=%lld "
-        "p2_residency_logical_bytes=%lld p2_residency_allocated_bytes=%llu p2_residency_remaining_bytes=%llu "
-        "p2_direct_weight_pack_bytes=%llu p2_direct_weight_pack_ms=%.3f p2_direct_weight_pack_GB_s=%.3f",
+        "Hoàn tất\n"
+        "Thực thi\n"
+        "  Số lần gọi FPGA = %lld | Số lần chạy VPU = %lld | Số lần từ chối = %lld | Số lần chuyển attention sang CPU = %lld\n"
+        "  Số lần chuyển vocab projection sang CPU = %lld | Số lần chuyển nhánh raw cũ sang CPU = %lld\n"
+        "  Thời gian đã trôi qua(s) = %.3f | Khả năng hỗ trợ ping pong = %d | Khả năng hỗ trợ descriptor = %d | Bộ lập lịch = %d\n"
+        "Cache\n"
+        "  Đã bật activation cache = %d | Số lần trúng trong activation cache = %lld | Số lần trượt = %lld\n"
+        "  Số lần xây dựng weight cache = %lld | Số lần trúng = %lld | Số lần trượt = %lld | Số byte = %lld\n"
+        "  Thời gian tra cứu cache(ms) = %.3f | Thời gian CRC cache(ms) = %.3f | Thời gian đóng gói weight(ms) = %.3f\n"
+        "Kiểm tra dữ liệu\n"
+        "  Số lần tràn scale FP16 của activation = %lld | Số lần kiểm tra tính toàn vẹn đầu vào = %lld\n"
+        "  Số lần kiểm tra tính toàn vẹn đầu vào thất bại = %lld | Số lần kiểm tra contract = %lld\n"
+        "  Số lần chuyển sang CPU do giới hạn contract = %lld | Số giá trị raw không khớp = %lld | Số giá trị raw được sửa = %lld\n"
+        "  Số giá trị không khớp = %lld | Số giá trị đầu ra do CPU shadow ghi trong chế độ contract = %lld\n"
+        "  Số lần staging lại = %lld | Số lần kiểm tra nguồn Q8 = %lld | Số lần kiểm tra nguồn Q8 thất bại = %lld\n"
+        "Kiểm tra P2\n"
+        "  Số lần kiểm tra contract ma trận P2 = %lld | Số lần kiểm tra Q16 của tile P2 = %lld | Giới hạn tile P2 = %d\n"
+        "  Ranh giới tile P2 = %d | Contract giá trị ma trận = %s | Số công việc contract P2 = %lld | Số bank contract P2 = %lld\n"
+        "  Số lần mất dữ liệu stream P2 = %lld | Số lỗi stream P2 = %lld\n"
+        "Lưu trú P2\n"
+        "  Đã bật lưu trú P2 = %d | Số slot lưu trú P2 = %zu/%zu | Số lần xây dựng dữ liệu lưu trú P2 = %lld\n"
+        "  Số lần trúng dữ liệu lưu trú P2 = %lld | Số lần trượt dữ liệu lưu trú P2 và staging trực tiếp = %lld\n"
+        "  Số lần xây dựng dữ liệu lưu trú P2 thất bại = %lld | Số byte logic lưu trú P2 = %lld\n"
+        "  Số byte đã cấp phát lưu trú P2 = %llu | Số byte còn lại lưu trú P2 = %llu | Số byte đóng gói weight trực tiếp P2 = %llu\n"
+        "  Thời gian đóng gói weight trực tiếp P2(ms) = %.3f | Tốc độ đóng gói weight trực tiếp P2 suy ra(GB/s) = %.3f",
         g_fpga_count, g_fpga_vpu_runs, g_reject_count, g_attention_bypass_count, g_vocab_projection_bypass_count,
         g_legacy_raw_cpu_bypass_count, elapsed_us > 0 ? (double) elapsed_us / 1000000.0 : 0.0,
         g_vpu_pingpong_supported ? 1 : 0, g_vpu_descriptor_supported ? 1 : 0, g_pingpong_scheduler_enabled ? 1 : 0,
@@ -9438,7 +9613,7 @@ void fpga_cleanup(void) {
         g_contract_value_mismatches, g_contract_cpu_shadow_dst_values, g_contract_staging_restage_count,
         g_q8_source_audit_checks, g_q8_source_audit_failures, g_p2_matrix_contract_checks, g_p2_tile_q16_checks,
         g_p2_tile_limit, g_p2_tile_contract_boundary_reached ? 1 : 0,
-        g_pl_scale_contract_check_limit > 0 ? "not_attempted" : "not_applicable", g_pl_scale_jobs, g_pl_scale_banks,
+        g_pl_scale_contract_check_limit > 0 ? "chưa thực hiện" : "không áp dụng", g_pl_scale_jobs, g_pl_scale_banks,
         g_pl_scale_stream_drops, g_pl_scale_stream_errors, g_p2_weight_residency_enabled ? 1 : 0,
         g_p2_resident_tile_count, g_p2_resident_tiles.size(), g_p2_residency_builds, g_p2_residency_hits,
         g_p2_residency_misses, g_p2_residency_build_failures, g_p2_residency_logical_bytes,
@@ -9598,7 +9773,7 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
             pthread_mutex_lock(&g_mutex);
             g_attention_bypass_count++;
             if (g_attention_bypass_count == 1) {
-                LOGI("Attention: CPU; FPGA timings cover Q8_0 matrix operations");
+                LOGI("Attention do CPU xử lý; thời gian FPGA chỉ bao gồm các phép tính ma trận Q8_0");
             }
             pthread_mutex_unlock(&g_mutex);
         }
@@ -9701,7 +9876,7 @@ extern "C" int fpga_try_matmul_extended(const struct ggml_tensor * src0,
             g_vocab_projection_bypass_count++;
             if (g_vocab_projection_bypass_count == 1) {
                 LOGI(
-                    "Vocabulary projection: CPU tensor=%s shape=K%lld_N%lld_M%lld threshold_n=%lld",
+                    "Vocab projection do CPU xử lý | tensor = %s | Kích thước = K%lld_N%lld_M%lld | Ngưỡng N = %lld",
                     tensor_name, (long long) probe_k, (long long) probe_n, (long long) probe_m,
                     (long long) g_vocab_projection_min_n);
             }
@@ -10881,7 +11056,8 @@ static bool fpga_token_timing_emit(int next_graph_seq,
             0;
     const bool decode_token = ubatch_tokens == 1 && g_token_timing.first_m == 1;
     const char * scope = decode_token ? "decode_token" : (ubatch_tokens > 0 ? "prefill_or_ubatch" : "incomplete");
-    fpga_dma_profile_graph_end(scope, decode_token);
+    fpga_dma_profile_graph_end(scope, decode_token, true);
+    fpga_log_graph_header(g_token_timing.graph_seq, scope);
     std::array<long long, PACK_DETAIL_COUNT> pack_delta = {};
     for (size_t i = 0; i < pack_delta.size(); ++i) {
         pack_delta[i] = g_pack_detail[i] - g_pack_detail_snapshot[i];
@@ -10890,14 +11066,8 @@ static bool fpga_token_timing_emit(int next_graph_seq,
         }
     }
     g_pack_detail_snapshot = g_pack_detail;
-    if (!decode_token) {
-        fpga_log_pack_breakdown(scope, g_token_timing.graph_seq, ubatch_tokens,
-                                fpga_pack_detail_record(pack_delta));
-    }
     if (decode_token) {
         ++g_summary_detail_decode_tokens;
-        fpga_log_result_overlap(g_token_timing.graph_seq, g_p2_result_overlap_enabled,
-                                g_token_timing.result_overlap_jobs, g_token_timing.result_overlap_host_us);
         ++g_fpga_perf_decode.decode_tokens;
         g_fpga_perf_decode.decode_wall_us += token_wall_us;
         g_fpga_perf_decode.fpga_matmuls += g_token_timing.matmuls;
@@ -10926,8 +11096,8 @@ static bool fpga_token_timing_emit(int next_graph_seq,
                                    (g_summary_detail_decode_tokens % g_summary_detail_every) == 0)));
     g_summary_detail_after_error = false;
 
+    fpga_token_timing_log_t report = {};
     if (g_token_timing_enabled || g_bottleneck_summary_enabled) {
-        fpga_token_timing_log_t report = {};
         report.timing_enabled = g_token_timing_enabled;
         report.bottleneck_summary_enabled = g_bottleneck_summary_enabled;
         report.compute_watch_enabled = g_compute_watch_enabled;
@@ -11001,6 +11171,16 @@ static bool fpga_token_timing_emit(int next_graph_seq,
         }
         fpga_log_token_timing(report);
     }
+    fpga_dma_profile_graph_emit();
+    if (!decode_token) {
+        fpga_log_pack_breakdown(scope, g_token_timing.graph_seq, ubatch_tokens,
+                                fpga_pack_detail_record(pack_delta));
+    }
+    if (decode_token) {
+        fpga_log_result_overlap(g_token_timing.graph_seq, g_p2_result_overlap_enabled,
+                                g_token_timing.result_overlap_jobs, g_token_timing.result_overlap_host_us);
+    }
+    fpga_log_token_diagnostics(report);
     fpga_token_timing_reset();
     return true;
 }
@@ -11520,9 +11700,11 @@ static bool fpga_weight_layout_host_self_test(void) {
         }
     }
     LOGI(
-        "P2_LAYOUT_SELFTEST_PASS layout=pair_interleaved_padded cases=20 "
-        "i8x16_le_words=03020100,07060504,0b0a0908,0f0e0d0c "
-        "emission=logical_row_equals_pair_major_zero_odd mapping=index=((row>>1)*group_beats+beat)*2+(row&1)");
+        "P2 LAYOUT SELFTEST PASS\n"
+        "  Bố trí dữ liệu = xen kẽ theo cặp có đệm | Số trường hợp = 20\n"
+        "  Các word i8x16 little endian = 03020100,07060504,0b0a0908,0f0e0d0c\n"
+        "  Quy tắc xuất dữ liệu = hàng logic theo pair major, đệm zero cho hàng lẻ\n"
+        "  Công thức ánh xạ = index=((row>>1)*group_beats+beat)*2+(row&1)");
     return true;
 }
 
@@ -12745,8 +12927,8 @@ static bool fpga_weight_path_bench_write(const fpga_weight_path_bench_job_t & jo
     fpga_p2_pack_worker_task_t task = {job.src0, job.weight_data_base, job.row0, job.k_block0,
         job.rows, job.group_blocks, job.group_beats, split, pairs, dst,
         (pairs - split) * words_per_pair, 0, cached};
-    if (parallel && (!fpga_p2_pack_worker_next_generation(&task.generation) ||
-                     !fpga_p2_pack_worker_submit(task))) return false;
+    if (parallel && (!fpga_p2_pack_worker_next_generation(&task.generation, false) ||
+                     !fpga_p2_pack_worker_submit(task, false))) return false;
     auto main_task = task;
     main_task.pair_begin = 0;
     main_task.pair_end = split;

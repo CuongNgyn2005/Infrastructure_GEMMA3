@@ -8,6 +8,8 @@
 #include <limits>
 #include <ctime>
 #include <cstdint>
+#include <string>
+#include <vector>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/resource.h>
@@ -19,6 +21,53 @@ constexpr const char * FPGA_LOG_FILE = "/tmp/fpga_debug.log";
 int g_flush_every   = 256;
 int g_pending_lines = 0;
 
+
+constexpr const char * LOG_BORDER = "==============================================================================================================";
+const char * log_scope(const char * scope) {
+    if (!scope) return "chưa hoàn tất";
+    if (!std::strcmp(scope, "decode_token")) return "token decode";
+    if (!std::strcmp(scope, "prefill_or_ubatch")) return "prefill hoặc ubatch";
+    if (!std::strcmp(scope, "decode_total")) return "tổng decode";
+    if (!std::strcmp(scope, "process_total_including_startup")) return "toàn bộ tiến trình, bao gồm khởi động";
+    if (!std::strcmp(scope, "all_graphs_total")) return "tổng các graph";
+    if (!std::strcmp(scope, "incomplete")) return "chưa hoàn tất";
+    return scope;
+}
+// Labels use precomposed Vietnamese UTF-8; count characters instead of bytes.
+size_t log_width(const std::string & text) {
+    size_t width = 0;
+    for (unsigned char c : text) if ((c & 0xc0) != 0x80) ++width;
+    return width;
+}
+using log_table_t = std::vector<std::vector<std::string>>;
+void log_table(FILE * fp, const log_table_t & rows) {
+    if (rows.empty()) return;
+    std::vector<size_t> widths(rows.front().size());
+    for (const auto & row : rows)
+        for (size_t i = 0; i < row.size(); ++i) widths[i] = std::max(widths[i], log_width(row[i]));
+    const auto border = [&]() {
+        fputs("  +", fp);
+        for (size_t width : widths) { fputs(std::string(width + 2, '-').c_str(), fp); fputc('+', fp); }
+        fputc('\n', fp);
+    };
+    border();
+    for (size_t r = 0; r < rows.size(); ++r) {
+        fputs("  |", fp);
+        for (size_t i = 0; i < rows[r].size(); ++i) {
+            const auto & cell = rows[r][i];
+            const std::string padding(widths[i] - log_width(cell), ' ');
+            const bool numeric = r > 0 && i > 0;
+            fprintf(fp, " %s%s%s |", numeric ? padding.c_str() : "", cell.c_str(), numeric ? "" : padding.c_str());
+        }
+        fputc('\n', fp);
+        border();
+    }
+}
+std::string log_ms(double us) {
+    char text[64];
+    snprintf(text, sizeof(text), "%.3f", us / 1000.0);
+    return text;
+}
 } // namespace
 
 FILE * fpga_log_fp() {
@@ -51,11 +100,23 @@ FILE * fpga_log_fp() {
 
         const time_t now = time(nullptr);
         fprintf(fp, "\n============================================================\n");
-        fprintf(fp, "ZDMA DDR-to-IP log started at %ld\n", (long) now);
+        fprintf(fp, "Log ZDMA DDR-to-IP bắt đầu tại mốc thời gian %ld\n", (long) now);
         fprintf(fp, "============================================================\n");
         fflush(fp);
     }
     return fp;
+}
+
+void fpga_log_section(const char * title) {
+    FILE * fp = fpga_log_fp();
+    if (fp == stderr) return;
+    fprintf(fp, "\n%s\n%s\n%s\n", LOG_BORDER, title ? title : "", LOG_BORDER);
+}
+void fpga_log_graph_header(int graph_seq, const char * scope) {
+    char title[160];
+    if (scope && !std::strcmp(scope, "decode_token")) snprintf(title, sizeof(title), "Graph = %d", graph_seq);
+    else snprintf(title, sizeof(title), "Graph = %d | Phạm vi = %s", graph_seq, log_scope(scope));
+    fpga_log_section(title);
 }
 
 void fpga_log_set_flush_every(int flush_every) {
@@ -84,7 +145,7 @@ void fpga_log_latency(const char * fmt, ...) {
     }
     va_list ap;
     va_start(ap, fmt);
-    fpga_log_vline("LATENCY", true, fmt, ap);
+    fpga_log_vline("ĐỘ TRỄ", true, fmt, ap);
     va_end(ap);
 }
 
@@ -93,8 +154,8 @@ void fpga_log_result_overlap(int graph_seq, bool enabled, long long jobs, long l
         return;
     }
     FILE * fp = fpga_log_fp();
-    fprintf(fp, "[RESULT_OVERLAP] graph_seq=%d enabled=%d jobs=%lld host_after_next_launch_ms=%.3f "
-                "scope=decode_token actual_hidden_time=not_measured\n",
+    fprintf(fp, "[RESULT OVERLAP]\n  Graph = %d | Được bật = %d | Số công việc = %lld\n"
+                "  Host xử lý sau lần chạy tiếp(ms) = %.3f | Thời gian thực sự được che giấu = chưa đo\n",
             graph_seq, enabled ? 1 : 0, jobs, (double) host_us / 1000.0);
     fpga_log_finish_line(fp, false);
 }
@@ -117,14 +178,16 @@ void fpga_log_pack_breakdown(const char * scope, int graph_seq, long long tokens
         data.reserve_unlock_us - data.submit_lock_us - data.submit_publish_us -
         data.submit_signal_us - data.submit_unlock_us;
     fpga_log_latency(
-        "P2_PACK_BREAKDOWN scope=%s graph_seq=%d tokens=%lld total_us=%lld serial_pack_us=%lld "
-        "dispatch_us=%lld main_pack_us=%lld caller_fence_us=%lld caller_wait_us=%lld "
-        "other_us=%lld helper_service_overlap_us=%lld serial_jobs=%lld parallel_jobs=%lld "
-        "reserve_lock_us=%lld reserve_body_us=%lld reserve_unlock_us=%lld "
-        "submit_lock_us=%lld submit_publish_us=%lld submit_signal_us=%lld submit_unlock_us=%lld "
-        "dispatch_other_us=%lld dispatch_detail=subsets_of_dispatch_wall_time submit_notify_order=unlock_then_signal "
-        "measurement=instrumented_successful_direct_preparation",
-        scope, graph_seq, tokens, data.total_us, data.serial_pack_us, data.dispatch_us,
+        "P2 PACK BREAKDOWN\n  Phạm vi = %s | Graph = %d | Số token = %lld\n"
+        "  Tổng thời gian(us) = %lld | Đóng gói tuần tự(us) = %lld | Điều phối(us) = %lld\n"
+        "  Đóng gói luồng chính(us) = %lld | Fence luồng gọi(us) = %lld | Chờ luồng gọi(us) = %lld\n"
+        "  Thời gian khác suy ra(us) = %lld | Helper overlap(us) = %lld | Công việc tuần tự = %lld | Công việc song song = %lld\n"
+        "  Đặt chỗ: lấy khóa(us) = %lld | xử lý(us) = %lld | nhả khóa(us) = %lld\n"
+        "  Giao việc: lấy khóa(us) = %lld | công bố(us) = %lld | phát tín hiệu(us) = %lld | nhả khóa(us) = %lld\n"
+        "  Điều phối khác suy ra(us) = %lld\n"
+        "  Chi tiết điều phối = các phần trong thời gian điều phối | Thứ tự thông báo = nhả khóa rồi phát tín hiệu\n"
+        "  Phạm vi đo = chuẩn bị trực tiếp thành công có đo đạc | Thời gian helper = overlap, không cộng độc lập",
+        log_scope(scope), graph_seq, tokens, data.total_us, data.serial_pack_us, data.dispatch_us,
         data.main_pack_us, data.caller_fence_us, data.caller_wait_us, other_us, data.helper_service_us,
         data.serial_jobs, data.parallel_jobs, data.reserve_lock_us, data.reserve_body_us,
         data.reserve_unlock_us, data.submit_lock_us, data.submit_publish_us, data.submit_signal_us,
@@ -132,12 +195,45 @@ void fpga_log_pack_breakdown(const char * scope, int graph_seq, long long tokens
 }
 
 #ifdef USE_FPGA
-void fpga_log_ram_bandwidth() {
+namespace {
+struct ram_report_t {
+    bool pending = false;
+    int status = 0; // 0 success, 1 allocation failure, 2 invalid duration, 3 mismatch
+    size_t allocation_bytes = 0, buffer_bytes = 0, copied_bytes = 0;
+    unsigned passes = 0;
+    double seconds = 0.0, copy_gb_s = 0.0;
+};
+ram_report_t ram_report;
+bool startup_started = false;
+}
+void fpga_log_startup_begin() {
     FILE * fp = fpga_log_fp();
-    if (fp == stderr) {
-        return;
+    if (fp == stderr) return;
+    if (!startup_started) { fpga_log_section("Khởi động"); startup_started = true; }
+    if (!ram_report.pending) return;
+    const auto r = ram_report;
+    ram_report.pending = false;
+    if (r.status == 1) {
+        fprintf(fp, "[RAM BANDWIDTH]\n  Trạng thái = bỏ qua | Lý do = cấp phát thất bại | Số byte cấp phát = %zu\n", r.allocation_bytes);
+    } else if (r.status) {
+        fprintf(fp, "[RAM BANDWIDTH]\n  Trạng thái = thất bại | Lý do = %s\n",
+                r.status == 2 ? "thời gian không hợp lệ" : "dữ liệu sao chép không khớp");
+    } else {
+        fprintf(fp, "[RAM BANDWIDTH]\n  Phạm vi = bộ nhớ có cache của CPU khi khởi động\n"
+                    "  Trạng thái = thành công | Phương pháp = libc_memcpy | Số luồng = 1\n"
+                    "  Buffer(byte) = %zu | Số lượt = %u | Số byte sao chép = %zu | Thời gian(ms) = %.6f\n"
+                    "  Tốc độ sao chép suy ra(GB/s) = %.6f | Tốc độ đọc và ghi logic suy ra(GB/s) = %.6f | Đã kiểm tra = 1\n"
+                    "  Lưu lượng DDR vật lý = chưa đo | Cấp phát, warmup và kiểm tra = không tính | Đơn vị = GB thập phân\n",
+                r.buffer_bytes, r.passes, r.copied_bytes, r.seconds * 1000.0, r.copy_gb_s, 2.0 * r.copy_gb_s);
     }
-    // Two 32 MiB buffers exceed the ZCU104 CPU cache capacity. Touch every
+    fpga_log_finish_line(fp, true);
+}
+void fpga_log_ram_bandwidth(bool defer_output) {
+    if (fpga_log_fp() == stderr) return;
+    if (ram_report.pending) fpga_log_startup_begin();
+    ram_report = {};
+    ram_report.pending = true;
+    // Two 32 MiB buffers exceed the CPU cache capacity. Touch every
     // page before timing, so allocation and initial page faults are excluded.
     // This is logical memcpy throughput, not a DDR-controller traffic counter.
     constexpr size_t bytes = 32u * 1024u * 1024u;
@@ -147,8 +243,9 @@ void fpga_log_ram_bandwidth() {
     if (!src || !dst) {
         std::free(src);
         std::free(dst);
-        fprintf(fp, "[RAM_BANDWIDTH] status=skipped reason=allocation_failed allocation_bytes=%zu\n", 2 * bytes);
-        fpga_log_finish_line(fp, true);
+        ram_report.status = 1;
+        ram_report.allocation_bytes = 2 * bytes;
+        if (!defer_output) fpga_log_startup_begin();
         return;
     }
     for (size_t i = 0; i < bytes; ++i) {
@@ -168,20 +265,15 @@ void fpga_log_ram_bandwidth() {
     const bool verified = std::memcmp(src, dst, bytes) == 0;
     std::free(src);
     std::free(dst);
-    if (!verified || seconds <= 0.0) {
-        fprintf(fp, "[RAM_BANDWIDTH] status=failed reason=%s\n",
-                verified ? "invalid_duration" : "copy_mismatch");
-    } else {
-        const size_t copied_bytes = bytes * passes;
-        const double copy_gb_s = static_cast<double>(copied_bytes) / seconds / 1e9;
-        fprintf(fp, "[RAM_BANDWIDTH] status=ok method=libc_memcpy threads=1 "
-                    "buffer_bytes=%zu passes=%u copied_bytes=%zu elapsed_ms=%.6f "
-                    "copy_GB_s=%.6f logical_read_write_GB_s=%.6f verified=1 "
-                    "scope=startup_cpu_cached_memory physical_ddr_traffic=not_measured "
-                    "allocation_warmup_verification=excluded units=decimal_GB\n",
-                bytes, passes, copied_bytes, seconds * 1000.0, copy_gb_s, 2.0 * copy_gb_s);
+    ram_report.status = !verified ? 3 : seconds <= 0.0 ? 2 : 0;
+    if (!ram_report.status) {
+        ram_report.buffer_bytes = bytes;
+        ram_report.passes = passes;
+        ram_report.copied_bytes = bytes * passes;
+        ram_report.seconds = seconds;
+        ram_report.copy_gb_s = static_cast<double>(ram_report.copied_bytes) / seconds / 1e9;
     }
-    fpga_log_finish_line(fp, true);
+    if (!defer_output) fpga_log_startup_begin();
 }
 
 void fpga_log_load_checkpoint(const char * phase) {
@@ -203,10 +295,21 @@ void fpga_log_load_checkpoint(const char * phase) {
         }
         fclose(io);
     }
-    fpga_log_latency("[MODEL_LOAD_DETAIL] phase=%s elapsed_ms=%.3f user_cpu_ms=%.3f system_cpu_ms=%.3f "
-                     "minor_faults=%ld major_faults=%ld block_inputs=%ld read_bytes=%lld "
-                     "max_rss_kib=%ld counters=process_cumulative unavailable=-1",
-                     phase, elapsed_ms, user_ms, system_ms,
+    const char * phase_text = phase ? phase : "không rõ";
+    const struct { const char * key; const char * label; } phases[] = {
+        {"metadata_begin", "bắt đầu metadata"}, {"metadata_done", "hoàn tất metadata"},
+        {"vocab_begin", "bắt đầu vocab"}, {"vocab_done", "hoàn tất vocab"},
+        {"tensors_begin", "bắt đầu tensor"}, {"tensors_done", "hoàn tất tensor"},
+        {"mapping_begin", "bắt đầu ánh xạ"}, {"mapping_done", "hoàn tất ánh xạ"},
+        {"buffers_done", "hoàn tất buffer"}, {"tensor_data_begin", "bắt đầu dữ liệu tensor"},
+        {"tensor_data_done", "hoàn tất dữ liệu tensor"}, {"tensors_cancelled", "hủy nạp tensor"}, {"load_error", "lỗi nạp"}
+    };
+    for (const auto & item : phases) if (phase && !std::strcmp(phase, item.key)) { phase_text = item.label; break; }
+    fpga_log_latency("[MODEL LOAD DETAIL]\n  Giai đoạn = %s\n"
+                     "  Thời gian(ms) = %.3f | CPU người dùng(ms) = %.3f | CPU hệ thống(ms) = %.3f\n"
+                     "  Minor page fault = %ld | Major page fault = %ld | Nhập block = %ld | Số byte đọc = %lld\n"
+                     "  RSS tối đa(KiB) = %ld | Bộ đếm = tích lũy theo tiến trình | Không có dữ liệu = -1",
+                     phase_text, elapsed_ms, user_ms, system_ms,
                      usage_ok ? usage.ru_minflt : -1L, usage_ok ? usage.ru_majflt : -1L,
                      usage_ok ? usage.ru_inblock : -1L, read_bytes, usage_ok ? usage.ru_maxrss : -1L);
 }
@@ -216,8 +319,9 @@ void fpga_log_load_checkpoint(const char * phase) {
 
 void fpga_log_runtime_summary(double load_ms, double prompt_ms, int prompt_tokens,
                               double decode_ms, int decode_runs) {
-    fpga_log_latency("RUNTIME_SUMMARY load_ms=%.2f prompt_tokens=%d prompt_ms=%.2f prompt_tokens_s=%.2f "
-                     "decode_runs=%d decode_ms=%.2f decode_tokens_s=%.2f",
+    fpga_log_section("Tổng kết thời gian chạy");
+    fpga_log_latency("RUNTIME SUMMARY\n  Nạp mô hình(ms) = %.2f | Token prompt = %d | Prompt(ms) = %.2f | Tốc độ prompt suy ra(token/s) = %.2f\n"
+                     "  Số lượt decode = %d | Decode(ms) = %.2f | Tốc độ decode suy ra(token/s) = %.2f",
                      load_ms, prompt_tokens, prompt_ms, prompt_ms > 0 ? 1000.0 * prompt_tokens / prompt_ms : 0.0,
                      decode_runs, decode_ms, decode_ms > 0 ? 1000.0 * decode_runs / decode_ms : 0.0);
 }
@@ -225,14 +329,17 @@ void fpga_log_runtime_summary(double load_ms, double prompt_ms, int prompt_token
 
 void fpga_log_prompt_weight_reuse(const char * tensor, long long columns, long long jobs,
                                   unsigned long long avoided_bytes) {
-    fpga_log_latency("PROMPT_WEIGHT_BANK_REUSE tensor=%s columns=%lld reused_jobs=%lld "
-                     "avoided_weight_dma_bytes=%llu scope=completed_matmul",
-                     tensor ? tensor : "?", columns, jobs, avoided_bytes);
+    FILE * fp = fpga_log_fp();
+    if (fp == stderr) return;
+    fprintf(fp, "[ĐỘ TRỄ] PROMPT WEIGHT BANK REUSE\n  Số cột = %lld | Phạm vi = phép matmul đã hoàn tất\n", columns);
+    log_table(fp, {{"tensor", "Số công việc tái sử dụng", "Số byte DMA weight tránh được"},
+                   {tensor ? tensor : "?", std::to_string(jobs), std::to_string(avoided_bytes)}});
+    fpga_log_finish_line(fp, true);
 }
 
 namespace {
 // Serialized by the host's existing submission/lifecycle mutex. No worker,
-// watcher, allocation, lock, MMIO access, or per-descriptor output is added.
+// watcher, per-descriptor allocation, lock, MMIO access, or per-descriptor output is added.
 struct dma_profile_row {
     unsigned long long descriptors = 0, bytes = 0, failures = 0, failed_bytes = 0;
     long long preparation_us = 0, launch_to_observed_us = 0, callback_pack_us = 0;
@@ -337,6 +444,19 @@ void dma_timeline_add(dma_profile_timeline & dst, const dma_profile_timeline & s
     dst = next;
 }
 
+struct dma_pending_report {
+    bool ready = false;
+    dma_profile_bucket profile;
+    dma_profile_timeline timeline;
+    std::string scope;
+    int graph_seq = -1;
+    unsigned long long graphs = 0;
+};
+dma_pending_report dma_pending;
+bool dma_config_valid = true;
+bool dma_configured = false;
+bool dma_config_emitted = false;
+
 void dma_timeline_emit(const dma_profile_timeline & g, const char * scope, int graph_seq, bool aggregate) {
     FILE * fp = fpga_log_fp();
     if (fp == stderr) return;
@@ -346,20 +466,22 @@ void dma_timeline_emit(const dma_profile_timeline & g, const char * scope, int g
     const auto duration = [usable](long long value) { return usable ? value : -1LL; };
     const double service_fraction = usable && g.window_us > 0 ? (double) g.service_us / g.window_us : -1.0;
     const double gap_fraction = usable && g.window_us > 0 ? (double) g.gap_us / g.window_us : -1.0;
-    fprintf(fp, "[DMA_PROFILE_TIMELINE] scope=%s graph_seq=%d valid_graphs=%lld excluded_graphs=%lld "
-                "no_dma_graphs=%lld aggregate_valid=%d begin_mono_us=%lld end_mono_us=%lld "
-                "profile_window_us=%lld head_to_first_launch_us=%lld launch_to_done_observed_us=%lld "
-                "done_observed_to_next_launch_us=%lld tail_after_last_done_observed_us=%lld no_dma_window_us=%lld "
-                "descriptors=%lld gap_count=%lld max_gap_us=%lld observed_service_fraction=%.6f observed_gap_fraction=%.6f "
-                "window_scope=profiler_graph_hooks cross_graph_gaps=excluded endpoints=%s "
-                "hardware_completion_time=not_measured service=software_upper_envelope "
-                "gap=owned_channel_idle_lower_bound sole_channel_ownership=required clock_resolution_us=1 "
-                "ddr_utilization=not_measured callback_prep_cleanup=overlapping_subsets fatal_inflight=excluded\n",
-            scope, graph_seq, g.valid_graphs, g.excluded_graphs, g.no_dma_graphs, usable ? 1 : 0,
+    fprintf(fp, "[DMA_PROFILE_TIMELINE]\n  Phạm vi = %s | Graph = %d | Graph hợp lệ = %lld | Graph loại trừ = %lld | Graph không DMA = %lld | Tổng hợp hợp lệ = %d\n"
+                "  Bắt đầu monotonic(us) = %lld | Kết thúc monotonic(us) = %lld\n"
+                "  Cửa sổ profiler(us) = %lld | Đầu cửa sổ đến khởi chạy đầu(us) = %lld | Khởi chạy đến quan sát hoàn tất(us) = %lld\n"
+                "  Quan sát hoàn tất đến khởi chạy tiếp(us) = %lld | Sau quan sát hoàn tất cuối(us) = %lld | Cửa sổ không DMA(us) = %lld\n"
+                "  Descriptor = %lld | Số khoảng giữa descriptor = %lld | Khoảng lớn nhất(us) = %lld\n"
+                "  Tỷ lệ khoảng khởi chạy đến quan sát hoàn tất, suy ra = %.6f | Tỷ lệ khoảng giữa descriptor, suy ra = %.6f\n"
+                "Phạm vi đo\n  Cửa sổ = hook profiler của graph | Khoảng giữa các graph = loại trừ | Hai đầu = %s\n"
+                "  Thời điểm phần cứng hoàn tất = chưa đo | Khoảng phục vụ = bao trên quan sát từ phần mềm\n"
+                "  Khoảng giữa descriptor = chỉ là cận dưới thời gian kênh nghỉ nếu host sở hữu độc quyền kênh; không khẳng định DDR ngừng truyền\n"
+                "  Sở hữu độc quyền kênh = điều kiện bắt buộc | Độ phân giải đồng hồ(us) = 1\n"
+                "  Mức sử dụng DDR = chưa đo | Callback, chuẩn bị, dọn dẹp = các phần có overlap | Lỗi nghiêm trọng khi đang truyền = loại trừ\n",
+            log_scope(scope), graph_seq, g.valid_graphs, g.excluded_graphs, g.no_dma_graphs, usable ? 1 : 0,
             g.begin, g.end, duration(g.window_us), duration(g.head_us), duration(g.service_us), duration(g.gap_us),
             duration(g.tail_us), duration(g.no_dma_us), duration(g.descriptors), duration(g.gap_count),
             duration(g.max_gap_us), service_fraction, gap_fraction,
-            aggregate ? "valid_window_envelope_not_denominator" : "window_boundaries");
+            aggregate ? "bao các cửa sổ hợp lệ, không phải mẫu số" : "biên cửa sổ");
     fpga_log_finish_line(fp, false);
 }
 
@@ -388,36 +510,43 @@ void dma_profile_emit(const dma_profile_bucket & bucket, const char * scope, int
                       unsigned long long graphs) {
     FILE * fp = fpga_log_fp();
     if (fp == stderr) return;
-    const char * const tags[] = {"ACT", "WEIGHT", "SPU_SCALE", "RESULT", "OTHER"};
-    for (int i = 0; i < 5; ++i) {
-        const auto & r = bucket.rows[i];
-        if (!r.descriptors && !r.failures && !r.timing_invalid) continue;
-        fprintf(fp, "[DMA_PROFILE] scope=%s graph_seq=%d decode_graphs=%llu tag=%s "
-                    "descriptors=%llu bytes=%llu preparation_us=%lld launch_to_observed_us=%lld "
-                    "callback_pack_us=%lld callback_pack_count=%llu callback_pack_bytes=%llu "
-                    "noncallback_launch_interval_us=%lld cleanup_us=%lld failures=%llu failed_bytes=%llu "
-                    "failed_elapsed_us=%lld failed_callback_pack_us=%lld timing_invalid=%llu "
-                    "post_pack_completion_observed=%llu post_pack_channel_enabled=%llu "
-                    "post_pack_incomplete_en_clear=%llu post_pack_error=%llu post_pack_observation_gap_us=%lld "
-                    "successful_timing=valid_samples_only failed_callback_scope=all_attempted_batches "
-                    "post_pack_scope=all_valid_samples callback_bytes_scope=weights_only "
-                    "failure_scope=returned_failures fatal_inflight=excluded "
-                    "noncallback_meaning=host_launch_interval_minus_measured_callback_pack "
-                    "hardware_completion_time=not_measured contention=not_measured\n",
-                scope, graph_seq, graphs, tags[i], r.descriptors, r.bytes, r.preparation_us,
-                r.launch_to_observed_us, r.callback_pack_us, r.callback_pack_count, r.callback_pack_bytes,
-                r.noncallback_launch_interval_us, r.cleanup_us, r.failures, r.failed_bytes,
-                r.failed_elapsed_us, r.failed_callback_pack_us, r.timing_invalid, r.completion_observed,
-                r.channel_enabled, r.incomplete_en_clear, r.error, r.post_pack_observation_gap_us);
-        fpga_log_finish_line(fp, false);
-    }
-    fprintf(fp, "[DMA_PROFILE_PACK] scope=%s graph_seq=%d decode_graphs=%llu success_only=1 "
-                "finalize_count=%llu residual_bytes=%llu residual_us=%lld helper_wait_us=%lld "
-                "helper_service_overlap_us=%lld finalize_us=%lld timing_invalid=%llu "
-                "helper_service_is_overlapping=1 residual_bytes_scope=weights_only failure_invalidation_waits=excluded "
-                "finalize_wall_clock=monotonic imported_component_clock=realtime_existing "
-                "components_not_guaranteed_partition=1\n",
-            scope, graph_seq, graphs, bucket.finalize_count, bucket.residual_bytes, bucket.residual_us,
+    fprintf(fp, "[DMA_PROFILE]\n  Phạm vi = %s | Graph = %d | Số graph decode = %llu\n", log_scope(scope), graph_seq, graphs);
+    const auto & other = bucket.rows[4];
+    const int columns = other.descriptors || other.failures || other.timing_invalid ? 5 : 4;
+    const char * tags[] = {"ACT", "WEIGHT", "SPU SCALE", "RESULT", "OTHER"};
+    log_table_t table = {{"Thông số"}};
+    for (int i = 0; i < columns; ++i) table[0].push_back(tags[i]);
+    { std::vector<std::string> row = {"Số descriptor"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].descriptors)); table.push_back(row); }
+    { std::vector<std::string> row = {"Số byte"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].bytes)); table.push_back(row); }
+    { std::vector<std::string> row = {"Chuẩn bị(us)"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].preparation_us)); table.push_back(row); }
+    { std::vector<std::string> row = {"Khởi chạy đến quan sát hoàn tất(us)"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].launch_to_observed_us)); table.push_back(row); }
+    { std::vector<std::string> row = {"Pack trong callback(us)"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].callback_pack_us)); table.push_back(row); }
+    { std::vector<std::string> row = {"Số lần pack trong callback"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].callback_pack_count)); table.push_back(row); }
+    { std::vector<std::string> row = {"Số byte pack trong callback"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].callback_pack_bytes)); table.push_back(row); }
+    { std::vector<std::string> row = {"Khoảng khởi chạy trừ callback pack, suy ra(us)"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].noncallback_launch_interval_us)); table.push_back(row); }
+    { std::vector<std::string> row = {"Dọn dẹp(us)"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].cleanup_us)); table.push_back(row); }
+    { std::vector<std::string> row = {"Số lần lỗi"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].failures)); table.push_back(row); }
+    { std::vector<std::string> row = {"Số byte lỗi"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].failed_bytes)); table.push_back(row); }
+    { std::vector<std::string> row = {"Thời gian lần lỗi(us)"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].failed_elapsed_us)); table.push_back(row); }
+    { std::vector<std::string> row = {"Callback pack của lần lỗi(us)"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].failed_callback_pack_us)); table.push_back(row); }
+    { std::vector<std::string> row = {"Số mẫu thời gian không hợp lệ"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].timing_invalid)); table.push_back(row); }
+    { std::vector<std::string> row = {"Sau pack: đã quan sát hoàn tất"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].completion_observed)); table.push_back(row); }
+    { std::vector<std::string> row = {"Sau pack: EN còn bật"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].channel_enabled)); table.push_back(row); }
+    { std::vector<std::string> row = {"Sau pack: chưa hoàn tất, EN tắt"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].incomplete_en_clear)); table.push_back(row); }
+    { std::vector<std::string> row = {"Sau pack: lỗi"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].error)); table.push_back(row); }
+    { std::vector<std::string> row = {"Kết thúc pack đến đọc trạng thái(us)"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].post_pack_observation_gap_us)); table.push_back(row); }
+    log_table(fp, table);
+    fputs("  Thời gian thành công = chỉ mẫu hợp lệ | Callback khi lỗi = tất cả batch đã thử\n"
+          "  Sau pack = tất cả mẫu hợp lệ | Byte callback = chỉ WEIGHT\n"
+          "  Lỗi = các lần trả về lỗi | Lỗi nghiêm trọng khi đang truyền = loại trừ\n"
+          "  Khoảng ngoài callback = khoảng khởi chạy phía host trừ callback pack đã đo\n"
+          "  Thời điểm phần cứng hoàn tất = chưa đo | Tranh chấp = chưa đo\n", fp);
+    fprintf(fp, "[DMA_PROFILE_PACK]\n  Phạm vi = %s | Graph = %d | Số graph decode = %llu | Chỉ lần thành công = 1\n"
+                "Pack còn lại\n  Số lần finalize = %llu | Số byte còn lại = %llu | Pack còn lại(us) = %lld\n"
+                "Helper và finalize\n  Chờ helper(us) = %lld | Helper overlap(us) = %lld | Finalize(us) = %lld | Mẫu thời gian không hợp lệ = %llu\n"
+                "Phạm vi đo\n  Helper có overlap = 1 | Byte còn lại = chỉ WEIGHT | Chờ vô hiệu hóa khi lỗi = loại trừ\n"
+                "  Đồng hồ finalize = monotonic | Đồng hồ thành phần = realtime hiện có | Tổng các thành phần có thể khác finalize = 1\n",
+            log_scope(scope), graph_seq, graphs, bucket.finalize_count, bucket.residual_bytes, bucket.residual_us,
             bucket.helper_wait_us, bucket.helper_service_overlap_us, bucket.finalize_us,
             bucket.finalize_timing_invalid);
     fpga_log_finish_line(fp, true);
@@ -438,15 +567,23 @@ bool fpga_dma_profile_configure() {
     dma_profile_transfer_state_current = {};
     dma_profile_finalize_start = -1;
     dma_timeline_graph = {}; dma_timeline_decode = {}; dma_timeline_all_graphs = {};
-    FILE * fp = fpga_log_fp();
-    if (fp != stderr) {
-        fprintf(fp, "[DMA_PROFILE_CONFIG] enabled=%d valid=%d default=off descriptor_clock=monotonic "
-                    "finalize_wall_clock=monotonic imported_component_clock=realtime_existing "
-                    "output=file_only graph_collection=enabled_when_profiled final_totals_require=normal_cleanup\n",
-                dma_profile_on ? 1 : 0, valid ? 1 : 0);
-        fpga_log_finish_line(fp, true);
-    }
+    dma_pending = {};
+    dma_config_valid = valid;
+    dma_configured = true;
+    dma_config_emitted = false;
+    if (!valid) fpga_dma_profile_log_config();
     return valid;
+}
+void fpga_dma_profile_log_config() {
+    if (!dma_configured || dma_config_emitted) return;
+    dma_config_emitted = true;
+    FILE * fp = fpga_log_fp();
+    if (fp == stderr) return;
+    fprintf(fp, "[DMA_PROFILE_CONFIG]\n  Bật = %d | Hợp lệ = %d | Mặc định = tắt\n"
+                "  Đồng hồ descriptor = monotonic | Đồng hồ finalize = monotonic | Đồng hồ thành phần = realtime hiện có\n"
+                "  Đầu ra = chỉ file | Thu thập graph = khi bật profiler | Tổng cuối = cần cleanup bình thường\n",
+            dma_profile_on ? 1 : 0, dma_config_valid ? 1 : 0);
+    fpga_log_finish_line(fp, true);
 }
 
 fpga_dma_profile_transfer::fpga_dma_profile_transfer(const char * tag, size_t bytes) :
@@ -581,6 +718,7 @@ void fpga_dma_profile_finalize_end(long long residual_us, long long helper_wait_
 }
 void fpga_dma_profile_graph_begin(int graph_seq) {
     if (!fpga_dma_profile_enabled()) return;
+    fpga_dma_profile_graph_emit();
     if (dma_profile_graph_active) fpga_dma_profile_graph_end("incomplete", false);
     dma_profile_graph = {};
     dma_timeline_graph = {};
@@ -590,7 +728,7 @@ void fpga_dma_profile_graph_begin(int graph_seq) {
     dma_profile_graph_seq = graph_seq;
     dma_profile_graph_active = true;
 }
-void fpga_dma_profile_graph_end(const char * scope, bool decode_token) {
+void fpga_dma_profile_graph_end(const char * scope, bool decode_token, bool defer_output) {
     if (!fpga_dma_profile_enabled() || !dma_profile_graph_active) return;
     auto & g = dma_timeline_graph;
     g.end = dma_profile_clock(); // Freeze the window before any report output.
@@ -621,14 +759,29 @@ void fpga_dma_profile_graph_end(const char * scope, bool decode_token) {
     }
     dma_timeline_add(dma_timeline_all_graphs, sample);
     if (decode_token) dma_timeline_add(dma_timeline_decode, sample);
-    dma_timeline_emit(g, scope ? scope : "incomplete", dma_profile_graph_seq, false);
-    dma_profile_emit(dma_profile_graph, scope, dma_profile_graph_seq, decode_token ? 1 : 0);
+    // The window is frozen above. Emission never contributes to that window.
+    fpga_dma_profile_graph_emit();
+    dma_pending.ready = true;
+    dma_pending.profile = dma_profile_graph;
+    dma_pending.timeline = g;
+    dma_pending.scope = scope ? scope : "incomplete";
+    dma_pending.graph_seq = dma_profile_graph_seq;
+    dma_pending.graphs = decode_token ? 1 : 0;
     if (decode_token) { dma_profile_add(dma_profile_decode, dma_profile_graph); ++dma_profile_decode_graphs; }
     dma_profile_graph = {};
     dma_profile_graph_active = false;
+    if (!defer_output) fpga_dma_profile_graph_emit();
+}
+void fpga_dma_profile_graph_emit() {
+    if (!dma_pending.ready) return;
+    dma_profile_emit(dma_pending.profile, dma_pending.scope.c_str(), dma_pending.graph_seq, dma_pending.graphs);
+    dma_timeline_emit(dma_pending.timeline, dma_pending.scope.c_str(), dma_pending.graph_seq, false);
+    dma_pending = {};
 }
 void fpga_dma_profile_finish() {
+    fpga_dma_profile_graph_emit();
     if (!fpga_dma_profile_enabled()) return;
+    fpga_log_section("Tổng DMA");
     fpga_dma_profile_graph_end("incomplete", false);
     dma_timeline_emit(dma_timeline_decode, "decode_total", -1, true);
     dma_timeline_emit(dma_timeline_all_graphs, "all_graphs_total", -1, true);
@@ -654,36 +807,32 @@ void fpga_log_token_timing(const fpga_token_timing_log_t & data) {
         return data.compute_watch_enabled ? (double) us : std::numeric_limits<double>::quiet_NaN();
     };
     if (data.timing_enabled) {
-        fpga_log_token_line(
-            true, "TIMING", data.force_flush,
-            "graph_seq=%d next_graph_seq=%d ubatch_tokens=%lld scope=%s reason=%s matmuls=%lld vpu_runs=%lld "
-            "graph_wall_ms=%.3f device_first_start_to_last_output_ready_ms=%.3f fpga_matmul_wall_sum_ms=%.3f "
-            "host_to_ip_dma_ms=%.3f act_dma_ms=%.3f weight_dma_ms=%.3f scale_dma_ms=%.3f "
-            "ping_h2ip_ms=%.3f pong_h2ip_ms=%.3f ping_jobs=%lld pong_jobs=%lld "
-            "ip_compute_sum_ms=%.3f ping_compute_ms=%.3f pong_compute_ms=%.3f "
-            "ip_to_host_dma_ms=%.3f ping_ip2host_ms=%.3f pong_ip2host_ms=%.3f "
-            "host_result_read_ms=%.3f ping_host_read_ms=%.3f pong_host_read_ms=%.3f token_read_ms=%.3f "
-            "prep_ms=%.3f host_accum_ms=%.3f act_bytes=%zu weight_bytes=%zu scale_bytes=%zu result_bytes=%zu "
-            "measurement_scope=host_ddr_to_ip_ip_compute_ip_to_host_ddr internal_pl_interconnect=not_observable_from_host",
-            data.graph_seq, data.next_graph_seq, (long long) data.ubatch_tokens, data.scope, data.reason ? data.reason : "unknown",
-            data.matmuls, data.vpu_runs, (double) data.token_wall_us / 1000.0,
-            (double) data.device_span_us / 1000.0, (double) data.matmul_wall_us / 1000.0,
-            (double) data.h2ip_dma_us / 1000.0, (double) data.act_dma_us / 1000.0,
-            (double) data.weight_dma_us / 1000.0, (double) data.scale_dma_us / 1000.0,
-            (double) data.bank_h2ip_us[0] / 1000.0,
-            (double) data.bank_h2ip_us[1] / 1000.0, data.bank_jobs[0],
-            data.bank_jobs[1], compute_report_us(data.ip_compute_us) / 1000.0,
+        fpga_log_token_line(true, "TIMING", data.force_flush,
+            "\n  Số phép matmul = %lld | Số lần chạy VPU = %lld\n"
+            "Thời gian thực tế\n"
+            "  Graph(ms) = %.3f | IP: lần chạy đầu đến kết quả cuối(ms) = %.3f | Tổng matmul FPGA(ms) = %.3f\n"
+            "Chuẩn bị và cộng dồn\n  Chuẩn bị(ms) = %.3f | Cộng dồn trên host(ms) = %.3f\n"
+            "Truyền từ host đến IP\n  DMA host đến IP(ms) = %.3f | ACT(ms) = %.3f | WEIGHT(ms) = %.3f | SPU SCALE(ms) = %.3f\n"
+            "  Ping(ms) = %.3f | Pong(ms) = %.3f | Số byte ACT = %zu | Số byte WEIGHT = %zu | Số byte SPU SCALE = %zu\n"
+            "Tính toán trên IP\n  Tổng compute(ms) = %.3f | Ping(ms) = %.3f | Pong(ms) = %.3f | Số job ping = %lld | Số job pong = %lld\n"
+            "Truyền từ IP về host và đọc kết quả\n  DMA IP về host(ms) = %.3f | Ping(ms) = %.3f | Pong(ms) = %.3f | Số byte RESULT = %zu\n"
+            "  Host đọc kết quả(ms) = %.3f | Ping(ms) = %.3f | Pong(ms) = %.3f | Truyền về và đọc token(ms) = %.3f\n"
+            "Phạm vi đo\n  DDR phía host đến IP, compute trên IP, IP về DDR phía host\n"
+            "  Kết nối nội bộ PL = không thể quan sát từ host",
+            data.matmuls, data.vpu_runs, data.token_wall_us / 1000.0,
+            data.device_span_us / 1000.0, data.matmul_wall_us / 1000.0,
+            data.prep_us / 1000.0, data.host_accum_us / 1000.0,
+            data.h2ip_dma_us / 1000.0, data.act_dma_us / 1000.0,
+            data.weight_dma_us / 1000.0, data.scale_dma_us / 1000.0,
+            data.bank_h2ip_us[0] / 1000.0, data.bank_h2ip_us[1] / 1000.0,
+            data.activation_bytes, data.weight_bytes, data.scale_bytes,
+            compute_report_us(data.ip_compute_us) / 1000.0,
             compute_report_us(data.bank_compute_us[0]) / 1000.0,
             compute_report_us(data.bank_compute_us[1]) / 1000.0,
-            (double) data.ip2host_dma_us / 1000.0,
-            (double) data.bank_ip2host_us[0] / 1000.0,
-            (double) data.bank_ip2host_us[1] / 1000.0,
-            (double) data.host_read_us / 1000.0,
-            (double) data.bank_host_read_us[0] / 1000.0,
-            (double) data.bank_host_read_us[1] / 1000.0, (double) data.token_read_us / 1000.0,
-            (double) data.prep_us / 1000.0, (double) data.host_accum_us / 1000.0,
-            data.activation_bytes, data.weight_bytes, data.scale_bytes,
-            data.result_bytes);
+            data.bank_jobs[0], data.bank_jobs[1], data.ip2host_dma_us / 1000.0,
+            data.bank_ip2host_us[0] / 1000.0, data.bank_ip2host_us[1] / 1000.0, data.result_bytes,
+            data.host_read_us / 1000.0, data.bank_host_read_us[0] / 1000.0,
+            data.bank_host_read_us[1] / 1000.0, data.token_read_us / 1000.0);
     }
 
     if (data.bottleneck_summary_enabled) {
@@ -699,13 +848,13 @@ void fpga_log_token_timing(const fpga_token_timing_log_t & data) {
                                             0.0;
         fpga_log_token_line(
             true, "BREAKDOWN", data.force_flush,
-            "graph_seq=%d next_graph_seq=%d scope=%s graph_wall_ms=%.3f matmul_wall_ms=%.3f "
-            "outside_matmul_ms=%.3f device_span_ms=%.3f ip_compute_ms=%.3f device_noncompute_ms=%.3f "
-            "compute_util_pct=%.2f prep_total_ms=%.3f prep_weight_select_ms=%.3f "
-            "prep_direct_weight_pack_ms=%.3f prep_scale_pack_ms=%.3f prep_act_pack_ms=%.3f prep_other_ms=%.3f "
-            "handoffs=%lld prep_overlap_ms=%.3f prep_late_jobs=%lld prep_late_ms=%.3f prep_headroom_ms=%.3f "
-            "output_ready_to_next_launch_ms=%.3f retire_to_next_launch_ms=%.3f",
-            data.graph_seq, data.next_graph_seq, data.scope, (double) data.token_wall_us / 1000.0,
+            "\n  Thời gian graph(ms) = %.3f | Thời gian matmul(ms) = %.3f | "
+            "Ngoài matmul, suy ra(ms) = %.3f | Khoảng theo dõi IP(ms) = %.3f | Thời gian tính toán trên IP(ms) = %.3f | IP ngoài compute, suy ra(ms) = %.3f | "
+            "Tỷ lệ compute, suy ra(%%) = %.2f\nChuẩn bị\n  Tổng thời gian chuẩn bị(ms) = %.3f | Thời gian chọn weight(ms) = %.3f | "
+            "Thời gian đóng gói weight trực tiếp(ms) = %.3f | Thời gian đóng gói scale(ms) = %.3f | Thời gian đóng gói ACT(ms) = %.3f | Chuẩn bị khác, suy ra(ms) = %.3f "
+            "\nChuyển tiếp giữa các tile\n  Số lần chuyển tiếp = %lld | Tổng overlap chuẩn bị(ms) = %.3f | Số tile chuẩn bị muộn = %lld | Tổng chuẩn bị muộn(ms) = %.3f | Tổng chuẩn bị sớm(ms) = %.3f | "
+            "Kết quả sẵn sàng đến lần chạy tiếp(ms) = %.3f | Hoàn tất xử lý đến lần chạy tiếp(ms) = %.3f",
+            (double) data.token_wall_us / 1000.0,
             (double) data.matmul_wall_us / 1000.0, (double) outside_matmul_us / 1000.0,
             (double) data.device_span_us / 1000.0, compute_report_us(data.ip_compute_us) / 1000.0,
             device_noncompute_us / 1000.0, compute_util_pct, (double) data.prep_us / 1000.0,
@@ -720,55 +869,43 @@ void fpga_log_token_timing(const fpga_token_timing_log_t & data) {
             (double) data.scheduler_retire_to_launch_us / 1000.0);
 
         if (data.sampled_detail) {
-            fpga_log_token_line(
-                true, "GEMV_TIME_BY_LAYER_TYPE", data.force_flush,
-                "graph_seq=%d scope=%s "
-                "attention_matmuls=%lld attention_tile_jobs=%lld attention_wall_ms=%.3f attention_host_prepare_ms=%.3f attention_fpga_compute_ms=%.3f attention_dma_ms=%.3f "
-                "ffn_gate_matmuls=%lld ffn_gate_tile_jobs=%lld ffn_gate_wall_ms=%.3f ffn_gate_host_prepare_ms=%.3f ffn_gate_fpga_compute_ms=%.3f ffn_gate_dma_ms=%.3f "
-                "ffn_up_matmuls=%lld ffn_up_tile_jobs=%lld ffn_up_wall_ms=%.3f ffn_up_host_prepare_ms=%.3f ffn_up_fpga_compute_ms=%.3f ffn_up_dma_ms=%.3f "
-                "ffn_down_matmuls=%lld ffn_down_tile_jobs=%lld ffn_down_wall_ms=%.3f ffn_down_host_prepare_ms=%.3f ffn_down_fpga_compute_ms=%.3f ffn_down_dma_ms=%.3f "
-                "other_matmuls=%lld other_tile_jobs=%lld other_wall_ms=%.3f other_host_prepare_ms=%.3f other_fpga_compute_ms=%.3f other_dma_ms=%.3f",
-                data.graph_seq, data.scope,
-                data.category_matmuls[0], data.category_runs[0],
-                (double) data.category_wall_us[0] / 1000.0,
-                (double) data.category_prep_us[0] / 1000.0,
-                compute_report_us(data.category_compute_us[0]) / 1000.0,
-                (double) data.category_dma_us[0] / 1000.0,
-                data.category_matmuls[1], data.category_runs[1],
-                (double) data.category_wall_us[1] / 1000.0,
-                (double) data.category_prep_us[1] / 1000.0,
-                compute_report_us(data.category_compute_us[1]) / 1000.0,
-                (double) data.category_dma_us[1] / 1000.0,
-                data.category_matmuls[2], data.category_runs[2],
-                (double) data.category_wall_us[2] / 1000.0,
-                (double) data.category_prep_us[2] / 1000.0,
-                compute_report_us(data.category_compute_us[2]) / 1000.0,
-                (double) data.category_dma_us[2] / 1000.0,
-                data.category_matmuls[3], data.category_runs[3],
-                (double) data.category_wall_us[3] / 1000.0,
-                (double) data.category_prep_us[3] / 1000.0,
-                compute_report_us(data.category_compute_us[3]) / 1000.0,
-                (double) data.category_dma_us[3] / 1000.0,
-                data.category_matmuls[4], data.category_runs[4],
-                (double) data.category_wall_us[4] / 1000.0,
-                (double) data.category_prep_us[4] / 1000.0,
-                compute_report_us(data.category_compute_us[4]) / 1000.0,
-                (double) data.category_dma_us[4] / 1000.0);
+            FILE * fp = fpga_log_fp();
+            fprintf(fp, "[GEMV_TIME_BY_LAYER_TYPE]\n  Graph = %d | Phạm vi = %s\n", data.graph_seq, log_scope(data.scope));
+            log_table_t table = {{"Loại layer", "Matmul", "Job tile", "Thực tế(ms)", "Chuẩn bị host(ms)", "Compute FPGA(ms)", "DMA(ms)"}};
+            const char * categories[] = {"Attention", "FFN gate", "FFN up", "FFN down", "Khác"};
+            for (int i = 0; i < 5; ++i) {
+                table.push_back({categories[i], std::to_string(data.category_matmuls[i]),
+                    std::to_string(data.category_runs[i]), log_ms(data.category_wall_us[i]),
+                    log_ms(data.category_prep_us[i]), log_ms(compute_report_us(data.category_compute_us[i])),
+                    log_ms(data.category_dma_us[i])});
+            }
+            log_table(fp, table);
+            fpga_log_finish_line(fp, data.force_flush);
 
             const double zdma_avg_us = data.zdma_descriptors > 0 ?
                                            (double) data.zdma_elapsed_us / (double) data.zdma_descriptors :
                                            0.0;
             fpga_log_token_line(
                 true, "ZDMA", data.force_flush,
-                "graph_seq=%d scope=%s descriptors=%lld bytes=%zu elapsed_ms=%.3f avg_descriptor_us=%.3f polls=%lld "
-                "zero_poll_descriptors=%lld saw_enabled_descriptors=%lld act_desc=%lld weight_desc=%lld scale_desc=%lld "
-                "result_desc=%lld other_desc=%lld max_descriptor_bytes=%zu",
-                data.graph_seq, data.scope, data.zdma_descriptors, data.zdma_bytes,
-                (double) data.zdma_elapsed_us / 1000.0, zdma_avg_us, data.zdma_polls,
-                data.zdma_zero_poll_descriptors, data.zdma_saw_enabled_descriptors,
+                "Graph = %d | Phạm vi = %s | Số descriptor = %lld | Số byte = %zu | Thời gian đã trôi qua(ms) = %.3f | Trung bình descriptor, suy ra(us) = %.3f | "
+                "Số descriptor ACT = %lld | Số descriptor WEIGHT = %lld | Số descriptor SPU SCALE = %lld | "
+                "Số descriptor RESULT = %lld | Số descriptor khác = %lld | Số byte descriptor tối đa = %zu",
+                data.graph_seq, log_scope(data.scope), data.zdma_descriptors, data.zdma_bytes,
+                (double) data.zdma_elapsed_us / 1000.0, zdma_avg_us,
                 data.zdma_act_descriptors, data.zdma_weight_descriptors,
                 data.zdma_scale_descriptors, data.zdma_result_descriptors,
                 data.zdma_other_descriptors, data.max_descriptor_bytes);
         }
     }
+}
+
+void fpga_log_token_diagnostics(const fpga_token_timing_log_t & data) {
+    if (!data.bottleneck_summary_enabled || !data.sampled_detail) return;
+    fpga_log_section("Chẩn đoán DMA");
+    fpga_log_token_line(true, "ZDMA_POLL", data.force_flush,
+        "\n  Graph = %d | Phạm vi = %s\n"
+        "  Tổng lượt chờ = %lld | Descriptor hoàn tất ở lần đọc đầu = %lld | Descriptor từng thấy EN bật = %lld\n"
+        "  Lượt chờ = lượt đọc trạng thái chưa thỏa điều kiện hoàn tất; không phải thời gian chờ",
+        data.graph_seq, log_scope(data.scope), data.zdma_polls,
+        data.zdma_zero_poll_descriptors, data.zdma_saw_enabled_descriptors);
 }

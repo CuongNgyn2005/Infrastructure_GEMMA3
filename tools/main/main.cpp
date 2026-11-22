@@ -288,7 +288,7 @@ int main(int argc, char ** argv) {
 
 #ifdef USE_FPGA
     // Run once before model loading/inference; release scratch RAM immediately.
-    fpga_log_ram_bandwidth();
+    fpga_log_ram_bandwidth(true);
 #endif
     LOG_INF("%s: llama backend init\n", __func__);
 
@@ -327,11 +327,15 @@ int main(int argc, char ** argv) {
     }
 #endif
     const int64_t fpga_init_elapsed_us = timing_us() - fpga_init_start_us;
+#ifdef USE_FPGA
+    fpga_log_startup_begin();
+#endif
 
     common_init_result llama_init = common_init_from_params(params);
 
-    fpga_log_latency("[STARTUP_TIMING] fpga_init_call_ms=%.3f model_load_ms=%.3f context_init_ms=%.3f "
-            "warmup_ms=%.3f warmup_enabled=%d main_to_init_done_ms=%.3f",
+    fpga_log_latency("[STARTUP TIMING]\n"
+        "  Thời gian gọi khởi tạo FPGA(ms) = %.3f | Thời gian nạp mô hình(ms) = %.3f | Thời gian khởi tạo context(ms) = %.3f\n"
+        "  Thời gian warmup(ms) = %.3f | Đã bật warmup = %d | Thời gian từ đầu main đến khi khởi tạo xong(ms) = %.3f",
             fpga_init_elapsed_us / 1000.0, llama_init.model_load_us / 1000.0,
             llama_init.context_init_us / 1000.0, llama_init.warmup_us / 1000.0,
             params.warmup ? 1 : 0, (timing_us() - main_start_us) / 1000.0);
@@ -958,9 +962,12 @@ int main(int argc, char ** argv) {
                 first_sample_us = timing_us();
                 first_sample_call_us = first_sample_us - sample_start_us;
                 if (llama_vocab_is_eog(vocab, id)) {
-                    fpga_log_latency("[FIRST_RESPONSE_TIMING] response=%d origin=%s request_to_sample_ms=%.3f "
-                            "eval_calls_ms=%.3f sample_call_ms=%.3f first_sample_eog=1",
-                            response_id, response_origin, (first_sample_us - response_start_us) / 1000.0,
+                    fpga_log_latency("[FIRST RESPONSE TIMING]\n"
+                        "  Số thứ tự phản hồi = %d | Nguồn bắt đầu = %s | Thời gian từ yêu cầu đến lấy mẫu(ms) = %.3f\n"
+                        "  Thời gian các lần gọi đánh giá(ms) = %.3f | Thời gian gọi lấy mẫu(ms) = %.3f | Mẫu đầu là EOG = 1",
+                            response_id, std::strcmp(response_origin, "prepared_initial_prompt") == 0 ? "prompt ban đầu đã chuẩn bị" :
+                            std::strcmp(response_origin, "readline_complete") == 0 ? "đọc xong đầu vào tương tác" : response_origin,
+                            (first_sample_us - response_start_us) / 1000.0,
                             response_eval_us / 1000.0, first_sample_call_us / 1000.0);
                 }
             }
@@ -1015,11 +1022,14 @@ int main(int argc, char ** argv) {
                 if (sampled_this_iteration && waiting_for_first_text &&
                     !token_str.empty() && !llama_vocab_is_eog(vocab, id)) {
                     const int64_t enqueue_done_us = timing_us();
-                    fpga_log_latency("[FIRST_RESPONSE_TIMING] response=%d origin=%s request_to_sample_ms=%.3f "
-                            "eval_calls_ms=%.3f sample_call_ms=%.3f request_to_enqueue_ms=%.3f "
-                            "first_sample_to_enqueue_ms=%.3f main_to_enqueue_ms=%.3f "
-                            "terminal_visible=not_measured",
-                            response_id, response_origin, (first_sample_us - response_start_us) / 1000.0,
+                    fpga_log_latency("[FIRST RESPONSE TIMING]\n"
+                        "  Số thứ tự phản hồi = %d | Nguồn bắt đầu = %s | Thời gian từ yêu cầu đến lấy mẫu(ms) = %.3f\n"
+                        "  Thời gian các lần gọi đánh giá(ms) = %.3f | Thời gian gọi lấy mẫu(ms) = %.3f\n"
+                        "  Thời gian từ yêu cầu đến đưa vào hàng đợi(ms) = %.3f | Thời gian từ mẫu đầu tiên đến đưa vào hàng đợi(ms) = %.3f\n"
+                        "  Thời gian từ đầu main đến đưa vào hàng đợi(ms) = %.3f | Thời điểm hiển thị trên terminal = chưa đo",
+                            response_id, std::strcmp(response_origin, "prepared_initial_prompt") == 0 ? "prompt ban đầu đã chuẩn bị" :
+                            std::strcmp(response_origin, "readline_complete") == 0 ? "đọc xong đầu vào tương tác" : response_origin,
+                            (first_sample_us - response_start_us) / 1000.0,
                             response_eval_us / 1000.0, first_sample_call_us / 1000.0,
                             (enqueue_done_us - response_start_us) / 1000.0,
                             (enqueue_done_us - first_sample_us) / 1000.0,

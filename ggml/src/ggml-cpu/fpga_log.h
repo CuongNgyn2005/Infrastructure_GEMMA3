@@ -9,7 +9,9 @@
 bool fpga_dma_profile_configure();
 bool fpga_dma_profile_enabled();
 void fpga_dma_profile_graph_begin(int graph_seq);
-void fpga_dma_profile_graph_end(const char * scope, bool decode_token);
+void fpga_dma_profile_graph_end(const char * scope, bool decode_token, bool defer_output = false);
+void fpga_dma_profile_graph_emit();
+void fpga_dma_profile_log_config();
 void fpga_dma_profile_finish();
 class fpga_dma_profile_transfer {
 public:
@@ -33,6 +35,8 @@ void fpga_dma_profile_finalize_end(long long residual_us, long long helper_wait_
 // Shared logging sink used by the FPGA host. Driver-specific diagnostics
 // remain in fpga_host.cpp and pass only formatted records through this API.
 FILE * fpga_log_fp();
+void fpga_log_section(const char * title);
+void fpga_log_graph_header(int graph_seq, const char * scope);
 void   fpga_log_set_flush_every(int flush_every);
 void   fpga_log_finish_line(FILE * fp, bool force_flush);
 void   fpga_log_vline(const char * tag, bool force_flush, const char * fmt, va_list ap);
@@ -64,9 +68,11 @@ void fpga_log_pack_breakdown(const char * scope, int graph_seq, long long tokens
 #ifdef USE_FPGA
 void   fpga_log_load_checkpoint(const char * phase);
 // One startup-only CPU RAM copy benchmark; no FPGA/physical-memory access.
-void   fpga_log_ram_bandwidth();
+void   fpga_log_ram_bandwidth(bool defer_output = false);
+void   fpga_log_startup_begin();
 #else
 inline void fpga_log_load_checkpoint(const char *) {}
+inline void fpga_log_startup_begin() {}
 #endif
 
 #ifdef USE_FPGA
@@ -77,8 +83,8 @@ void fpga_log_runtime_summary(double load_ms, double prompt_ms, int prompt_token
 void fpga_log_prompt_weight_reuse(const char * tensor, long long columns, long long jobs,
                                   unsigned long long avoided_bytes);
 
-// Value snapshot for graph reports. Strings are borrowed only for this call;
-// the logger neither retains pointers nor reads driver state or hardware.
+// Token report values: strings are borrowed only during each synchronous call.
+// Deferred DMA reports own their scope string and copied counters; no driver or hardware reads.
 struct fpga_token_timing_log_t {
     bool timing_enabled;
     bool bottleneck_summary_enabled;
@@ -146,3 +152,4 @@ struct fpga_token_timing_log_t {
     size_t result_bytes;
 };
 void fpga_log_token_timing(const fpga_token_timing_log_t & data);
+void fpga_log_token_diagnostics(const fpga_token_timing_log_t & data);

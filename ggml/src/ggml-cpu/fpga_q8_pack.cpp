@@ -4,6 +4,7 @@
 #include "quants.h"
 
 #include <limits>
+#include <cstring>
 
 namespace {
 
@@ -14,14 +15,26 @@ constexpr int kBlockBeats = kQk8 / kNumLanes;
 using block_q8_0_t = block_q8_0;
 
 static inline uint32_t pack_i8x4_le(const int8_t * lanes) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    uint32_t word;
+    memcpy(&word, lanes, sizeof(word));
+    return word;
+#else
     return (uint32_t) (uint8_t) lanes[0] |
            ((uint32_t) (uint8_t) lanes[1] << 8U) |
            ((uint32_t) (uint8_t) lanes[2] << 16U) |
            ((uint32_t) (uint8_t) lanes[3] << 24U);
+#endif
 }
 
 static inline uint64_t pack_i8x8_le(const int8_t * lanes) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    uint64_t word;
+    memcpy(&word, lanes, sizeof(word));
+    return word;
+#else
     return (uint64_t) pack_i8x4_le(lanes) | ((uint64_t) pack_i8x4_le(lanes + 4) << 32U);
+#endif
 }
 
 static inline void store_i8x16_words(volatile uint32_t * dst, const int8_t * lanes, bool wide_stores) {
@@ -93,23 +106,19 @@ bool fpga_pack_direct_weight_pair_range(
         const int even_row = (int) (pair * 2U);
         const int odd_row  = even_row + 1;
 
+        const block_q8_0_t * even_base = weight_block_from_base(src0, weight_data_base, row0 + even_row, k_block0);
+        const block_q8_0_t * odd_base = odd_row < rows ?
+            weight_block_from_base(src0, weight_data_base, row0 + odd_row, k_block0) : nullptr;
         for (int gb = 0; gb < group_blocks; ++gb) {
-            const block_q8_0_t * even_wb =
-                weight_block_from_base(src0, weight_data_base, row0 + even_row, k_block0 + gb);
-            const block_q8_0_t * odd_wb = odd_row < rows ?
-                                                  weight_block_from_base(
-                                                      src0, weight_data_base, row0 + odd_row, k_block0 + gb) :
-                                                  nullptr;
+            const block_q8_0_t * even_wb = even_base + gb;
+            const block_q8_0_t * odd_wb = odd_base ? odd_base + gb : nullptr;
 
-            for (int beat = 0; beat < kBlockBeats; ++beat) {
-                store_i8x16_words(out, even_wb->qs + beat * kNumLanes, wide_stores);
-                out += 4;
-                words += 4U;
-
-                store_i8x16_words(out, odd_wb ? odd_wb->qs + beat * kNumLanes : zero_i8x16, wide_stores);
-                out += 4;
-                words += 4U;
-            }
+            store_i8x16_words(out, even_wb->qs, wide_stores);
+            store_i8x16_words(out + 4, odd_wb ? odd_wb->qs : zero_i8x16, wide_stores);
+            store_i8x16_words(out + 8, even_wb->qs + kNumLanes, wide_stores);
+            store_i8x16_words(out + 12, odd_wb ? odd_wb->qs + kNumLanes : zero_i8x16, wide_stores);
+            out += 16;
+            words += 16U;
         }
     }
 
@@ -189,23 +198,51 @@ bool fpga_pack_direct_weight_scale_pair_range(
         bool even_scale_is_pending  = false;
         bool odd_scale_is_pending   = false;
 
-        for (int gb = 0; gb < group_blocks; ++gb) {
-            const block_q8_0_t * even_wb =
-                weight_block_from_base(src0, weight_data_base, row0 + even_row, k_block0 + gb);
-            const block_q8_0_t * odd_wb = have_odd_row ?
-                                                  weight_block_from_base(
-                                                      src0, weight_data_base, row0 + odd_row, k_block0 + gb) :
-                                                  nullptr;
-
-            for (int beat = 0; beat < kBlockBeats; ++beat) {
-                store_i8x16_words(out, even_wb->qs + beat * kNumLanes, wide_stores);
-                out += 4;
-                weight_words += 4U;
-
-                store_i8x16_words(out, odd_wb ? odd_wb->qs + beat * kNumLanes : zero_i8x16, wide_stores);
-                out += 4;
-                weight_words += 4U;
+        const block_q8_0_t * even_base = weight_block_from_base(src0, weight_data_base, row0 + even_row, k_block0);
+        const block_q8_0_t * odd_base = have_odd_row ?
+            weight_block_from_base(src0, weight_data_base, row0 + odd_row, k_block0) : nullptr;
+        volatile uint32_t * const even_scale_base = scale_dst_words + (size_t) even_row * group_blocks_size;
+        volatile uint32_t * const odd_scale_base = have_odd_row ?
+            scale_dst_words + (size_t) odd_row * group_blocks_size : nullptr;
+        // Common decode tiles have an even number of blocks and aligned scale
+        // rows. Pair blocks explicitly instead of testing pending state per block.
+        if (wide_stores && (group_blocks & 1) == 0 &&
+            (reinterpret_cast<uintptr_t>(even_scale_base) & 7U) == 0U &&
+            (!have_odd_row || (reinterpret_cast<uintptr_t>(odd_scale_base) & 7U) == 0U)) {
+            for (int gb = 0; gb < group_blocks; gb += 2) {
+                const block_q8_0_t * even_wb = even_base + gb;
+                const block_q8_0_t * odd_wb = odd_base ? odd_base + gb : nullptr;
+                for (int block = 0; block < 2; ++block) {
+                    store_i8x16_words(out, even_wb[block].qs, true);
+                    store_i8x16_words(out + 4, odd_wb ? odd_wb[block].qs : zero_i8x16, true);
+                    store_i8x16_words(out + 8, even_wb[block].qs + kNumLanes, true);
+                    store_i8x16_words(out + 12, odd_wb ? odd_wb[block].qs + kNumLanes : zero_i8x16, true);
+                    out += 16;
+                }
+                const uint32_t act0 = (uint16_t) activation_blocks[gb].d;
+                const uint32_t act1 = (uint16_t) activation_blocks[gb + 1].d;
+                store_scale_pair_words(even_scale_base + gb,
+                    act0 | ((uint32_t) (uint16_t) even_wb[0].d << 16U),
+                    act1 | ((uint32_t) (uint16_t) even_wb[1].d << 16U));
+                if (have_odd_row) {
+                    store_scale_pair_words(odd_scale_base + gb,
+                        act0 | ((uint32_t) (uint16_t) odd_wb[0].d << 16U),
+                        act1 | ((uint32_t) (uint16_t) odd_wb[1].d << 16U));
+                }
+                weight_words += 32U;
             }
+            continue;
+        }
+        for (int gb = 0; gb < group_blocks; ++gb) {
+            const block_q8_0_t * even_wb = even_base + gb;
+            const block_q8_0_t * odd_wb = odd_base ? odd_base + gb : nullptr;
+
+            store_i8x16_words(out, even_wb->qs, wide_stores);
+            store_i8x16_words(out + 4, odd_wb ? odd_wb->qs : zero_i8x16, wide_stores);
+            store_i8x16_words(out + 8, even_wb->qs + kNumLanes, wide_stores);
+            store_i8x16_words(out + 12, odd_wb ? odd_wb->qs + kNumLanes : zero_i8x16, wide_stores);
+            out += 16;
+            weight_words += 16U;
 
             const uint32_t even_scale = (uint32_t) (uint16_t) activation_blocks[gb].d |
                                         ((uint32_t) (uint16_t) even_wb->d << 16U);
