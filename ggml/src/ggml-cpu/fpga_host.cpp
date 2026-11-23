@@ -231,7 +231,9 @@ static_assert((WEIGHT_BASE % alignof(uint32_t)) == 0U, "WEIGHT_BASE must be 32-b
 static constexpr size_t   VPU_DEVMEM_COMPAT_MMAP = SPU_SCRATCH_END;
 static constexpr size_t   DDR_REQUIRED_BYTES     = SPU_SCRATCH_END;
 static constexpr uint32_t WEIGHT_CACHE_BASE      = 0x01000000;
-static constexpr uint32_t P2_WEIGHT_RESIDENCY_END = 0x03000000;
+static constexpr uint32_t P2_WEIGHT_RESIDENCY_END = 0x80000000U;
+static_assert((uint64_t) P2_WEIGHT_RESIDENCY_END <= (uint64_t) DDR_REGION_SIZE,
+              "P2 residency must stay inside the ddr_high carveout");
 static constexpr size_t   WEIGHT_CACHE_ALIGN     = 4096;
 static_assert((DDR_BASE_PHYS & 0xFFFULL) == 0ULL, "DDR_BASE_PHYS must be page aligned");
 static_assert((DDR_REGION_SIZE & 0xFFFULL) == 0ULL, "DDR_REGION_SIZE must be page aligned");
@@ -240,25 +242,24 @@ static_assert(DDR_BASE_PHYS >= 0x0000000800000000ULL && DDR_END_EXCLUSIVE <= 0x0
 static_assert(DDR_REQUIRED_BYTES <= DDR_REGION_SIZE, "FPGA scratch windows exceed the reserved DDR carveout");
 static_assert((uint64_t) WEIGHT_CACHE_BASE < (uint64_t) DDR_REGION_SIZE,
               "weight-cache base lies outside the reserved DDR carveout");
-// A UIO resource size only proves that Linux will mmap the address range; it
-// does not prove that a large sequential write is safe for the deployed DDR
-// interconnect/bitstream.  Keep the first cache experiment bounded until the
-// board-specific address preflight and graduated cache tests are recorded.
-// Larger requests require an explicit operator acknowledgement and are never
-// enabled by the primary command accidentally.
+// The legacy weight-cache experiment remains bounded and requires an explicit
+// operator acknowledgement for larger requests. This limit does not apply to
+// the separate P2 sealed-residency directory below.
 static constexpr long long WEIGHT_CACHE_DEFAULT_MAX_MB    = 16;
-// P2 residency is deliberately a different experiment from the legacy
-// weight cache. It owns a fixed, non-evicting directory of sealed tiles and
-// never calls msync().
-static constexpr long long P2_WEIGHT_RESIDENCY_MAX_MB     = 32;
+// P2 residency owns a fixed, non-evicting directory of sealed tiles and never
+// calls msync(). By default it uses the full reserved interval
+// [WEIGHT_CACHE_BASE, DDR_REGION_SIZE); FPGA_P2_RESIDENCY_MB can lower the budget.
+static constexpr long long P2_WEIGHT_RESIDENCY_MAX_MB =
+    ((long long) P2_WEIGHT_RESIDENCY_END - (long long) WEIGHT_CACHE_BASE) / (1024LL * 1024LL);
+static constexpr long long P2_WEIGHT_RESIDENCY_MIN_MB = 32;
 // Protocol-2/VPU2 stores each beat as an adjacent even/odd row pair.  This
 // version is deliberately part of the sealed-residency identity: a v1 tile
 // is byte-valid but semantically row-major, and must never be reused by VPU2.
 static constexpr uint32_t  P2_WEIGHT_RESIDENCY_LAYOUT_V2  = 2U;
-static constexpr size_t    P2_WEIGHT_RESIDENCY_SLOT_CAPACITY = 128U;
+static constexpr size_t    P2_WEIGHT_RESIDENCY_SLOT_CAPACITY = 4096U;
 // Residency lookups are bounded without walking the slot directory.  Linear
 // probing is deterministic, capped, and never overwrites or evicts a seal.
-static constexpr size_t    P2_WEIGHT_RESIDENCY_INDEX_BUCKETS = 1024U;
+static constexpr size_t    P2_WEIGHT_RESIDENCY_INDEX_BUCKETS = 8192U;
 static constexpr size_t    P2_WEIGHT_RESIDENCY_INDEX_MAX_PROBES = 8U;
 static constexpr uint32_t  P2_WEIGHT_RESIDENCY_NO_SLOT       = UINT32_MAX;
 static constexpr uint32_t  P2_WEIGHT_RESIDENCY_INVALID_SLOT  = UINT32_MAX - 1U;
@@ -266,7 +267,7 @@ static_assert(P2_WEIGHT_RESIDENCY_INDEX_BUCKETS >= P2_WEIGHT_RESIDENCY_SLOT_CAPA
               "P2 residency index must not be smaller than its sealed-slot directory");
 static_assert((uint64_t) P2_WEIGHT_RESIDENCY_END - (uint64_t) WEIGHT_CACHE_BASE ==
                   (uint64_t) P2_WEIGHT_RESIDENCY_MAX_MB * 1024ULL * 1024ULL,
-              "P2 residency budget must remain inside [0x01000000,0x03000000)");
+              "P2 residency budget must cover [WEIGHT_CACHE_BASE,P2_WEIGHT_RESIDENCY_END)");
 // Avoid a repeated, unsupported msync only for cache payloads large enough to
 // make the call itself disruptive.  Per-tile scratch transfers retain v16's
 // conservative msync attempt even after a UIO driver reports EINVAL.
@@ -2671,7 +2672,21 @@ static bool configure_ddr_mapping_policy(void) {
     g_p2_weight_residency_budget_mb = 0;
     g_ddr_requested_map_size = align_up_size(DDR_REQUIRED_BYTES, (size_t) page_size);
     if (g_p2_weight_residency_requested) {
-        const long long residency_mb = P2_WEIGHT_RESIDENCY_MAX_MB;
+        long long residency_mb = P2_WEIGHT_RESIDENCY_MAX_MB;
+        const char * const residency_value = getenv("FPGA_P2_RESIDENCY_MB");
+        const char * residency_source = "default";
+        if (residency_value && residency_value[0] != '\0') {
+            char * end = nullptr;
+            errno = 0;
+            residency_mb = strtoll(residency_value, &end, 10);
+            if (errno != 0 || end == residency_value || *end != '\0' ||
+                residency_mb < P2_WEIGHT_RESIDENCY_MIN_MB || residency_mb > P2_WEIGHT_RESIDENCY_MAX_MB) {
+                LOGE("invalid FPGA_P2_RESIDENCY_MB='%s': expected an integer in [%lld,%lld] MiB",
+                     residency_value, P2_WEIGHT_RESIDENCY_MIN_MB, P2_WEIGHT_RESIDENCY_MAX_MB);
+                return false;
+            }
+            residency_source = "env";
+        }
         const uint64_t required_bytes = (uint64_t) WEIGHT_CACHE_BASE + (uint64_t) residency_mb * 1024ULL * 1024ULL;
         if (required_bytes > DDR_REGION_SIZE) {
             LOGE("P2 residency range exceeds reserved DDR: budget_mb=%lld required=0x%llx region=0x%zx", residency_mb,
@@ -2681,12 +2696,12 @@ static bool configure_ddr_mapping_policy(void) {
         g_p2_weight_residency_budget_mb = residency_mb;
         g_ddr_requested_map_size = align_up_size((size_t) required_bytes, (size_t) page_size);
         LOGINIT(
-            "P2_RESIDENCY_CONFIG requested=1 diagnostic=%d trace=%d verify_metadata=%d base_off=0x%08x phys=[0x%llx,0x%llx) budget_mb=%lld requested_map=0x%zx "
+            "P2_RESIDENCY_CONFIG requested=1 diagnostic=%d trace=%d verify_metadata=%d base_off=0x%08x phys=[0x%llx,0x%llx) budget_mb=%lld source=%s requested_map=0x%zx "
             "policy=fixed_non_evicting_directory_index_no_msync slots=%zu index_buckets=%zu",
             g_p2_weight_residency_diagnostic ? 1 : 0, g_p2_residency_trace_enabled ? 1 : 0,
             g_p2_residency_verify_metadata ? 1 : 0, WEIGHT_CACHE_BASE,
             (unsigned long long) (DDR_BASE_PHYS + WEIGHT_CACHE_BASE),
-            (unsigned long long) (DDR_BASE_PHYS + required_bytes), residency_mb, g_ddr_requested_map_size,
+            (unsigned long long) (DDR_BASE_PHYS + required_bytes), residency_mb, residency_source, g_ddr_requested_map_size,
             P2_WEIGHT_RESIDENCY_SLOT_CAPACITY, P2_WEIGHT_RESIDENCY_INDEX_BUCKETS);
         return true;
     }
@@ -2727,6 +2742,62 @@ static bool configure_ddr_mapping_policy(void) {
     g_ddr_requested_map_size = align_up_size((size_t) required_bytes, (size_t) page_size);
     LOGINIT("DDR map policy: cache=enabled budget_mb=%lld requested_size=0x%zx large_confirmed=%d",
             g_weight_cache_budget_mb, g_ddr_requested_map_size, large_cache_confirmed ? 1 : 0);
+    return true;
+}
+
+static bool fpga_p2_residency_ddr_probe(void) {
+    if (!env_flag_enabled("FPGA_P2_RESIDENCY_PROBE")) {
+        return true;
+    }
+
+    const uint64_t end = (uint64_t) WEIGHT_CACHE_BASE +
+                         (uint64_t) g_p2_weight_residency_budget_mb * 1024ULL * 1024ULL;
+    constexpr size_t probe_bytes = 4096U;
+    constexpr size_t probe_words = probe_bytes / sizeof(uint32_t);
+    constexpr uint64_t probe_stride = 16ULL * 1024ULL * 1024ULL;
+    size_t points = 0;
+    const auto probe_page = [&](uint32_t off) {
+        volatile uint32_t * const words = ddr_checked_u32_ptr(off, probe_bytes);
+        for (size_t j = 0; j < probe_words; ++j) {
+            words[j] = off ^ ((uint32_t) j * 0x9E3779B1U) ^ 0x5AA5C33CU;
+        }
+        mmio_fence();
+        size_t failed_word = probe_words;
+        uint32_t failed_expected = 0;
+        uint32_t failed_actual = 0;
+        for (size_t j = 0; j < probe_words; ++j) {
+            const uint32_t expected = off ^ ((uint32_t) j * 0x9E3779B1U) ^ 0x5AA5C33CU;
+            const uint32_t actual = words[j];
+            if (actual != expected) {
+                failed_word = j;
+                failed_expected = expected;
+                failed_actual = actual;
+                break;
+            }
+        }
+        for (size_t j = 0; j < probe_words; ++j) {
+            words[j] = 0;
+        }
+        mmio_fence();
+        if (failed_word != probe_words) {
+            LOGE("P2_RESIDENCY_PROBE FAIL off=0x%08x word=%zu expected=0x%08x actual=0x%08x",
+                 off, failed_word, failed_expected, failed_actual);
+            return false;
+        }
+        ++points;
+        return true;
+    };
+    for (uint64_t off = WEIGHT_CACHE_BASE; off + probe_bytes <= end; off += probe_stride) {
+        if (!probe_page((uint32_t) off)) {
+            return false;
+        }
+    }
+    const uint32_t last_off = (uint32_t) (end - probe_bytes);
+    if (!probe_page(last_off)) {
+        return false;
+    }
+    LOGINIT("P2_RESIDENCY_PROBE PASS points=%zu first_off=0x%08x last_off=0x%08x budget_mb=%lld",
+            points, WEIGHT_CACHE_BASE, last_off, g_p2_weight_residency_budget_mb);
     return true;
 }
 
@@ -8945,6 +9016,9 @@ int fpga_init(void) {
         fpga_fatal(
             "P2 pre-init ZDMA ownership gate failed; CTRL2.EN was set or passive registers were unavailable. No ZDMA "
             "initialization write was issued");
+    }
+    if (g_p2_init_requested && !fpga_p2_residency_ddr_probe()) {
+        fpga_fatal("P2 residency DDR probe failed after the passive ZDMA gate; no ZDMA init write was issued");
     }
     if (!fpga_dma_init()) {
         fpga_fatal("ZDMA init failed; refusing CPU fallback");
