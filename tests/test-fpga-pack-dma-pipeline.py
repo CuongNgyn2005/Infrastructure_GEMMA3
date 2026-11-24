@@ -54,7 +54,7 @@ assert "candidate.helper_pair_begin      = fpga_p2_dma_pipeline_main_pair_count(
 assert SCHEDULER.index("fpga_accumulate_pl_scaled_q8_tile_job(*running, accum, totals, false)") < SCHEDULER.index(
     "fpga_p2_dma_pipeline_finalize(lookahead)"
 )
-assert "dma_pipeline_host_dma_includes_callback=1" in SOURCE
+assert "Thời gian DMA phía host trong pipeline có bao gồm callback = 1" in SOURCE
 assert "const size_t scale_capacity_entries = lookahead.job.scale_bytes / sizeof(uint32_t);" in SOURCE
 
 
@@ -95,6 +95,8 @@ static constexpr uint32_t ZDMA_ISR_DMA_DONE = 0x00000400U;
 static constexpr uint32_t ZDMA_ISR_ERROR_MASK = 0x00000BF9U;
 
 struct fpga_tile_job_t {
+    bool weight_prefetched = false;
+    bool p3_split_scale = false;
     int bank = 0;
     uint32_t job_id = 0, tile_id = 0;
     int rows = 0, group_blocks = 0, group_beats = 0;
@@ -116,6 +118,15 @@ struct fpga_stage_totals_t {
 typedef struct {
     bool                  valid = false;
     bool                  worker_submitted = false;
+    bool offload = false, worker1_submitted = false;
+    uint64_t generation1 = 0;
+    size_t helper1_pair_begin = 0;
+    long long helper1_service_us = 0;
+    bool worker2_submitted = false;
+    uint64_t generation2 = 0;
+    size_t helper2_pair_begin = 0;
+    long long helper2_service_us = 0;
+    int helper_count = 1;
     bool                  consumed = false;
     uint64_t              generation = 0;
     uint64_t              source_epoch = 0;
@@ -205,6 +216,10 @@ static bool g_worker_ok = true;
 static uint64_t g_p2_weight_residency_epoch = 9;
 static long long g_p2_pack_dma_pipeline_residual_bytes = 0;
 static long long g_p2_pack_dma_pipeline_helper_us = 0;
+static long long g_p2_pack_offload_jobs = 0;
+static long long g_p2_pack_offload_helper_us[3] = {};
+static uint64_t g_p2_pack_offload_helper_bytes[3] = {};
+static long long g_p2_pack_offload_finalize_wait_us = 0;
 static long long g_p2_pack_dma_pipeline_helper_wait_us = 0;
 static long long g_p2_pack_dma_pipeline_residual_us = 0;
 static long long g_p2_pack_dma_pipeline_helper_publication_lead_us = 0;
@@ -260,7 +275,7 @@ static long long monotonic_now_us() { return ++g_mono_clock; }
 
 static bool fpga_p2_pack_worker_wait(uint64_t generation, size_t * words, long long * service_us,
                                      long long * wait_us, size_t * scale_entries = nullptr,
-                                     long long * completion_mono_us = nullptr) {
+                                     long long * completion_mono_us = nullptr, int = 0) {
     assert(generation != 0);
     if (completion_mono_us) *completion_mono_us = 0;
     ++g_helper_waits;
@@ -284,6 +299,7 @@ static bool fpga_p2_pack_worker_wait(uint64_t generation, size_t * words, long l
     return true;
 }
 '''
+harness += extract_definition("static size_t fpga_p2_pack_helper_scale_entries(") + "\n"
 harness += PAIR_SPLIT + "\n" + INVALIDATE + "\n" + PACK_BATCH + "\n" + POLL + "\n" + CONSUME + "\n" + FINALIZE + "\n" + WAIT_DISABLED + "\n" + WAIT_COMPLETE
 harness += r'''
 

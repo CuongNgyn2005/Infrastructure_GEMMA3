@@ -3,6 +3,7 @@
 
 import math
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -74,6 +75,7 @@ assert running.index("fpga_accumulate_pl_scaled_q8_tile_job(*running, accum, tot
 harness = r'''
 #include <algorithm>
 #include <cassert>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -106,14 +108,15 @@ constexpr uint32_t P2_PIPELINE_SCALE_SLOT_COUNT = 2U;
 constexpr size_t P2_PIPELINE_PL_SCALE_BYTES = 64U * 1024U;
 constexpr size_t WEIGHT_CACHE_ALIGN = 4096U;
 constexpr uint32_t WEIGHT_CACHE_BASE = 0x01000000U;
-constexpr uint32_t P2_WEIGHT_RESIDENCY_END = 0x03000000U;
+__RESIDENCY_END__
 constexpr uint32_t P2_WEIGHT_RESIDENCY_NO_SLOT = UINT32_MAX;
 constexpr uint32_t P2_WEIGHT_RESIDENCY_LAYOUT_V2 = 2U;
 constexpr uint64_t DDR_BASE_PHYS = 0U, LMM_BASE_PHYS = 0U;
-constexpr size_t DDR_REGION_SIZE = 0x10000000U;
+constexpr size_t DDR_REGION_SIZE = 0x80000000ULL;
 constexpr size_t FPGA_P2_PACK_PARALLEL_MIN_BYTES = 256U * 1024U;
 
 struct fpga_stage_totals_t {
+    long long p3_reject_delta = 0;
     long long prep_us = 0, dma_act_us = 0, dma_weight_us = 0, dma_scale_us = 0;
     long long dma_result_us = 0, ip_compute_us = 0, host_result_us = 0, host_accum_us = 0;
     long long weight_cache_hits = 0, weight_cache_misses = 0, weight_cache_lookup_us = 0;
@@ -135,6 +138,7 @@ struct fpga_stage_totals_t {
 };
 
 struct fpga_tile_job_t {
+    bool * p3_scratch_valid = nullptr;
     int bank = 0;
     uint32_t job_id = 0;
     unsigned long long matmul_call_id = 0;
@@ -162,6 +166,7 @@ struct fpga_tile_job_t {
     long long dma_result_us = 0, ip_start_us = 0, measured_compute_us = 0, ip_compute_us = 0;
     long long host_result_us = 0;
     bool output_dma_ready = false, hardware_released = false, result_consumed = false;
+    bool act_bank_reused = false;
     long long event_prep_begin_us = 0, event_prep_done_us = 0, event_submit_begin_us = 0;
     long long event_input_transfer_begin_us = 0, event_launch_us = 0, event_vpu_done_us = 0;
     long long event_spu_finality_us = 0, event_retire_us = 0;
@@ -169,10 +174,15 @@ struct fpga_tile_job_t {
     uint32_t vpu_status = 0, spu_stream_count_before = 0, spu_stream_done_before = 0;
     uint32_t spu_stream_out_before = 0, spu_stream_drop_before = 0, spu_stream_error_before = 0;
     bool weight_bank_reused = false;
+    bool weight_prefetched = false;
 };
 
 struct fpga_p2_dma_pipeline_lookahead_t {
     bool valid = false, worker_submitted = false, consumed = false;
+    bool worker1_submitted = false;
+    bool worker2_submitted = false;
+    uint64_t generation2 = 0;
+    uint64_t generation1 = 0;
     uint64_t generation = 0, source_epoch = 0;
     size_t pair_count = 0, helper_pair_begin = 0, main_pair_next = 0;
     size_t words_per_pair = 0, expected_words = 0, expected_scale_entries = 0;
@@ -195,14 +205,36 @@ bool configured_descriptor = true;
 int max_blocks = 2, test_blocks = 0, test_columns = 0, test_rows = 0;
 bool g_p1_sched_summary_enabled = true;
 bool g_p2_result_overlap_enabled = false, g_vpu_descriptor_supported = true;
+bool g_result_ldp_enabled = false;
 bool g_pingpong_timing_enabled = false;
 bool g_p2_pack_dma_pipeline_enabled = false, pipeline_resident = false;
+bool g_p2_weight_prefetch_enabled = false;
+long long g_p2_weight_prefetch_restarts = 0, g_p2_weight_prefetch_skip_geometry = 0;
+long long g_p2_weight_prefetch_late_reads = 0;
+struct fpga_p2_prefetch_read_ctx_t {
+    fpga_tile_job_t * job;
+    std::vector<float> * accum;
+    fpga_stage_totals_t * totals;
+    bool done, ok;
+};
+bool fpga_p2_weight_prefetch_promote(fpga_p2_dma_pipeline_lookahead_t &, fpga_p2_dma_pipeline_lookahead_t &) {
+    throw "unexpected prefetch in baseline scheduler fixture";
+}
+bool fpga_p2_weight_prefetch_dma(fpga_p2_dma_pipeline_lookahead_t &, const fpga_tile_job_t &,
+                                  fpga_p2_prefetch_read_ctx_t *) {
+    throw "unexpected prefetch in baseline scheduler fixture";
+}
 bool g_p2_weight_residency_enabled = false;
 long long g_p2_weight_residency_budget_mb = 1;
 uint32_t g_p2_residency_next_off = 0;
 size_t g_p2_residency_next_slot = 0;
 uint64_t g_p2_weight_residency_epoch = 1;
 std::vector<int> g_p2_resident_tiles(128);
+bool g_p3_matmul_active = false;
+constexpr uint32_t REG_P3_REJECT_COUNT = 0x218U;
+uint32_t vpu_rd32(uint32_t) { throw "unexpected P3 MMIO in P2 fixture"; }
+bool g_p2_act_bank_reuse_enabled = false; // Preserve the original ACT-transfer fixture.
+uint64_t g_p2_act_bank_reused_jobs = 0, g_p2_act_bank_avoided_bytes = 0;
 long long g_p2_pack_dma_pipeline_eligible_jobs = 0;
 long long g_p2_pack_dma_pipeline_consumed_jobs = 0;
 long long g_p2_pack_dma_pipeline_rejected_jobs = 0;
@@ -280,7 +312,7 @@ void observe_admission(const fpga_tile_job_t & current) {
     assert(!pending_generation);
 }
 bool fpga_p2_pack_worker_wait(uint64_t generation, size_t * words, long long * service,
-                              long long * wait, size_t * entries = nullptr) {
+                              long long * wait, size_t * entries = nullptr, long long * = nullptr, int = 0) {
     assert(generation != 0 && generation == pending_generation);
     event("join", (uint32_t) generation);
     pending_generation = 0;
@@ -323,6 +355,13 @@ bool fpga_p2_dma_pipeline_geometry(size_t rows, size_t groups, int beats, size_t
     *weight_bytes = *pairs * *words_per_pair * sizeof(uint32_t);
     *scale_bytes = ((*scale_entries + VPU_RESULT_PACK_LANES - 1U) / VPU_RESULT_PACK_LANES) * 16U;
     return *pairs > 0 && *weight_bytes > 0 && *scale_bytes > 0;
+}
+bool fpga_p2_dma_pipeline_geometry(size_t rows, size_t groups, int beats, size_t * weight_bytes,
+                                    size_t * scale_bytes, size_t * pairs, size_t * words_per_pair,
+                                    size_t * scale_entries, bool p3) {
+    if (p3) throw "unexpected P3 geometry in P2 fixture";
+    return fpga_p2_dma_pipeline_geometry(rows, groups, beats, weight_bytes, scale_bytes, pairs,
+                                         words_per_pair, scale_entries);
 }
 bool fpga_p2_dma_pipeline_slot_ranges(uint32_t, uint32_t, size_t, size_t) { return true; }
 
@@ -476,6 +515,21 @@ int64_t ddr_read_spu_q16_row(uint32_t off, uint16_t * row_id) {
 }
 '''
 
+# Use the real bounded pointer helper with RAM deliberately aligned to 4, not 8,
+# bytes. This selects the scalar consumer branch so row-ID fault injection and
+# read/order accounting below remain observable; wide-reader extremes are covered
+# separately by the result-reader regression.
+harness = harness.replace("__RESIDENCY_END__", re.search(
+    r"static constexpr uint32_t P2_WEIGHT_RESIDENCY_END\s*=\s*[^;]+;", SOURCE).group(0))
+harness += r'''
+alignas(8) uint8_t ram_result_aperture[SPU_OUT_BASE + 65536U + 8U] = {};
+uint8_t * g_ddr = ram_result_aperture + 4;
+size_t g_ddr_map_size = sizeof(ram_result_aperture) - 4;
+bool ddr_range_fits(uint32_t off, size_t bytes) {
+    return off <= g_ddr_map_size && bytes <= g_ddr_map_size - off;
+}
+'''
+harness += extract_definition("static uint8_t * ddr_ptr(") + "\n"
 # The production residency arithmetic is useful in the legacy cache/tail cases.
 harness += residency_align + "\n" + residency_end
 
@@ -483,12 +537,13 @@ harness += residency_align + "\n" + residency_end
 # production guards around weight DMA, while all register/DDR operations remain
 # RAM-only stubs.
 weight_transfer = SOURCE[
-    SOURCE.index("    if (!job.weight_bank_reused &&", SOURCE.index("static bool fpga_submit_q8_tile_job(")) :
+    SOURCE.index("    if (weight_dma_needed &&", SOURCE.index("static bool fpga_submit_q8_tile_job(")) :
     SOURCE.index("\n    const long long event_dma_weight_done", SOURCE.index("static bool fpga_submit_q8_tile_job("))
 ]
 harness += r'''
 bool weight_transfer(fpga_tile_job_t & job) {
     const fpga_dma_poll_hook_t * poll_hook = nullptr;
+    const bool weight_dma_needed = !job.weight_bank_reused && !job.weight_prefetched;
 ''' + weight_transfer + r'''
     return true;
 }
@@ -508,7 +563,7 @@ bool transfer(fpga_tile_job_t & job) {
 }
 bool fpga_prepare_q8_tile_job(fpga_tile_job_t & job, const ggml_tensor * src0, const void * weight_data_base,
                               const block_q8_0_t * act_group, int64_t row0, int rows, int64_t ib0, int groups,
-                              int64_t col, uint32_t, const fpga_weight_cache_entry_t *, uint32_t id, int bank,
+                              int64_t col, uint32_t id, int bank,
                               fpga_stage_totals_t *, fpga_prompt_weight_staging_t *, uint32_t weight_stage_off,
                               uint32_t scale_stage_off) {
     event("prepare", id);
@@ -621,7 +676,7 @@ bool run_legacy(int columns, bool overlap, int failure, int rows = 7, int blocks
     g_p2_result_overlap_enabled = overlap;
     g_vpu_descriptor_supported = configured_descriptor;
     g_p2_weight_residency_enabled = cache != 0;
-    g_p2_weight_residency_budget_mb = 32;
+    g_p2_weight_residency_budget_mb = (P2_WEIGHT_RESIDENCY_END - WEIGHT_CACHE_BASE) / (1024U * 1024U);
     g_p2_residency_next_slot = cache == 3 ? 128 : 0;
     size_t remaining = 1024U * 1024U;
     const int first_rows = std::min(rows, g_vpu_max_rows);
@@ -644,7 +699,7 @@ bool run_legacy(int columns, bool overlap, int failure, int rows = 7, int blocks
     std::vector<float> values, scales_local;
     fpga_stage_totals_t totals = {};
     const bool ok = fpga_hw_q8_0_matmul_dma_to_ip_pipelined(
-        &tensor, &tensor, acts, scales_local, nullptr, &totals, "test", 0, blocks * 32, rows, columns, blocks, values);
+        &tensor, &tensor, acts, scales_local, &totals, "test", 0, blocks * 32, rows, columns, blocks, values);
     if (ok) {
         const int row_groups = (rows + g_vpu_max_rows - 1) / g_vpu_max_rows;
         const int weight_tiles = row_groups * ((blocks + max_blocks - 1) / max_blocks);
@@ -687,7 +742,7 @@ bool run_pipeline_case(int rows, int blocks, bool enabled, bool resident, int fa
     g_p2_weight_residency_enabled = resident;
     g_p2_residency_next_slot = 0;
     g_p2_residency_next_off = WEIGHT_CACHE_BASE;
-    g_p2_weight_residency_budget_mb = 32;
+    g_p2_weight_residency_budget_mb = (P2_WEIGHT_RESIDENCY_END - WEIGHT_CACHE_BASE) / (1024U * 1024U);
     g_p2_pack_dma_pipeline_eligible_jobs = 0;
     g_p2_pack_dma_pipeline_consumed_jobs = 0;
     expected.assign((size_t) rows, 0.0f);
@@ -703,7 +758,7 @@ bool run_pipeline_case(int rows, int blocks, bool enabled, bool resident, int fa
     std::vector<float> values, act_scales;
     fpga_stage_totals_t totals = {};
     const bool ok = fpga_hw_q8_0_matmul_dma_to_ip_pipelined(
-        &tensor, &tensor, acts, act_scales, nullptr, &totals, "pipeline", 0, blocks * 32, rows, 1, blocks, values);
+        &tensor, &tensor, acts, act_scales, &totals, "pipeline", 0, blocks * 32, rows, 1, blocks, values);
     assert(pending_generation == 0 && helper_submissions == helper_completions);
     if (failure || stale) {
         assert(!ok);
