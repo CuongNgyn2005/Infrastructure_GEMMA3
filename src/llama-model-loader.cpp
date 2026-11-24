@@ -16,30 +16,17 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
-// C0 and P2 deliberately execute model GEMVs through ZDMA/VPU. Validate the
+// P2 qualification deliberately executes model GEMVs through ZDMA/VPU. Validate the
 // active GGUF during model loading first, so a malformed Q8 scale cannot waste
 // a long board run or be misdiagnosed as a transfer/IP failure. This remains
-// opt-in at the runtime level: raw C0, P2 PL-scale, and source-audit modes.
+// opt-in at the runtime level: P2 PL-scale qualification.
 static bool llama_fpga_source_validation_required() {
-    const char * const contract = std::getenv("FPGA_CONTRACT_CHECK");
-    if (contract && std::strtol(contract, nullptr, 0) > 0) {
-        return true;
-    }
-
     const char * const pl_scale_contract = std::getenv("FPGA_PL_SCALE_CONTRACT_CHECK");
     if (pl_scale_contract && std::strtol(pl_scale_contract, nullptr, 0) > 0) {
         return true;
     }
 
-    const char * const audit = std::getenv("FPGA_SOURCE_AUDIT_ONLY");
-    return audit && (
-        std::strcmp(audit, "1") == 0 ||
-        std::strcmp(audit, "true") == 0 ||
-        std::strcmp(audit, "TRUE") == 0 ||
-        std::strcmp(audit, "yes") == 0 ||
-        std::strcmp(audit, "YES") == 0 ||
-        std::strcmp(audit, "on") == 0 ||
-        std::strcmp(audit, "ON") == 0);
+    return false;
 }
 
 const char * llama_file_version_name(llama_fver version) {
@@ -506,7 +493,7 @@ llama_model_loader::llama_model_loader(
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p) {
     if (!check_tensors && llama_fpga_source_validation_required()) {
         check_tensors = true;
-        LLAMA_LOG_INFO("%s: enabling tensor validation for FPGA C0/P2/source-audit before accelerator execution\n", __func__);
+        LLAMA_LOG_INFO("%s: enabling tensor validation for FPGA P2 qualification before accelerator execution\n", __func__);
     }
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
@@ -1179,7 +1166,7 @@ bool llama_model_loader::load_all_data(
         if (progress_callback && !progress_callback(1.0f, progress_callback_user_data)) {
             // Even though the model is done loading, we still honor
             // cancellation since we need to free allocations.  Do not report
-            // a C0-ready validation result for a load that the caller rejects.
+            // a qualification-ready validation result for a load that the caller rejects.
             return false;
         }
     }
@@ -1191,7 +1178,7 @@ bool llama_model_loader::load_all_data(
         // was not cancelled. Tell the deferred qualification host that mapping
         // MY_IP/ZDMA is now safe for this process.
         fpga_mark_model_tensor_validation_passed();
-        LLAMA_LOG_INFO("%s: FPGA C0/P2/source-audit tensor-validation handshake complete\n", __func__);
+        LLAMA_LOG_INFO("%s: FPGA P2 qualification tensor-validation handshake complete\n", __func__);
     }
 #endif
 
