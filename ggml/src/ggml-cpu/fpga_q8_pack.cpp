@@ -388,3 +388,22 @@ bool fpga_pack_direct_weight_p3scale_pair_range(
     *written_scale_entries = expected_scale_entries;
     return weight_words == (pair_end - pair_begin) * words_per_pair;
 }
+
+bool fpga_p3_pack_scratch_words(const block_q8_0 * act, int group_blocks,
+                                uint32_t * out_words, size_t word_count) {
+    if (!act || !out_words || group_blocks < 1 || group_blocks > 64 ||
+        word_count < ((size_t) group_blocks + 1U) / 2U) {
+        return false;
+    }
+    const size_t live_words = ((size_t) group_blocks + 1U) / 2U;
+    for (size_t j = 0; j < word_count; ++j) {
+        uint16_t lo = 0U, hi = 0U;
+        if (j < live_words) {
+            const size_t block = j * 2U;
+            memcpy(&lo, &act[block].d, sizeof(lo));
+            if (block + 1U < (size_t) group_blocks) memcpy(&hi, &act[block + 1U].d, sizeof(hi));
+        }
+        out_words[j] = (uint32_t) lo | ((uint32_t) hi << 16U);
+    }
+    return true;
+}

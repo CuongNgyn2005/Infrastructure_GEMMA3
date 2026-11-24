@@ -442,6 +442,7 @@ typedef struct {
     long long drain_wait_jobs;
     long long scratch_dma_us;
     long long scratch_bytes;
+    long long scratch_mmio_jobs;
     long long scratch_desc;
     long long p3_reject_delta;
     long long p3_mode_switches;
@@ -1000,6 +1001,7 @@ static uint32_t  g_stream_protocol_version = 0;
 static uint32_t  g_bitstream_id            = 0;
 
 static bool g_p3_split_scale_enabled = false;
+static bool g_p3_scratch_mmio_enabled = false;
 static bool g_p3_matmul_active = false;
 static long long g_p3_mode_switches = 0;
 static long long g_p3_graph_mode_switches_start = 0;
@@ -1082,6 +1084,7 @@ typedef struct {
     long long drain_wait_jobs;
     long long scratch_dma_us;
     long long scratch_bytes;
+    long long scratch_mmio_jobs;
     long long scratch_desc;
     long long p3_reject_delta;
     long long p3_mode_switches;
@@ -5414,10 +5417,50 @@ static void fpga_p3_split_scale_configure() {
     if (!value || strcmp(value, "0") == 0) g_p3_split_scale_enabled = false;
     else if (strcmp(value, "1") == 0) g_p3_split_scale_enabled = true;
     else fpga_fatal("FPGA_P3_SPLIT_SCALE must be 0 or 1");
+    const char * scratch_value = getenv("FPGA_P3_SCRATCH_MMIO");
+    if (!scratch_value || strcmp(scratch_value, "0") == 0) g_p3_scratch_mmio_enabled = false;
+    else if (strcmp(scratch_value, "1") == 0) g_p3_scratch_mmio_enabled = true;
+    else fpga_fatal("FPGA_P3_SCRATCH_MMIO must be 0 or 1");
+    if (g_p3_scratch_mmio_enabled && !g_p3_split_scale_enabled) {
+        fpga_fatal("FPGA_P3_SCRATCH_MMIO requires FPGA_P3_SPLIT_SCALE=1");
+    }
     g_p3_matmul_active = false;
     g_token_timing_collection_enabled = g_token_timing_collection_enabled || g_p3_split_scale_enabled;
     g_p3_mode_switches = 0;
     g_p3_graph_mode_switches_start = 0;
+}
+
+static void fpga_p3_scratch_mmio_self_test() {
+    // Recheck ownership immediately before the first scratch store; admission's
+    // earlier snapshot cannot establish that the memories are still idle.
+    const uint32_t stream = vpu_rd32(REG_SPU_STREAM_STATUS);
+    const uint32_t spu = vpu_rd32(REG_SPU_CTRL);
+    const uint32_t p3 = vpu_rd32(REG_P3_STREAM_STATUS);
+    if ((stream & SPU_STREAM_STATUS_QUIESCENT) == 0U || (spu & 1U) != 0U ||
+        (p3 & P3_STATUS_LOCK_VALID) != 0U) {
+        fpga_fatal("P3 SCRATCH MMIO self-test ownership failed stream=0x%08x spu=0x%08x p3=0x%08x",
+                   stream, spu, p3);
+    }
+    for (int phase = 0; phase < 2; ++phase) {
+        for (int bank = 0; bank < 2; ++bank) {
+            for (int word = 0; word < 32; ++word) {
+                const uint32_t value = phase == 0 ? 0xA5000000U | ((uint32_t) bank << 16U) | (uint32_t) word : 0U;
+                vpu_wr32(SPU_SCRATCH_BASE + (uint32_t) bank * P3_BANK_BYTES + (uint32_t) word * 4U, value);
+            }
+        }
+        mmio_fence();
+        for (int bank = 0; bank < 2; ++bank) {
+            for (int word = 0; word < 32; ++word) {
+                const uint32_t want = phase == 0 ? 0xA5000000U | ((uint32_t) bank << 16U) | (uint32_t) word : 0U;
+                const uint32_t got = vpu_rd32(SPU_SCRATCH_BASE + (uint32_t) bank * P3_BANK_BYTES + (uint32_t) word * 4U);
+                if (got != want) {
+                    fpga_fatal("P3 SCRATCH MMIO self-test failed bank=%d word=%d got=0x%08x want=0x%08x",
+                               bank, word, got, want);
+                }
+            }
+        }
+    }
+    LOGINIT("P3_SCRATCH_MMIO_SELFTEST pass words=64");
 }
 
 // Fixed for one initialized host lifetime; fpga_init re-entry keeps the policy.
@@ -5702,21 +5745,50 @@ static bool fpga_submit_q8_tile_job(fpga_tile_job_t &     job,
             return false;
         }
         if (!(job.act_bank_reused && job.p3_scratch_valid[b])) {
-            const uint32_t scratch_off = SPU_SCRATCH_BASE + (uint32_t) b * P3_BANK_BYTES;
-            volatile uint16_t * scratch = reinterpret_cast<volatile uint16_t *>(ddr_ptr(scratch_off, job.scratch_bytes));
-            for (int gb = 0; gb < job.group_blocks; ++gb) scratch[gb] = (uint16_t) job.p3_act_group[gb].d;
-            for (size_t gb = (size_t) job.group_blocks; gb < job.scratch_bytes / sizeof(uint16_t); ++gb) scratch[gb] = 0U;
-            mmio_fence();
-            const long long scratch_dma_start = now_us();
-            if (!fpga_dma_copy(DDR_BASE_PHYS + scratch_off, LMM_BASE_PHYS + scratch_off,
-                               job.scratch_bytes, "SPU_SCRATCH", poll_hook)) return false;
-            scratch_dma_us = now_us() - scratch_dma_start;
-            job.p3_scratch_valid[b] = true;
-            if (totals) {
-                totals->scratch_dma_us += scratch_dma_us;
-                totals->scratch_bytes += (long long) job.scratch_bytes;
-                totals->scratch_desc += (long long) (job.scratch_bytes / g_zdma_max_transfer_bytes +
-                                                    (job.scratch_bytes % g_zdma_max_transfer_bytes != 0U));
+            if (g_p3_scratch_mmio_enabled) {
+                const long long scratch_mmio_start = now_us();
+                uint32_t words[32];
+                const size_t n = job.scratch_bytes / sizeof(uint32_t);
+                if (n == 0U || n > 32U ||
+                    !fpga_p3_pack_scratch_words(job.p3_act_group, job.group_blocks, words, n)) {
+                    LOGE("P3 SCRATCH MMIO packing failed job=%u tile=%u bank=%d words=%zu",
+                         job.job_id, job.tile_id, b, n);
+                    return false;
+                }
+                const uint32_t base = SPU_SCRATCH_BASE + (uint32_t) b * P3_BANK_BYTES;
+                for (size_t j = 0; j < n; ++j) vpu_wr32(base + (uint32_t) j * 4U, words[j]);
+                mmio_fence();
+                const uint32_t got = vpu_rd32(base + (uint32_t) (n - 1U) * 4U);
+                if (got != words[n - 1U]) {
+                    LOGE("P3 SCRATCH MMIO readback mismatch job=%u tile=%u bank=%d word=%zu got=0x%08x want=0x%08x",
+                         job.job_id, job.tile_id, b, n - 1U, got, words[n - 1U]);
+                    return false;
+                }
+                job.p3_scratch_valid[b] = true;
+                // Historical scratch_dma_us includes the entire MMIO block in this mode.
+                scratch_dma_us = now_us() - scratch_mmio_start;
+                if (totals) {
+                    totals->scratch_dma_us += scratch_dma_us;
+                    totals->scratch_bytes += (long long) job.scratch_bytes;
+                    ++totals->scratch_mmio_jobs;
+                }
+            } else {
+                const uint32_t scratch_off = SPU_SCRATCH_BASE + (uint32_t) b * P3_BANK_BYTES;
+                volatile uint16_t * scratch = reinterpret_cast<volatile uint16_t *>(ddr_ptr(scratch_off, job.scratch_bytes));
+                for (int gb = 0; gb < job.group_blocks; ++gb) scratch[gb] = (uint16_t) job.p3_act_group[gb].d;
+                for (size_t gb = (size_t) job.group_blocks; gb < job.scratch_bytes / sizeof(uint16_t); ++gb) scratch[gb] = 0U;
+                mmio_fence();
+                const long long scratch_dma_start = now_us();
+                if (!fpga_dma_copy(DDR_BASE_PHYS + scratch_off, LMM_BASE_PHYS + scratch_off,
+                                   job.scratch_bytes, "SPU_SCRATCH", poll_hook)) return false;
+                scratch_dma_us = now_us() - scratch_dma_start;
+                job.p3_scratch_valid[b] = true;
+                if (totals) {
+                    totals->scratch_dma_us += scratch_dma_us;
+                    totals->scratch_bytes += (long long) job.scratch_bytes;
+                    totals->scratch_desc += (long long) (job.scratch_bytes / g_zdma_max_transfer_bytes +
+                                                        (job.scratch_bytes % g_zdma_max_transfer_bytes != 0U));
+                }
             }
         }
         scratch_stage_us = now_us() - scratch_stage_start;
@@ -7008,7 +7080,8 @@ int fpga_init(void) {
     if (g_p3_split_scale_enabled && p3_sig != P3_SPLIT_SCALE_ABI_ID) {
         fpga_fatal("P3 split-scale ABI mismatch sig=0x%08x expected=0x%08x", p3_sig, P3_SPLIT_SCALE_ABI_ID);
     }
-    LOGINIT("P3_CONFIG enabled=%d sig=0x%08x", g_p3_split_scale_enabled ? 1 : 0, p3_sig);
+    LOGINIT("P3_CONFIG enabled=%d sig=0x%08x scratch_mode=%s", g_p3_split_scale_enabled ? 1 : 0, p3_sig,
+            g_p3_scratch_mmio_enabled ? "mmio" : "dma");
     g_spu_stream_status       = vpu_rd32(REG_SPU_STREAM_STATUS);
     g_spu_word_capacity       = (spu_caps >> 16) & 0xFFFFU;
     fpga_p2_init_breadcrumb(
@@ -7111,6 +7184,7 @@ int fpga_init(void) {
     if (g_p3_split_scale_enabled && (!g_spu_q8_scale_stream_supported || !g_vpu_pingpong_supported)) {
         fpga_fatal("P3 split-scale requires admitted SPU scale stream and ping-pong banks");
     }
+    if (g_p3_scratch_mmio_enabled) fpga_p3_scratch_mmio_self_test();
 
     // Ordinary P2 requires the admitted descriptor/bank scheduler. Explicit
     // disable remains available for qualification and raw diagnostic routes.
@@ -8942,6 +9016,7 @@ static bool fpga_token_timing_emit(int next_graph_seq,
     report.drain_wait_jobs = g_token_timing.drain_wait_jobs;
     report.scratch_dma_us = g_token_timing.scratch_dma_us;
     report.scratch_bytes = g_token_timing.scratch_bytes;
+    report.scratch_mmio_jobs = g_token_timing.scratch_mmio_jobs;
     report.scratch_desc = g_token_timing.scratch_desc;
     report.p3_reject_delta = g_token_timing.p3_reject_delta;
     report.p3_mode_switches = g_token_timing.p3_mode_switches;
@@ -9040,7 +9115,7 @@ static bool fpga_token_timing_emit(int next_graph_seq,
     if (decode_token) {
         fpga_log_result_overlap(g_token_timing.graph_seq, g_p2_result_overlap_enabled,
                                 g_token_timing.result_overlap_jobs, g_token_timing.result_overlap_host_us);
-        fpga_log_p3_split(report, g_p3_split_scale_enabled);
+        fpga_log_p3_split(report, g_p3_split_scale_enabled, g_p3_scratch_mmio_enabled);
     }
     fpga_log_token_diagnostics(report);
     fpga_token_timing_reset();
@@ -9098,6 +9173,7 @@ static void fpga_token_timing_accumulate(const fpga_stage_totals_t & totals, lon
     g_token_timing.drain_wait_jobs += totals.drain_wait_jobs;
     g_token_timing.scratch_dma_us += totals.scratch_dma_us;
     g_token_timing.scratch_bytes += totals.scratch_bytes;
+    g_token_timing.scratch_mmio_jobs += totals.scratch_mmio_jobs;
     g_token_timing.scratch_desc += totals.scratch_desc;
     g_token_timing.p3_reject_delta += totals.p3_reject_delta;
     g_token_timing.p3_mode_switches += totals.p3_mode_switches;

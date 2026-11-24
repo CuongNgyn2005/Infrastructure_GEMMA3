@@ -117,6 +117,7 @@ struct fpga_token_timing_log_t {
     long long drain_wait_jobs;
     long long scratch_dma_us;
     long long scratch_bytes;
+    long long scratch_mmio_jobs;
     long long scratch_desc;
     long long p3_reject_delta;
     long long p3_mode_switches;
@@ -163,4 +164,4 @@ struct fpga_token_timing_log_t {
 void fpga_log_token_timing(const fpga_token_timing_log_t & data);
 void fpga_log_token_diagnostics(const fpga_token_timing_log_t & data);
 
-void fpga_log_p3_split(const fpga_token_timing_log_t & data, bool enabled);
+void fpga_log_p3_split(const fpga_token_timing_log_t & data, bool enabled, bool scratch_mmio = false);

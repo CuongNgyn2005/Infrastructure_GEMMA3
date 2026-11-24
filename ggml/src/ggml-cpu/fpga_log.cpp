@@ -913,13 +913,14 @@ void fpga_log_token_diagnostics(const fpga_token_timing_log_t & data) {
         data.zdma_zero_poll_descriptors, data.zdma_saw_enabled_descriptors);
 }
 
-void fpga_log_p3_split(const fpga_token_timing_log_t & data, bool enabled) {
+void fpga_log_p3_split(const fpga_token_timing_log_t & data, bool enabled, bool scratch_mmio) {
     FILE * fp = fpga_log_fp();
     if (fp == stderr) return;
     fprintf(fp, "[P3_SPLIT] Graph=%d enabled=%d p3_jobs=%lld drain_wait_ms=%.3f drain_wait_jobs=%lld "
-                "scratch_dma_ms=%.3f scratch_bytes=%lld scratch_desc=%lld p3_reject_delta=%lld mode_switches=%lld\n",
+                "scratch_dma_ms=%.3f scratch_bytes=%lld scratch_desc=%lld p3_reject_delta=%lld mode_switches=%lld"
+                " scratch_mode=%s scratch_mmio_jobs=%lld\n",
             data.graph_seq, enabled ? 1 : 0, data.p3_jobs, data.drain_wait_us / 1000.0, data.drain_wait_jobs,
             data.scratch_dma_us / 1000.0, data.scratch_bytes, data.scratch_desc, data.p3_reject_delta,
-            data.p3_mode_switches);
+            data.p3_mode_switches, scratch_mmio ? "mmio" : "dma", data.scratch_mmio_jobs);
     fpga_log_finish_line(fp, data.force_flush);
 }
