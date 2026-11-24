@@ -1270,17 +1270,11 @@ void ggml_compute_forward_mul_mat(
 
     // 2. BÂY GIỜ MỚI GỌI FPGA HOOK
 #ifdef USE_FPGA
-    // FPGA_SOURCE_AUDIT_ONLY validates Q8 source tensors without board I/O.
-    // Skipping lazy initialization here is essential: fpga_init() maps
-    // MY_IP/ZDMA/DDR and runs self-tests, which would invalidate the audit's
-    // file-versus-process-memory isolation.
-    const int fpga_source_audit_only = fpga_source_audit_only_requested();
-    if (ith == 0 && !fpga_source_audit_only) {
+    if (ith == 0) {
         pthread_once(&g_fpga_once, do_fpga_init);  // thread-safe
     }
     ggml_barrier(params->threadpool);
-    const bool fpga_mul_mat_enabled = g_fpga_initialized || fpga_source_audit_only;
-    if (fpga_mul_mat_enabled) {
+    if (g_fpga_initialized) {
         // The optional Llamafile path below may return before native F32->Q8
         // conversion.  Select the route first, as the original hook did, but
         // make thread 0 the only host caller and publish its result before any

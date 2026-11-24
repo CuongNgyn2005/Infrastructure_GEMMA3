@@ -60,16 +60,9 @@ int  fpga_init(void);
 void fpga_cleanup(void);
 
 // Side-effect-free environment queries used before FPGA initialization.
-int fpga_source_audit_only_requested(void);
-int fpga_contract_check_requested(void);
+int fpga_p2_contract_check_requested(void);
 
-// Strict opt-in fused Gemma3 attention + Q8 Wo route. The custom node owns one
-// hardware transaction at a time; userdata is an encoded value, never a pointer
-// to a graph-builder object. Runtime rejection is fatal, without CPU fallback.
-int fpga_attention_requested(void);
-void fpga_attention_wo_callback(struct ggml_tensor * dst, int ith, int nth, void * userdata);
-
-// C0 is allowed to map and drive ZDMA/VPU only after llama-model-loader has
+// P2 qualification is allowed to map and drive ZDMA/VPU only after llama-model-loader has
 // validated every model tensor.  This is a process-local handshake; it never
 // accesses board hardware or mutates model data.
 void fpga_mark_model_tensor_validation_passed(void);

@@ -43,3 +43,22 @@ bool fpga_pack_direct_weight_scale_pair_range(
     bool                       wide_stores,
     size_t *                   written_weight_words,
     size_t *                   written_scale_entries);
+
+// Raw FP16 P3 PARAM stores: no destination reads and no stores wider than 64 bits.
+void fpga_p3_store_scale_row(volatile uint16_t * dst, const uint16_t * src, int count);
+
+bool fpga_pack_direct_weight_p3scale_pair_range(
+    volatile uint32_t *       weight_dst_words,
+    volatile uint16_t *       scale_dst_halves,
+    const struct ggml_tensor * src0,
+    const void *               weight_data_base,
+    int64_t                    row0,
+    int64_t                    k_block0,
+    int                        rows,
+    int                        group_blocks,
+    int                        group_beats,
+    size_t                     pair_begin,
+    size_t                     pair_end,
+    bool                       wide_stores,
+    size_t *                   written_weight_words,
+    size_t *                   written_scale_entries);

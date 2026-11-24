@@ -112,6 +112,15 @@ struct fpga_token_timing_log_t {
     long long act_dma_us;
     long long weight_dma_us;
     long long scale_dma_us;
+    long long p3_jobs;
+    long long drain_wait_us;
+    long long drain_wait_jobs;
+    long long scratch_dma_us;
+    long long scratch_bytes;
+    long long scratch_desc;
+    long long p3_reject_delta;
+    long long p3_mode_switches;
+
     long long ip_compute_us;
     long long ip2host_dma_us;
     long long host_read_us;
@@ -153,3 +162,5 @@ struct fpga_token_timing_log_t {
 };
 void fpga_log_token_timing(const fpga_token_timing_log_t & data);
 void fpga_log_token_diagnostics(const fpga_token_timing_log_t & data);
+
+void fpga_log_p3_split(const fpga_token_timing_log_t & data, bool enabled);

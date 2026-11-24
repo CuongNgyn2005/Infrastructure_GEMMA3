@@ -351,7 +351,7 @@ struct dma_profile_row {
     long long post_pack_observation_gap_us = 0;
 };
 struct dma_profile_bucket {
-    dma_profile_row rows[5];
+    dma_profile_row rows[6];
     unsigned long long finalize_count = 0, residual_bytes = 0, finalize_timing_invalid = 0;
     long long residual_us = 0, helper_wait_us = 0, helper_service_overlap_us = 0, finalize_us = 0;
 };
@@ -497,7 +497,7 @@ void dma_profile_add(dma_profile_row & dst, const dma_profile_row & src) {
 #undef DMA_PROFILE_ADD
 }
 void dma_profile_add(dma_profile_bucket & dst, const dma_profile_bucket & src) {
-    for (int i = 0; i < 5; ++i) dma_profile_add(dst.rows[i], src.rows[i]);
+    for (int i = 0; i < 6; ++i) dma_profile_add(dst.rows[i], src.rows[i]);
     dst.finalize_count += src.finalize_count;
     dst.residual_bytes += src.residual_bytes;
     dst.finalize_timing_invalid += src.finalize_timing_invalid;
@@ -512,8 +512,10 @@ void dma_profile_emit(const dma_profile_bucket & bucket, const char * scope, int
     if (fp == stderr) return;
     fprintf(fp, "[DMA_PROFILE]\n  Phạm vi = %s | Graph = %d | Số graph decode = %llu\n", log_scope(scope), graph_seq, graphs);
     const auto & other = bucket.rows[4];
-    const int columns = other.descriptors || other.failures || other.timing_invalid ? 5 : 4;
-    const char * tags[] = {"ACT", "WEIGHT", "SPU SCALE", "RESULT", "OTHER"};
+    const auto & scratch = bucket.rows[5];
+    const int columns = scratch.descriptors || scratch.failures || scratch.timing_invalid ? 6 :
+                        (other.descriptors || other.failures || other.timing_invalid ? 5 : 4);
+    const char * tags[] = {"ACT", "WEIGHT", "SPU SCALE", "RESULT", "OTHER", "SPU_SCRATCH"};
     log_table_t table = {{"Thông số"}};
     for (int i = 0; i < columns; ++i) table[0].push_back(tags[i]);
     { std::vector<std::string> row = {"Số descriptor"}; for (int i = 0; i < columns; ++i) row.push_back(std::to_string(bucket.rows[i].descriptors)); table.push_back(row); }
@@ -598,6 +600,7 @@ fpga_dma_profile_transfer::fpga_dma_profile_transfer(const char * tag, size_t by
     if (tag && !std::strncmp(tag, "ACT", 3)) t.tag = 0;
     else if (tag && !std::strncmp(tag, "WEIGHT", 6)) t.tag = 1;
     else if (tag && !std::strncmp(tag, "SPU_SCALE", 9)) t.tag = 2;
+    else if (tag && !std::strncmp(tag, "SPU_SCRATCH", 11)) t.tag = 5;
     else if (tag && (!std::strncmp(tag, "RESULT", 6) || !std::strncmp(tag, "SPU_OUT", 7))) t.tag = 3;
     t.entry = dma_profile_clock();
     t.invalid = t.entry < 0;
@@ -908,4 +911,15 @@ void fpga_log_token_diagnostics(const fpga_token_timing_log_t & data) {
         "  Lượt chờ = lượt đọc trạng thái chưa thỏa điều kiện hoàn tất; không phải thời gian chờ",
         data.graph_seq, log_scope(data.scope), data.zdma_polls,
         data.zdma_zero_poll_descriptors, data.zdma_saw_enabled_descriptors);
+}
+
+void fpga_log_p3_split(const fpga_token_timing_log_t & data, bool enabled) {
+    FILE * fp = fpga_log_fp();
+    if (fp == stderr) return;
+    fprintf(fp, "[P3_SPLIT] Graph=%d enabled=%d p3_jobs=%lld drain_wait_ms=%.3f drain_wait_jobs=%lld "
+                "scratch_dma_ms=%.3f scratch_bytes=%lld scratch_desc=%lld p3_reject_delta=%lld mode_switches=%lld\n",
+            data.graph_seq, enabled ? 1 : 0, data.p3_jobs, data.drain_wait_us / 1000.0, data.drain_wait_jobs,
+            data.scratch_dma_us / 1000.0, data.scratch_bytes, data.scratch_desc, data.p3_reject_delta,
+            data.p3_mode_switches);
+    fpga_log_finish_line(fp, data.force_flush);
 }
