@@ -8,6 +8,8 @@
 
 namespace {
 
+bool g_pair_stores = false;
+
 constexpr int kNumLanes   = 16;
 constexpr int kQk8        = 32;
 constexpr int kBlockBeats = kQk8 / kNumLanes;
@@ -37,7 +39,17 @@ static inline uint64_t pack_i8x8_le(const int8_t * lanes) {
 #endif
 }
 
-static inline void store_i8x16_words(volatile uint32_t * dst, const int8_t * lanes, bool wide_stores) {
+static inline void store_i8x16_words(volatile uint32_t * dst, const int8_t * lanes, bool wide_stores, bool pair_stores) {
+#if defined(__aarch64__)
+    if (pair_stores) {
+        const uint64_t lo = pack_i8x8_le(lanes);
+        const uint64_t hi = pack_i8x8_le(lanes + 8);
+        __asm__ __volatile__("stp %1, %2, [%0]" : : "r"(dst), "r"(lo), "r"(hi) : "memory");
+        return;
+    }
+#else
+    (void) pair_stores;
+#endif
     if (wide_stores) {
         volatile uint64_t * const dst_u64 = reinterpret_cast<volatile uint64_t *>(dst);
         dst_u64[0] = pack_i8x8_le(lanes + 0);
@@ -71,6 +83,17 @@ static inline const block_q8_0_t * weight_block_from_base(
 
 } // namespace
 
+void fpga_q8_pack_set_pair_stores(bool enable) {
+#if defined(__aarch64__)
+    g_pair_stores = enable;
+#else
+    (void) enable;
+    g_pair_stores = false;
+#endif
+}
+
+bool fpga_q8_pack_pair_stores_enabled(void) { return g_pair_stores; }
+
 bool fpga_pack_direct_weight_pair_range(
     volatile uint32_t *        dst_words,
     const struct ggml_tensor * src0,
@@ -84,6 +107,8 @@ bool fpga_pack_direct_weight_pair_range(
     size_t                     pair_end,
     bool                       wide_stores,
     size_t *                   written_words) {
+    const bool pair_stores = wide_stores && g_pair_stores;
+    if (pair_stores && ((uintptr_t) dst_words & 15U) != 0U) return false;
     if (!dst_words || (wide_stores && ((uintptr_t) dst_words & (alignof(uint64_t) - 1U)) != 0U) || !src0 ||
         !weight_data_base || !written_words || rows <= 0 || group_blocks <= 0 ||
         group_beats != group_blocks * kBlockBeats || pair_begin > pair_end ||
@@ -113,10 +138,10 @@ bool fpga_pack_direct_weight_pair_range(
             const block_q8_0_t * even_wb = even_base + gb;
             const block_q8_0_t * odd_wb = odd_base ? odd_base + gb : nullptr;
 
-            store_i8x16_words(out, even_wb->qs, wide_stores);
-            store_i8x16_words(out + 4, odd_wb ? odd_wb->qs : zero_i8x16, wide_stores);
-            store_i8x16_words(out + 8, even_wb->qs + kNumLanes, wide_stores);
-            store_i8x16_words(out + 12, odd_wb ? odd_wb->qs + kNumLanes : zero_i8x16, wide_stores);
+            store_i8x16_words(out, even_wb->qs, wide_stores, pair_stores);
+            store_i8x16_words(out + 4, odd_wb ? odd_wb->qs : zero_i8x16, wide_stores, pair_stores);
+            store_i8x16_words(out + 8, even_wb->qs + kNumLanes, wide_stores, pair_stores);
+            store_i8x16_words(out + 12, odd_wb ? odd_wb->qs + kNumLanes : zero_i8x16, wide_stores, pair_stores);
             out += 16;
             words += 16U;
         }
@@ -142,6 +167,8 @@ bool fpga_pack_direct_weight_scale_pair_range(
     bool                       wide_stores,
     size_t *                   written_weight_words,
     size_t *                   written_scale_entries) {
+    const bool pair_stores = wide_stores && g_pair_stores;
+    if (pair_stores && ((uintptr_t) weight_dst_words & 15U) != 0U) return false;
     if (!weight_dst_words || !scale_dst_words ||
         (wide_stores && ((uintptr_t) weight_dst_words & (alignof(uint64_t) - 1U)) != 0U) ||
         ((uintptr_t) scale_dst_words & (alignof(uint32_t) - 1U)) != 0U) {
@@ -213,10 +240,10 @@ bool fpga_pack_direct_weight_scale_pair_range(
                 const block_q8_0_t * even_wb = even_base + gb;
                 const block_q8_0_t * odd_wb = odd_base ? odd_base + gb : nullptr;
                 for (int block = 0; block < 2; ++block) {
-                    store_i8x16_words(out, even_wb[block].qs, true);
-                    store_i8x16_words(out + 4, odd_wb ? odd_wb[block].qs : zero_i8x16, true);
-                    store_i8x16_words(out + 8, even_wb[block].qs + kNumLanes, true);
-                    store_i8x16_words(out + 12, odd_wb ? odd_wb[block].qs + kNumLanes : zero_i8x16, true);
+                    store_i8x16_words(out, even_wb[block].qs, true, pair_stores);
+                    store_i8x16_words(out + 4, odd_wb ? odd_wb[block].qs : zero_i8x16, true, pair_stores);
+                    store_i8x16_words(out + 8, even_wb[block].qs + kNumLanes, true, pair_stores);
+                    store_i8x16_words(out + 12, odd_wb ? odd_wb[block].qs + kNumLanes : zero_i8x16, true, pair_stores);
                     out += 16;
                 }
                 const uint32_t act0 = (uint16_t) activation_blocks[gb].d;
@@ -237,10 +264,10 @@ bool fpga_pack_direct_weight_scale_pair_range(
             const block_q8_0_t * even_wb = even_base + gb;
             const block_q8_0_t * odd_wb = odd_base ? odd_base + gb : nullptr;
 
-            store_i8x16_words(out, even_wb->qs, wide_stores);
-            store_i8x16_words(out + 4, odd_wb ? odd_wb->qs : zero_i8x16, wide_stores);
-            store_i8x16_words(out + 8, even_wb->qs + kNumLanes, wide_stores);
-            store_i8x16_words(out + 12, odd_wb ? odd_wb->qs + kNumLanes : zero_i8x16, wide_stores);
+            store_i8x16_words(out, even_wb->qs, wide_stores, pair_stores);
+            store_i8x16_words(out + 4, odd_wb ? odd_wb->qs : zero_i8x16, wide_stores, pair_stores);
+            store_i8x16_words(out + 8, even_wb->qs + kNumLanes, wide_stores, pair_stores);
+            store_i8x16_words(out + 12, odd_wb ? odd_wb->qs + kNumLanes : zero_i8x16, wide_stores, pair_stores);
             out += 16;
             weight_words += 16U;
 
@@ -315,6 +342,8 @@ bool fpga_pack_direct_weight_p3scale_pair_range(
     bool                       wide_stores,
     size_t *                   written_weight_words,
     size_t *                   written_scale_entries) {
+    const bool pair_stores = wide_stores && g_pair_stores;
+    if (pair_stores && ((uintptr_t) weight_dst_words & 15U) != 0U) return false;
     if (!weight_dst_words || !scale_dst_halves ||
         (wide_stores && ((uintptr_t) weight_dst_words & (alignof(uint64_t) - 1U)) != 0U) ||
         ((uintptr_t) scale_dst_halves & (alignof(uint16_t) - 1U)) != 0U) {
@@ -370,10 +399,10 @@ bool fpga_pack_direct_weight_p3scale_pair_range(
         for (int gb = 0; gb < group_blocks; ++gb) {
             const block_q8_0_t * even_wb = even_base + gb;
             const block_q8_0_t * odd_wb = odd_base ? odd_base + gb : nullptr;
-            store_i8x16_words(out, even_wb->qs, wide_stores);
-            store_i8x16_words(out + 4, odd_wb ? odd_wb->qs : zero_i8x16, wide_stores);
-            store_i8x16_words(out + 8, even_wb->qs + kNumLanes, wide_stores);
-            store_i8x16_words(out + 12, odd_wb ? odd_wb->qs + kNumLanes : zero_i8x16, wide_stores);
+            store_i8x16_words(out, even_wb->qs, wide_stores, pair_stores);
+            store_i8x16_words(out + 4, odd_wb ? odd_wb->qs : zero_i8x16, wide_stores, pair_stores);
+            store_i8x16_words(out + 8, even_wb->qs + kNumLanes, wide_stores, pair_stores);
+            store_i8x16_words(out + 12, odd_wb ? odd_wb->qs + kNumLanes : zero_i8x16, wide_stores, pair_stores);
             out += 16;
             weight_words += 16U;
             row_buf[gb] = (uint16_t) even_wb->d;

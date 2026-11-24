@@ -121,16 +121,16 @@ int main() {
         task.generation = 0;
         assert(!fpga_p2_pack_worker_submit(task));
         // Admission rejection checks are isolated while the helper is idle.
-        pthread_mutex_lock(&g_p2_pack_worker_mutex);
-        g_p2_pack_worker_busy = true;
-        pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+        pthread_mutex_lock(&g_p2_pack_workers[0].mutex);
+        g_p2_pack_workers[0].busy = true;
+        pthread_mutex_unlock(&g_p2_pack_workers[0].mutex);
         task.generation = 1;
         assert(!fpga_p2_pack_worker_submit(task));
         assert(!fpga_p2_pack_worker_next_generation(&generation));
         assert(!fpga_p2_pack_worker_stop());
-        pthread_mutex_lock(&g_p2_pack_worker_mutex);
-        g_p2_pack_worker_busy = false;
-        pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+        pthread_mutex_lock(&g_p2_pack_workers[0].mutex);
+        g_p2_pack_workers[0].busy = false;
+        pthread_mutex_unlock(&g_p2_pack_workers[0].mutex);
         for (int i = 0; i < 2000; ++i) {
             for (size_t j = 0; j < input.size(); ++j)
                 for (int k = 0; k < 32; ++k)
@@ -173,19 +173,19 @@ int main() {
         assert(completion_mono == 0);
         task.group_beats = beats;
         assert(fpga_p2_pack_worker_stop());
-        pthread_mutex_lock(&g_p2_pack_worker_mutex);
-        assert(g_p2_pack_worker_completed_mono_us == 0);
-        pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+        pthread_mutex_lock(&g_p2_pack_workers[0].mutex);
+        assert(g_p2_pack_workers[0].completed_mono_us == 0);
+        pthread_mutex_unlock(&g_p2_pack_workers[0].mutex);
         assert(fpga_p2_pack_worker_stop());
         assert(!fpga_p2_pack_worker_submit(task));
     }
     assert(fpga_p2_pack_worker_start());
-    g_p2_pack_worker_next_generation = UINT64_MAX;
+    g_p2_pack_workers[0].next_generation = UINT64_MAX;
     assert(!fpga_p2_pack_worker_next_generation(&generation));
     assert(fpga_p2_pack_worker_stop());
-    pthread_mutex_lock(&g_p2_pack_worker_mutex);
-    assert(g_p2_pack_worker_completed_mono_us == 0);
-    pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+    pthread_mutex_lock(&g_p2_pack_workers[0].mutex);
+    assert(g_p2_pack_workers[0].completed_mono_us == 0);
+    pthread_mutex_unlock(&g_p2_pack_workers[0].mutex);
     puts("PASS: 6000 byte-exact parallel jobs (3000 pack, 3000 copy); wake races, stale/failed completion, admission, overflow, restart");
 }
 '''

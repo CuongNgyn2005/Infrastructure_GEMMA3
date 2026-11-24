@@ -593,6 +593,11 @@ typedef struct {
 typedef struct {
     bool                  valid;
     bool                  worker_submitted;
+    bool                  offload;
+    bool                  worker1_submitted;
+    uint64_t              generation1;
+    size_t                helper1_pair_begin;
+    long long             helper1_service_us;
     bool                  consumed;
     uint64_t              generation;
     uint64_t              source_epoch;
@@ -876,22 +881,25 @@ typedef struct {
     volatile uint16_t *         p3_scale_halves = nullptr;
 } fpga_p2_pack_worker_task_t;
 
-static pthread_mutex_t        g_p2_pack_worker_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t         g_p2_pack_worker_task_cv = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t         g_p2_pack_worker_done_cv = PTHREAD_COND_INITIALIZER;
-static pthread_t              g_p2_pack_worker_thread = {};
-static fpga_p2_pack_worker_task_t g_p2_pack_worker_task = {};
-static bool                   g_p2_pack_worker_created = false;
-static bool                   g_p2_pack_worker_stop_requested = false;
-static bool                   g_p2_pack_worker_task_pending = false;
-static bool                   g_p2_pack_worker_busy = false;
-static uint64_t               g_p2_pack_worker_next_generation = 0;
-static uint64_t               g_p2_pack_worker_completed_generation = 0;
-static bool                   g_p2_pack_worker_completed_success = false;
-static size_t                 g_p2_pack_worker_completed_words = 0;
-static size_t                 g_p2_pack_worker_completed_scale_entries = 0;
-static long long              g_p2_pack_worker_completed_service_us = 0;
-static long long              g_p2_pack_worker_completed_mono_us = 0;
+typedef struct {
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t task_cv = PTHREAD_COND_INITIALIZER;
+    pthread_cond_t done_cv = PTHREAD_COND_INITIALIZER;
+    pthread_t thread = {};
+    fpga_p2_pack_worker_task_t task = {};
+    bool created = false;
+    bool stop_requested = false;
+    bool task_pending = false;
+    bool busy = false;
+    uint64_t next_generation = 0;
+    uint64_t completed_generation = 0;
+    bool completed_success = false;
+    size_t completed_words = 0;
+    size_t completed_scale_entries = 0;
+    long long completed_service_us = 0;
+    long long completed_mono_us = 0;
+} fpga_p2_pack_worker_state_t;
+static fpga_p2_pack_worker_state_t g_p2_pack_workers[2] = {};
 static long long         g_p2_residency_avoided_cpu_pack_bytes        = 0;
 // Residency still transfers each selected tile from DDR to the IP.  Keep this
 // explicit so a diagnostic log never claims a traffic reduction it cannot
@@ -1000,6 +1008,14 @@ static unsigned long long      g_dma_trace_sequence              = 0;
 static uint32_t  g_stream_protocol_version = 0;
 static uint32_t  g_bitstream_id            = 0;
 
+static bool g_p2_pack_offload_enabled = false;
+static bool g_pack_stp_enabled = false;
+static bool g_result_ldp_enabled = false;
+static bool g_uncached_write_probe_enabled = false;
+static long long g_p2_pack_offload_jobs = 0;
+static long long g_p2_pack_offload_helper_us[2] = {};
+static uint64_t g_p2_pack_offload_helper_bytes[2] = {};
+static long long g_p2_pack_offload_finalize_wait_us = 0;
 static bool g_p3_split_scale_enabled = false;
 static bool g_p3_scratch_mmio_enabled = false;
 static bool g_p3_matmul_active = false;
@@ -2292,6 +2308,142 @@ static void fpga_uncached_read_probe(void) {
 #endif
 }
 
+#if defined(__aarch64__)
+struct fpga_write_probe_gate_t {
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+    pthread_barrier_t barrier;
+    bool start = false;
+    bool abort = false;
+};
+struct fpga_write_probe_task_t {
+    fpga_write_probe_gate_t * gate;
+    uint8_t * base;
+    size_t bytes;
+    int method;
+    long long elapsed_us;
+};
+
+static void * fpga_uncached_write_probe_thread(void * arg) {
+    auto & task = *static_cast<fpga_write_probe_task_t *>(arg);
+    auto & gate = *task.gate;
+    pthread_mutex_lock(&gate.mutex);
+    while (!gate.start && !gate.abort) pthread_cond_wait(&gate.cv, &gate.mutex);
+    const bool abort = gate.abort;
+    pthread_mutex_unlock(&gate.mutex);
+    if (abort) return nullptr;
+    const int barrier_rc = pthread_barrier_wait(&gate.barrier);
+    if (barrier_rc != 0 && barrier_rc != PTHREAD_BARRIER_SERIAL_THREAD) {
+        fpga_fatal("Uncached write probe barrier wait failed; refusing live-thread teardown");
+    }
+    const long long start = now_us();
+    for (int pass = 0; pass < 16; ++pass) {
+        const size_t step = task.method == 3 ? 64U : 16U;
+        for (size_t offset = 0; offset < task.bytes; offset += step) {
+            uint8_t * addr = task.base + offset;
+            switch (task.method) {
+                case 0: {
+                    volatile uint64_t * words = reinterpret_cast<volatile uint64_t *>(addr);
+                    words[0] = 0U;
+                    words[1] = 0U;
+                    break;
+                }
+                case 1:
+                    __asm__ __volatile__("stp xzr, xzr, [%0]" : : "r"(addr) : "memory");
+                    break;
+                case 2:
+                    __asm__ __volatile__("movi v0.2d, #0\n\tstr q0, [%0]" : : "r"(addr) : "v0", "memory");
+                    break;
+                case 3:
+                    __asm__ __volatile__("movi v0.2d, #0\n\tmovi v1.2d, #0\n\t"
+                                         "movi v2.2d, #0\n\tmovi v3.2d, #0\n\t"
+                                         "st1 {v0.16b-v3.16b}, [%0]"
+                                         : : "r"(addr) : "v0", "v1", "v2", "v3", "memory");
+                    break;
+            }
+        }
+    }
+    mmio_fence();
+    task.elapsed_us = now_us() - start;
+    return nullptr;
+}
+#endif
+
+static void fpga_uncached_write_probe(void) {
+#if defined(__aarch64__)
+    constexpr size_t bytes = WEIGHT_END - WEIGHT_BASE;
+    static_assert(bytes == 1048576U, "write probe must use only the 1 MiB WEIGHT staging window");
+    uint8_t * const base = ddr_ptr(WEIGHT_BASE, bytes);
+    if (!base || (reinterpret_cast<uintptr_t>(base) & 63U) != 0U) {
+        fpga_fatal("Uncached write probe requires 64-byte aligned WEIGHT staging");
+    }
+    const char * const methods[] = {"str64x2", "stp", "strq", "st1x4"};
+    for (int method = 0; method < 4; ++method) {
+        double best[3] = {};
+        for (int threads = 1; threads <= 3; ++threads) {
+            const size_t slice = (bytes / (size_t) threads) & ~(size_t) 63U;
+            for (int repeat = 0; repeat < 3; ++repeat) {
+                fpga_write_probe_gate_t gate = {};
+                fpga_write_probe_task_t tasks[3] = {};
+                pthread_t helpers[2] = {};
+                int created = 0;
+                const bool barrier_ready = pthread_barrier_init(&gate.barrier, nullptr, (unsigned) threads) == 0;
+                bool ready = barrier_ready;
+                if (ready) {
+                    for (int i = 0; i < threads; ++i) {
+                        tasks[i] = {&gate, base + (size_t) i * slice, slice, method, 0};
+                    }
+                    // No participant enters the fixed-count barrier until all
+                    // helpers exist. A partial create can therefore abort safely.
+                    for (int i = 1; i < threads; ++i) {
+                        if (pthread_create(&helpers[created], nullptr, fpga_uncached_write_probe_thread, &tasks[i]) != 0) {
+                            ready = false;
+                            break;
+                        }
+                        ++created;
+                    }
+                    pthread_mutex_lock(&gate.mutex);
+                    gate.start = ready;
+                    gate.abort = !ready;
+                    pthread_cond_broadcast(&gate.cv);
+                    pthread_mutex_unlock(&gate.mutex);
+                    if (ready) fpga_uncached_write_probe_thread(&tasks[0]);
+                }
+                for (int i = 0; i < created; ++i) {
+                    if (pthread_join(helpers[i], nullptr) != 0) {
+                        fpga_fatal("Uncached write probe thread join failed; refusing mapping or gate teardown");
+                    }
+                }
+                if (barrier_ready) pthread_barrier_destroy(&gate.barrier);
+                pthread_cond_destroy(&gate.cv);
+                pthread_mutex_destroy(&gate.mutex);
+                if (!ready) {
+                    fpga_log_line(true, "UNCACHED_WRITE_PROBE", true,
+                                  "method=%s threads=%d skipped=thread_create_failed", methods[method], threads);
+                    best[threads - 1] = 0.0;
+                    break;
+                }
+                long long elapsed = 0;
+                for (int i = 0; i < threads; ++i) elapsed = std::max(elapsed, tasks[i].elapsed_us);
+                // Bytes/us equals decimal MB/s. The 3-thread case deliberately
+                // excludes the unassigned tail from the actual byte numerator.
+                const double mbps = elapsed > 0 ? (double) ((size_t) threads * slice * 16U) / (double) elapsed : 0.0;
+                best[threads - 1] = std::max(best[threads - 1], mbps);
+            }
+        }
+        fpga_log_line(true, "UNCACHED_WRITE_PROBE", true,
+                      "method=%s bytes=1048576 passes=16 t1_mbps=%.0f t2_mbps=%.0f t3_mbps=%.0f",
+                      methods[method], best[0], best[1], best[2]);
+    }
+#if defined(GGML_USE_OPENMP)
+    constexpr int openmp = 1;
+#else
+    constexpr int openmp = 0;
+#endif
+    fpga_log_line(true, "HOST_THREADS", true, "online_cpus=%ld openmp=%d", sysconf(_SC_NPROCESSORS_ONLN), openmp);
+#endif
+}
+
 static bool configure_ddr_mapping_policy(void) {
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
@@ -3562,20 +3714,21 @@ static bool fpga_copy_weight_pair_range(const fpga_p2_pack_worker_task_t & task,
     return true;
 }
 
-static void * fpga_p2_pack_worker_main(void *) {
+static void * fpga_p2_pack_worker_main(void * arg) {
+    auto & w = *static_cast<fpga_p2_pack_worker_state_t *>(arg);
     for (;;) {
-        pthread_mutex_lock(&g_p2_pack_worker_mutex);
-        while (!g_p2_pack_worker_stop_requested && !g_p2_pack_worker_task_pending) {
-            (void) pthread_cond_wait(&g_p2_pack_worker_task_cv, &g_p2_pack_worker_mutex);
+        pthread_mutex_lock(&w.mutex);
+        while (!w.stop_requested && !w.task_pending) {
+            (void) pthread_cond_wait(&w.task_cv, &w.mutex);
         }
-        if (g_p2_pack_worker_stop_requested) {
-            pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+        if (w.stop_requested) {
+            pthread_mutex_unlock(&w.mutex);
             return nullptr;
         }
-        const fpga_p2_pack_worker_task_t task = g_p2_pack_worker_task;
-        g_p2_pack_worker_task_pending = false;
-        g_p2_pack_worker_busy = true;
-        pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+        const fpga_p2_pack_worker_task_t task = w.task;
+        w.task_pending = false;
+        w.busy = true;
+        pthread_mutex_unlock(&w.mutex);
 
         const long long service0 = now_us();
         size_t written_words = 0U;
@@ -3599,58 +3752,62 @@ static void * fpga_p2_pack_worker_main(void *) {
         // stores are globally observed.  The caller performs its own DSB
         // before DMA.
         mmio_fence();
-        pthread_mutex_lock(&g_p2_pack_worker_mutex);
-        g_p2_pack_worker_busy = false;
-        g_p2_pack_worker_completed_generation = task.generation;
-        g_p2_pack_worker_completed_success = success;
-        g_p2_pack_worker_completed_words = written_words;
-        g_p2_pack_worker_completed_scale_entries = written_scale_entries;
-        g_p2_pack_worker_completed_service_us = now_us() - service0;
-        g_p2_pack_worker_completed_mono_us = monotonic_now_us();
-        pthread_cond_broadcast(&g_p2_pack_worker_done_cv);
-        pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+        pthread_mutex_lock(&w.mutex);
+        w.busy = false;
+        w.completed_generation = task.generation;
+        w.completed_success = success;
+        w.completed_words = written_words;
+        w.completed_scale_entries = written_scale_entries;
+        w.completed_service_us = now_us() - service0;
+        w.completed_mono_us = monotonic_now_us();
+        pthread_cond_broadcast(&w.done_cv);
+        pthread_mutex_unlock(&w.mutex);
     }
 }
 
-static bool fpga_p2_pack_worker_start(void) {
+static bool fpga_p2_pack_worker_start(int worker = 0) {
+    if (worker < 0 || worker > 1) return false;
+    auto & w = g_p2_pack_workers[worker];
     if (g_p2_pack_workers_requested != 2) {
         return true;
     }
-    pthread_mutex_lock(&g_p2_pack_worker_mutex);
-    if (g_p2_pack_worker_created || g_p2_pack_worker_task_pending || g_p2_pack_worker_busy) {
-        pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+    pthread_mutex_lock(&w.mutex);
+    if (w.created || w.task_pending || w.busy) {
+        pthread_mutex_unlock(&w.mutex);
         return false;
     }
-    g_p2_pack_worker_stop_requested = false;
-    g_p2_pack_worker_completed_generation = 0U;
-    g_p2_pack_worker_completed_success = false;
-    g_p2_pack_worker_completed_words = 0U;
-    g_p2_pack_worker_completed_scale_entries = 0U;
-    g_p2_pack_worker_completed_service_us = 0;
-    g_p2_pack_worker_completed_mono_us = 0;
-    const int create_rc = pthread_create(&g_p2_pack_worker_thread, nullptr, fpga_p2_pack_worker_main, nullptr);
+    w.stop_requested = false;
+    w.completed_generation = 0U;
+    w.completed_success = false;
+    w.completed_words = 0U;
+    w.completed_scale_entries = 0U;
+    w.completed_service_us = 0;
+    w.completed_mono_us = 0;
+    const int create_rc = pthread_create(&w.thread, nullptr, fpga_p2_pack_worker_main, &w);
     if (create_rc == 0) {
-        g_p2_pack_worker_created = true;
+        w.created = true;
     }
-    pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+    pthread_mutex_unlock(&w.mutex);
     return create_rc == 0;
 }
 
-static bool fpga_p2_pack_worker_next_generation(uint64_t * generation, bool record_dispatch = true) {
+static bool fpga_p2_pack_worker_next_generation(uint64_t * generation, bool record_dispatch = true, int worker = 0) {
+    if (worker < 0 || worker > 1) return false;
+    auto & w = g_p2_pack_workers[worker];
     if (!generation) {
         return false;
     }
     const long long lock0 = now_us();
-    pthread_mutex_lock(&g_p2_pack_worker_mutex);
+    pthread_mutex_lock(&w.mutex);
     const long long locked = now_us();
-    const bool ready = g_p2_pack_worker_created && !g_p2_pack_worker_stop_requested &&
-                       !g_p2_pack_worker_task_pending && !g_p2_pack_worker_busy &&
-                       g_p2_pack_worker_next_generation != UINT64_MAX;
+    const bool ready = w.created && !w.stop_requested &&
+                       !w.task_pending && !w.busy &&
+                       w.next_generation != UINT64_MAX;
     if (ready) {
-        *generation = ++g_p2_pack_worker_next_generation;
+        *generation = ++w.next_generation;
     }
     const long long unlock0 = now_us();
-    pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+    pthread_mutex_unlock(&w.mutex);
     const long long unlocked = now_us();
     if (ready && record_dispatch) {
         g_pack_detail[PACK_RESERVE_LOCK] += locked - lock0;
@@ -3660,26 +3817,28 @@ static bool fpga_p2_pack_worker_next_generation(uint64_t * generation, bool reco
     return ready;
 }
 
-static bool fpga_p2_pack_worker_submit(const fpga_p2_pack_worker_task_t & task, bool record_dispatch = true) {
+static bool fpga_p2_pack_worker_submit(const fpga_p2_pack_worker_task_t & task, bool record_dispatch = true, int worker = 0) {
+    if (worker < 0 || worker > 1) return false;
+    auto & w = g_p2_pack_workers[worker];
     const long long lock0 = now_us();
-    pthread_mutex_lock(&g_p2_pack_worker_mutex);
+    pthread_mutex_lock(&w.mutex);
     const long long locked = now_us();
-    if (!g_p2_pack_worker_created || g_p2_pack_worker_stop_requested || g_p2_pack_worker_task_pending ||
-        g_p2_pack_worker_busy || task.generation == 0U) {
-        pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+    if (!w.created || w.stop_requested || w.task_pending ||
+        w.busy || task.generation == 0U) {
+        pthread_mutex_unlock(&w.mutex);
         return false;
     }
-    g_p2_pack_worker_task = task;
-    g_p2_pack_worker_task_pending = true;
+    w.task = task;
+    w.task_pending = true;
     const long long unlock0 = now_us();
-    pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+    pthread_mutex_unlock(&w.mutex);
     const long long unlocked = now_us();
     // Publish the predicate before notifying so the awakened helper need not
     // contend with this caller for the mutex. The helper tests task_pending
     // under the same mutex before waiting, so an early notification cannot
     // lose a task. Submission and cleanup are serialized by the owning g_mutex;
     // the static condition variable remains alive throughout notification.
-    pthread_cond_signal(&g_p2_pack_worker_task_cv);
+    pthread_cond_signal(&w.task_cv);
     const long long signaled = now_us();
     // Elapsed intervals may include OS descheduling; these are not CPU-only costs.
     if (record_dispatch) {
@@ -3696,7 +3855,9 @@ static bool fpga_p2_pack_worker_wait(uint64_t generation,
                                      long long * service_us,
                                      long long * wait_us,
                                      size_t * scale_entries = nullptr,
-                                     long long * completion_mono_us = nullptr) {
+                                     long long * completion_mono_us = nullptr, int worker = 0) {
+    if (worker < 0 || worker > 1) return false;
+    auto & w = g_p2_pack_workers[worker];
     if (completion_mono_us) {
         *completion_mono_us = 0;
     }
@@ -3704,21 +3865,21 @@ static bool fpga_p2_pack_worker_wait(uint64_t generation,
         return false;
     }
     const long long wait0 = now_us();
-    pthread_mutex_lock(&g_p2_pack_worker_mutex);
-    while (g_p2_pack_worker_created && g_p2_pack_worker_completed_generation < generation) {
-        (void) pthread_cond_wait(&g_p2_pack_worker_done_cv, &g_p2_pack_worker_mutex);
+    pthread_mutex_lock(&w.mutex);
+    while (w.created && w.completed_generation < generation) {
+        (void) pthread_cond_wait(&w.done_cv, &w.mutex);
     }
-    const bool success = g_p2_pack_worker_created && g_p2_pack_worker_completed_generation == generation &&
-                         g_p2_pack_worker_completed_success;
-    *words = g_p2_pack_worker_completed_words;
+    const bool success = w.created && w.completed_generation == generation &&
+                         w.completed_success;
+    *words = w.completed_words;
     if (scale_entries) {
-        *scale_entries = g_p2_pack_worker_completed_scale_entries;
+        *scale_entries = w.completed_scale_entries;
     }
-    *service_us = g_p2_pack_worker_completed_service_us;
+    *service_us = w.completed_service_us;
     if (completion_mono_us && success) {
-        *completion_mono_us = g_p2_pack_worker_completed_mono_us;
+        *completion_mono_us = w.completed_mono_us;
     }
-    pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+    pthread_mutex_unlock(&w.mutex);
     *wait_us = now_us() - wait0;
     return success;
 }
@@ -3739,6 +3900,14 @@ static void fpga_p2_dma_pipeline_invalidate(fpga_p2_dma_pipeline_lookahead_t * l
         }
         lookahead->worker_submitted = false;
     }
+    if (lookahead->worker1_submitted) {
+        size_t words = 0U, scales = 0U;
+        long long service = 0, wait = 0;
+        if (!fpga_p2_pack_worker_wait(lookahead->generation1, &words, &service, &wait, &scales, nullptr, 1)) {
+            fpga_fatal("P2 DMA pipeline helper did not publish completion; refusing source-slot reuse");
+        }
+        lookahead->worker1_submitted = false;
+    }
     lookahead->valid = false;
     lookahead->consumed = false;
 }
@@ -3746,7 +3915,7 @@ static void fpga_p2_dma_pipeline_invalidate(fpga_p2_dma_pipeline_lookahead_t * l
 struct fpga_p2_dma_pipeline_scope_guard {
     fpga_p2_dma_pipeline_lookahead_t * lookahead;
     ~fpga_p2_dma_pipeline_scope_guard() {
-        if (lookahead && (lookahead->valid || lookahead->worker_submitted)) {
+        if (lookahead && (lookahead->valid || lookahead->worker_submitted || lookahead->worker1_submitted)) {
             fpga_p2_dma_pipeline_invalidate(lookahead);
         }
     }
@@ -3840,32 +4009,34 @@ static bool fpga_p2_dma_pipeline_poll(void * context, long long elapsed_us) {
 
 // Called under g_mutex during explicit cleanup.  A join error is surfaced to
 // the caller before any UIO DDR mapping can be invalidated.
-static bool fpga_p2_pack_worker_stop(void) {
-    pthread_mutex_lock(&g_p2_pack_worker_mutex);
-    if (!g_p2_pack_worker_created) {
-        pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+static bool fpga_p2_pack_worker_stop(int worker = 0) {
+    if (worker < 0 || worker > 1) return false;
+    auto & w = g_p2_pack_workers[worker];
+    pthread_mutex_lock(&w.mutex);
+    if (!w.created) {
+        pthread_mutex_unlock(&w.mutex);
         return true;
     }
-    if (g_p2_pack_worker_task_pending || g_p2_pack_worker_busy) {
-        pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+    if (w.task_pending || w.busy) {
+        pthread_mutex_unlock(&w.mutex);
         return false;
     }
-    g_p2_pack_worker_stop_requested = true;
-    pthread_cond_broadcast(&g_p2_pack_worker_task_cv);
-    pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+    w.stop_requested = true;
+    pthread_cond_broadcast(&w.task_cv);
+    pthread_mutex_unlock(&w.mutex);
 
-    if (pthread_join(g_p2_pack_worker_thread, nullptr) != 0) {
+    if (pthread_join(w.thread, nullptr) != 0) {
         return false;
     }
 
-    pthread_mutex_lock(&g_p2_pack_worker_mutex);
-    g_p2_pack_worker_created = false;
-    g_p2_pack_worker_stop_requested = false;
-    g_p2_pack_worker_task_pending = false;
-    g_p2_pack_worker_busy = false;
-    g_p2_pack_worker_completed_scale_entries = 0U;
-    g_p2_pack_worker_completed_mono_us = 0;
-    pthread_mutex_unlock(&g_p2_pack_worker_mutex);
+    pthread_mutex_lock(&w.mutex);
+    w.created = false;
+    w.stop_requested = false;
+    w.task_pending = false;
+    w.busy = false;
+    w.completed_scale_entries = 0U;
+    w.completed_mono_us = 0;
+    pthread_mutex_unlock(&w.mutex);
     return true;
 }
 
@@ -5097,7 +5268,7 @@ static bool fpga_p2_dma_pipeline_admit(fpga_p2_dma_pipeline_lookahead_t & lookah
                                        fpga_stage_totals_t *              totals,
                                        uint32_t                           weight_src_off,
                                        uint32_t                           scale_src_off) {
-    if (lookahead.valid || lookahead.worker_submitted || !g_p2_pack_dma_pipeline_enabled || !src0 ||
+    if (lookahead.valid || lookahead.worker_submitted || lookahead.worker1_submitted || !g_p2_pack_dma_pipeline_enabled || !src0 ||
         !weight_data_base || !act_group || rows <= 0 || group_blocks <= 0 || row0 < 0 || k_block0 < 0 || col < 0 ||
         !ddr_is_mapped()) {
         return false;
@@ -5147,6 +5318,11 @@ static bool fpga_p2_dma_pipeline_admit(fpga_p2_dma_pipeline_lookahead_t & lookah
     candidate.source_epoch           = g_p2_weight_residency_epoch;
     candidate.pair_count             = pair_count;
     candidate.helper_pair_begin      = fpga_p2_dma_pipeline_main_pair_count(pair_count, weight_bytes);
+    if (g_p2_pack_offload_enabled) {
+        candidate.offload = true;
+        candidate.helper_pair_begin = 0U;
+        candidate.helper1_pair_begin = pair_count / 2U;
+    }
     candidate.main_pair_next         = 0U;
     candidate.words_per_pair         = words_per_pair;
     candidate.expected_words         = pair_count * words_per_pair;
@@ -5205,8 +5381,9 @@ static bool fpga_p2_dma_pipeline_admit(fpga_p2_dma_pipeline_lookahead_t & lookah
         return false;
     }
 
-    const size_t helper_words = (pair_count - candidate.helper_pair_begin) * words_per_pair;
-    const size_t helper_rows = (size_t) rows - candidate.helper_pair_begin * 2U;
+    const size_t h0_end = candidate.offload ? candidate.helper1_pair_begin : pair_count;
+    const size_t helper_words = (h0_end - candidate.helper_pair_begin) * words_per_pair;
+    const size_t helper_rows = std::min(h0_end * 2U, (size_t) rows) - candidate.helper_pair_begin * 2U;
     if (helper_rows == 0U || helper_rows > std::numeric_limits<size_t>::max() / (size_t) group_blocks ||
         helper_words == 0U) {
         ++g_p2_pack_dma_pipeline_rejected_jobs;
@@ -5214,6 +5391,11 @@ static bool fpga_p2_dma_pipeline_admit(fpga_p2_dma_pipeline_lookahead_t & lookah
     }
     uint64_t generation = 0U;
     if (!fpga_p2_pack_worker_next_generation(&generation, false)) {
+        ++g_p2_pack_dma_pipeline_rejected_jobs;
+        return false;
+    }
+    uint64_t generation1 = 0U;
+    if (candidate.offload && !fpga_p2_pack_worker_next_generation(&generation1, false, 1)) {
         ++g_p2_pack_dma_pipeline_rejected_jobs;
         return false;
     }
@@ -5227,7 +5409,7 @@ static bool fpga_p2_dma_pipeline_admit(fpga_p2_dma_pipeline_lookahead_t & lookah
     task.group_blocks           = group_blocks;
     task.group_beats            = group_blocks * VPU_BLOCK_BEATS;
     task.pair_begin             = candidate.helper_pair_begin;
-    task.pair_end               = pair_count;
+    task.pair_end               = h0_end;
     task.dst_words              = candidate.weight_words;
     task.expected_words         = helper_words;
     task.generation             = generation;
@@ -5239,6 +5421,25 @@ static bool fpga_p2_dma_pipeline_admit(fpga_p2_dma_pipeline_lookahead_t & lookah
     if (!fpga_p2_pack_worker_submit(task, false)) {
         ++g_p2_pack_dma_pipeline_rejected_jobs;
         return false;
+    }
+    if (candidate.offload) {
+        fpga_p2_pack_worker_task_t task1 = task;
+        task1.pair_begin = candidate.helper1_pair_begin;
+        task1.pair_end = pair_count;
+        task1.expected_words = (pair_count - candidate.helper1_pair_begin) * words_per_pair;
+        task1.expected_scale_entries = ((size_t) rows - candidate.helper1_pair_begin * 2U) * (size_t) group_blocks;
+        task1.generation = generation1;
+        if (!fpga_p2_pack_worker_submit(task1, false, 1)) {
+            size_t words = 0U, scales = 0U;
+            long long service = 0, wait = 0;
+            if (!fpga_p2_pack_worker_wait(generation, &words, &service, &wait, &scales)) {
+                fpga_fatal("P2 DMA pipeline helper did not publish completion; refusing source-slot reuse");
+            }
+            ++g_p2_pack_dma_pipeline_rejected_jobs;
+            return false;
+        }
+        candidate.generation1 = generation1;
+        candidate.worker1_submitted = true;
     }
     candidate.generation       = generation;
     candidate.worker_submitted = true;
@@ -5258,7 +5459,7 @@ static bool fpga_p2_dma_pipeline_consume(fpga_p2_dma_pipeline_lookahead_t & look
                                          int                                      expected_group_blocks,
                                          int64_t                                expected_col,
                                          uint32_t                               expected_tile_id) {
-    if (!lookahead.valid || lookahead.consumed || lookahead.worker_submitted || lookahead.main_pair_next !=
+    if (!lookahead.valid || lookahead.consumed || lookahead.worker_submitted || lookahead.worker1_submitted || lookahead.main_pair_next !=
                                                                             lookahead.helper_pair_begin ||
         lookahead.main_written_words != lookahead.helper_pair_begin * lookahead.words_per_pair ||
         lookahead.main_scale_entries > lookahead.expected_scale_entries || lookahead.totals != totals ||
@@ -5281,6 +5482,7 @@ static bool fpga_p2_dma_pipeline_consume(fpga_p2_dma_pipeline_lookahead_t & look
 }
 
 static bool fpga_p2_dma_pipeline_finalize(fpga_p2_dma_pipeline_lookahead_t & lookahead) {
+    if (lookahead.offload && !lookahead.worker1_submitted) return false;
     if (!lookahead.valid || lookahead.consumed || !lookahead.worker_submitted) {
         return !lookahead.valid || lookahead.consumed;
     }
@@ -5306,19 +5508,32 @@ static bool fpga_p2_dma_pipeline_finalize(fpga_p2_dma_pipeline_lookahead_t & loo
         return false;
     }
     lookahead.worker_submitted = false;
-    const size_t helper_expected_words =
-        (lookahead.pair_count - lookahead.helper_pair_begin) * lookahead.words_per_pair;
-    const size_t helper_rows = lookahead.job.rows > (int) (lookahead.helper_pair_begin * 2U) ?
-                                   (size_t) lookahead.job.rows - lookahead.helper_pair_begin * 2U :
-                                   0U;
+    size_t h1_words = 0U, h1_scales = 0U;
+    long long h1_wait = 0, h1_pub = 0;
+    if (lookahead.offload) {
+        if (!fpga_p2_pack_worker_wait(lookahead.generation1, &h1_words, &lookahead.helper1_service_us,
+                                      &h1_wait, &h1_scales, &h1_pub, 1)) return false;
+        lookahead.worker1_submitted = false;
+    }
+    const size_t h0_end = lookahead.offload ? lookahead.helper1_pair_begin : lookahead.pair_count;
+    const size_t helper_expected_words = (h0_end - lookahead.helper_pair_begin) * lookahead.words_per_pair;
+    const size_t helper_rows = std::min(h0_end * 2U, (size_t) lookahead.job.rows) - lookahead.helper_pair_begin * 2U;
     const size_t helper_expected_scales = helper_rows * (size_t) lookahead.job.group_blocks;
-    if (helper_words != helper_expected_words || helper_scales != helper_expected_scales) {
+    if (helper_words != helper_expected_words || helper_scales != helper_expected_scales) return false;
+    if (lookahead.offload &&
+        (h1_words != (lookahead.pair_count - lookahead.helper1_pair_begin) * lookahead.words_per_pair ||
+         h1_scales != ((size_t) lookahead.job.rows - lookahead.helper1_pair_begin * 2U) * (size_t) lookahead.job.group_blocks)) {
         return false;
     }
-    if (lookahead.main_written_words != lookahead.helper_pair_begin * lookahead.words_per_pair ||
-        lookahead.main_scale_entries != lookahead.expected_scale_entries - helper_expected_scales) {
+    if (helper_scales > lookahead.expected_scale_entries ||
+        h1_scales > lookahead.expected_scale_entries - helper_scales ||
+        lookahead.main_written_words != lookahead.helper_pair_begin * lookahead.words_per_pair ||
+        lookahead.main_scale_entries != lookahead.expected_scale_entries - helper_scales - h1_scales) {
         return false;
     }
+    const long long helper_service_total = lookahead.helper_service_us + lookahead.helper1_service_us;
+    const long long helper_wait_total = helper_wait + h1_wait;
+    helper_publication_mono_us = std::max(helper_publication_mono_us, h1_pub);
     // scale_bytes is already the padded byte capacity of the source slot.
     // Each entry occupies one uint32_t in the packed row-major table; do not
     // multiply the byte-derived entry count by the number of 128-bit lanes a
@@ -5348,12 +5563,20 @@ static bool fpga_p2_dma_pipeline_finalize(fpga_p2_dma_pipeline_lookahead_t & loo
         return false;
     }
     g_p2_pack_dma_pipeline_residual_bytes += (long long) (total_main_bytes - lookahead.callback_bytes);
-    g_p2_pack_dma_pipeline_helper_us += lookahead.helper_service_us;
+    g_p2_pack_dma_pipeline_helper_us += helper_service_total;
+    if (lookahead.offload) {
+        ++g_p2_pack_offload_jobs;
+        g_p2_pack_offload_helper_us[0] += lookahead.helper_service_us;
+        g_p2_pack_offload_helper_us[1] += lookahead.helper1_service_us;
+        g_p2_pack_offload_helper_bytes[0] += (uint64_t) helper_words * sizeof(uint32_t);
+        g_p2_pack_offload_helper_bytes[1] += (uint64_t) h1_words * sizeof(uint32_t);
+        g_p2_pack_offload_finalize_wait_us += helper_wait_total;
+    }
     g_p2_pack_dma_pipeline_residual_us += lookahead.residual_us;
     // This is caller-observed mutex/condition/scheduling elapsed time, not
     // helper CPU service time; the latter is tracked separately above.
-    if (helper_wait >= 0 && g_p2_pack_dma_pipeline_helper_wait_us <= LLONG_MAX - helper_wait) {
-        g_p2_pack_dma_pipeline_helper_wait_us += helper_wait;
+    if (helper_wait_total >= 0 && g_p2_pack_dma_pipeline_helper_wait_us <= LLONG_MAX - helper_wait_total) {
+        g_p2_pack_dma_pipeline_helper_wait_us += helper_wait_total;
     }
     if (finalize_mono0 > 0 && helper_publication_mono_us > 0 && finalize_mono0 > helper_publication_mono_us) {
         const long long publication_lead_us = finalize_mono0 - helper_publication_mono_us;
@@ -5371,7 +5594,7 @@ static bool fpga_p2_dma_pipeline_finalize(fpga_p2_dma_pipeline_lookahead_t & loo
         lookahead.totals->prep_direct_weight_pack_us += lookahead.residual_us;
         lookahead.totals->prep_us += finalize_wall_us;
     }
-    fpga_dma_profile_finalize_end(lookahead.residual_us, helper_wait, lookahead.helper_service_us,
+    fpga_dma_profile_finalize_end(lookahead.residual_us, helper_wait_total, helper_service_total,
                                    total_main_bytes, lookahead.callback_bytes);
     return true;
 }
@@ -5410,6 +5633,36 @@ static bool fpga_p2_residency_job_still_valid(const fpga_tile_job_t & job) {
         fpga_p2_residency_poison_slot(job.p2_residency_slot, "post_selection_binding_mismatch");
     }
     return valid;
+}
+
+static void fpga_host_offload_configure() {
+    if (g_p2_pack_workers[0].created || g_p2_pack_workers[1].created) {
+        fpga_fatal("Host I/O policy cannot change while pack helpers exist");
+    }
+    const auto flag = [](const char * name) {
+        const char * value = getenv(name);
+        if (!value || strcmp(value, "0") == 0) return false;
+        if (strcmp(value, "1") == 0) return true;
+        fpga_fatal("%s must be 0 or 1", name);
+        return false;
+    };
+    g_p2_pack_offload_enabled = flag("FPGA_P2_PACK_OFFLOAD");
+    g_pack_stp_enabled = flag("FPGA_PACK_STP");
+    g_result_ldp_enabled = flag("FPGA_RESULT_LDP");
+    g_uncached_write_probe_enabled = flag("FPGA_UNCACHED_WRITE_PROBE");
+#if !defined(__aarch64__)
+    if (g_pack_stp_enabled) fpga_fatal("FPGA_PACK_STP=1 requires aarch64");
+    if (g_result_ldp_enabled) fpga_fatal("FPGA_RESULT_LDP=1 requires aarch64");
+    if (g_uncached_write_probe_enabled) fpga_fatal("FPGA_UNCACHED_WRITE_PROBE=1 requires aarch64");
+#endif
+    fpga_q8_pack_set_pair_stores(g_pack_stp_enabled);
+    g_p2_pack_offload_jobs = 0;
+    g_p2_pack_offload_helper_us[0] = g_p2_pack_offload_helper_us[1] = 0;
+    g_p2_pack_offload_helper_bytes[0] = g_p2_pack_offload_helper_bytes[1] = 0;
+    g_p2_pack_offload_finalize_wait_us = 0;
+    LOGINIT("HOST_IO_CONFIG pack_offload=%d pack_stp=%d result_ldp=%d write_probe=%d",
+            g_p2_pack_offload_enabled ? 1 : 0, g_pack_stp_enabled ? 1 : 0,
+            g_result_ldp_enabled ? 1 : 0, g_uncached_write_probe_enabled ? 1 : 0);
 }
 
 static void fpga_p3_split_scale_configure() {
@@ -6054,6 +6307,10 @@ static bool fpga_accumulate_pl_scaled_q8_tile_job(fpga_tile_job_t & job,
     float *         accum_col = &accum[(size_t) (job.col * job.rows)];
     const volatile uint32_t * result_src = reinterpret_cast<const volatile uint32_t *>(
         ddr_ptr(SPU_OUT_BASE, (size_t) job.rows * 16U));
+    if (g_result_ldp_enabled && (reinterpret_cast<uintptr_t>(result_src) & 15U) != 0U) {
+        LOGE("P2 result ldp requires 16-byte SPU_OUT alignment job=%u", job.job_id);
+        return false;
+    }
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     const bool wide_result = (reinterpret_cast<uintptr_t>(result_src) & 7U) == 0U;
 #else
@@ -6065,8 +6322,16 @@ static bool fpga_accumulate_pl_scaled_q8_tile_job(fpga_tile_job_t & job,
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         if (wide_result) {
             const volatile uint64_t * wide = reinterpret_cast<const volatile uint64_t *>(result_src) + (size_t) row * 2U;
-            const uint64_t low = wide[0];
-            const uint64_t high = wide[1];
+            uint64_t low, high;
+#if defined(__aarch64__)
+            if (g_result_ldp_enabled) {
+                __asm__ __volatile__("ldp %0, %1, [%2]" : "=&r"(low), "=&r"(high) : "r"(wide) : "memory");
+            } else
+#endif
+            {
+                low = wide[0];
+                high = wide[1];
+            }
             row_id = (uint16_t) low;
             const uint64_t bits = (low >> 16U) | (high << 48U);
             memcpy(&q16, &bits, sizeof(q16));
@@ -6732,6 +6997,7 @@ int fpga_init(void) {
     if (!fpga_dma_profile_configure()) {
         fpga_fatal("Invalid FPGA DMA profiling policy; initialization stopped before hardware mapping");
     }
+    fpga_host_offload_configure();
     g_init_verbose = env_flag_enabled("FPGA_INIT_VERBOSE");
     // This checks the host-only P2 PARAM packing contract before any UIO
     // mapping of DDR, VPU, or ZDMA can be attempted.
@@ -7047,6 +7313,15 @@ int fpga_init(void) {
     fpga_p2_init_breadcrumb("phase=mapping pass my_ip_source=%s my_ip_size=0x%zx", g_vpu_map_source.c_str(),
                             g_vpu_map_size);
     fpga_uncached_read_probe();
+    if (g_result_ldp_enabled && (reinterpret_cast<uintptr_t>(ddr_ptr(SPU_OUT_BASE, 16U)) & 15U) != 0U) {
+        fpga_fatal("FPGA_RESULT_LDP=1 requires 16-byte aligned SPU_OUT mapping");
+    }
+    if (g_uncached_write_probe_enabled) {
+        if (!p2_zdma_preinit_passive_gate()) {
+            fpga_fatal("Uncached write probe requires idle ZDMA ownership before any DDR write");
+        }
+        fpga_uncached_write_probe();
+    }
     fpga_p2_init_breadcrumb("phase=zdma_init begin");
     if (g_p2_init_requested && !p2_zdma_preinit_passive_gate()) {
         fpga_fatal(
@@ -7202,6 +7477,9 @@ int fpga_init(void) {
     // already proved its P2 scheduler, scale stream, and two-worker contract.
     // Explicit zero is the only normal way to retain the serialized pack path.
     g_p2_pack_dma_pipeline_requested = !p2_pack_dma_pipeline_disable_env && p2_pack_dma_pipeline_compatible;
+    if (g_p2_pack_offload_enabled && !g_p2_pack_dma_pipeline_requested) {
+        fpga_fatal("FPGA_P2_PACK_OFFLOAD=1 requires the P2 pack DMA pipeline (FPGA_P2_PACK_WORKERS=2, FPGA_P2_PACK_DMA_PIPELINE not 0)");
+    }
     if (g_p2_pack_dma_pipeline_requested) {
         LOGINIT(
             "P2_PACK_DMA_PIPELINE requested=1 source=%s admission=waiting_for_persistent_helper "
@@ -7390,13 +7668,19 @@ int fpga_init(void) {
                 "FPGA_P2_PACK_WORKERS=2 could not create its persistent WEIGHT-pack helper; mappings were torn down "
                 "before ready and no DMA/IP job was started");
         }
+        if (g_p2_pack_offload_enabled && !fpga_p2_pack_worker_start(1)) {
+            pthread_mutex_unlock(&g_mutex);
+            fpga_cleanup();
+            fpga_fatal("FPGA_P2_PACK_OFFLOAD=1 could not create the second WEIGHT-pack helper; mappings were torn down before ready and no DMA/IP job was started");
+        }
         g_p2_pack_workers_active = 2;
     }
     if (g_p2_pack_dma_pipeline_requested) {
         // The pipeline submits its suffix to this already-created helper during
         // admission. Publish the route only after the helper exists, so a
         // worker policy mismatch cannot reach the first eligible tile.
-        if (!g_p2_pack_worker_created || g_p2_pack_workers_active != 2) {
+        if (!g_p2_pack_workers[0].created || g_p2_pack_workers_active != 2 ||
+            (g_p2_pack_offload_enabled && !g_p2_pack_workers[1].created)) {
             pthread_mutex_unlock(&g_mutex);
             fpga_cleanup();
             fpga_fatal(
@@ -7408,6 +7692,10 @@ int fpga_init(void) {
             "P2_PACK_DMA_PIPELINE enabled=1 mode=decode_direct_large_tiles slots=2 weight_slot_bytes=%u "
             "scale_slot_bytes=%u callback_batch_pairs=%zu residency_builds=deferred helper=ready",
             P2_PIPELINE_WEIGHT_SLOT_BYTES, P2_PIPELINE_SCALE_SLOT_BYTES, P2_PIPELINE_PACK_BATCH_PAIRS);
+    }
+    if (g_p2_pack_offload_enabled) {
+        LOGINIT("P2_PACK_OFFLOAD enabled=1 pipeline_helpers=2 main_pack_pairs=0 split=half store=%s",
+                g_pack_stp_enabled ? "stp128" : "u64");
     }
     LOGINIT(
         "P2_PACK_CONFIG requested_workers=%d active_workers=%d parallel_min_bytes=%zu policy=pair_disjoint_before_dma "
@@ -7463,7 +7751,7 @@ void fpga_cleanup(void) {
     // The helper has no DMA ownership, but it can still hold a volatile DDR
     // pointer.  Join it before touching any DDR cache metadata or unmapping
     // the aperture.  A failed join deliberately leaves all mappings intact.
-    if (!fpga_p2_pack_worker_stop()) {
+    if (!fpga_p2_pack_worker_stop(1) || !fpga_p2_pack_worker_stop()) {
         pthread_mutex_unlock(&g_mutex);
         fpga_fatal(
             "P2 WEIGHT-pack helper did not stop cleanly during cleanup; DDR/VPU/DMA mappings were intentionally "
@@ -7539,7 +7827,7 @@ void fpga_cleanup(void) {
         "  Số byte còn lại trong DMA pipeline = %lld | Số công việc DMA pipeline bị từ chối = %lld\n"
         "  Thời gian chờ helper trong DMA pipeline(us) = %lld | Thời gian helper công bố trước trong DMA pipeline(us) = %lld\n"
         "  Số lần helper hoàn tất sớm trong DMA pipeline = %lld",
-        g_p2_pack_workers_requested, g_p2_pack_workers_active, g_p2_pack_worker_created ? 0 : 1,
+        g_p2_pack_workers_requested, g_p2_pack_workers_active, g_p2_pack_workers[0].created ? 0 : 1,
         FPGA_P2_PACK_PARALLEL_MIN_BYTES, g_p2_pack_parallel_jobs, (unsigned long long) g_p2_pack_parallel_bytes,
         g_p2_pack_serial_threshold_skips, g_p2_pack_main_us, g_p2_pack_helper_service_us, g_p2_pack_caller_wait_us,
          g_p2_pack_fused_jobs, g_p2_pack_fused_us, g_p2_pack_fused_scale_entries,
@@ -7550,6 +7838,13 @@ void fpga_cleanup(void) {
          g_p2_pack_dma_pipeline_residual_bytes, g_p2_pack_dma_pipeline_rejected_jobs,
          g_p2_pack_dma_pipeline_helper_wait_us,
          g_p2_pack_dma_pipeline_helper_publication_lead_us, g_p2_pack_dma_pipeline_helper_early_completions);
+    fpga_log_line(true, "P2_PACK_OFFLOAD", true,
+        "enabled=%d jobs=%lld helper0_us=%lld helper1_us=%lld helper0_bytes=%llu helper1_bytes=%llu finalize_wait_us=%lld store=%s result_read=%s",
+        g_p2_pack_offload_enabled ? 1 : 0, g_p2_pack_offload_jobs,
+        g_p2_pack_offload_helper_us[0], g_p2_pack_offload_helper_us[1],
+        (unsigned long long) g_p2_pack_offload_helper_bytes[0], (unsigned long long) g_p2_pack_offload_helper_bytes[1],
+        g_p2_pack_offload_finalize_wait_us, g_pack_stp_enabled ? "stp128" : "u64",
+        g_result_ldp_enabled ? "ldp" : "ldr64x2");
     fpga_log_pack_breakdown("decode_total", -1, g_fpga_perf_decode.decode_tokens,
                             fpga_pack_detail_record(g_pack_detail_decode));
     fpga_log_pack_breakdown("process_total_including_startup", -1, -1,

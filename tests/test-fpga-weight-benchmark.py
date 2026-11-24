@@ -66,7 +66,7 @@ int main() {
             g_weight_path_bench.payload_bytes=120*j.payload_bytes;
             assert(fpga_weight_path_bench_replay_at_boundary(9,1));
             assert(g_weight_path_bench.replayed && g_weight_path_bench.jobs.empty());
-            assert(g_weight_path_bench.cached_payload.empty() && !g_p2_pack_worker_created);
+            assert(g_weight_path_bench.cached_payload.empty() && !g_p2_pack_workers[0].created);
             assert(fpga_p2_pack_worker_start());
         }
     }

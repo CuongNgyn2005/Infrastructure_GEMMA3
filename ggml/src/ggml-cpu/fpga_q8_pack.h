@@ -68,3 +68,7 @@ bool fpga_pack_direct_weight_p3scale_pair_range(
 // Pack raw activation FP16 halves into little-endian SCRATCH words, zeroing padding.
 bool fpga_p3_pack_scratch_words(const block_q8_0 * act, int group_blocks,
                                 uint32_t * out_words, size_t word_count);
+
+// Configure before creating any pack helper; immutable while helpers exist.
+void fpga_q8_pack_set_pair_stores(bool enable);
+bool fpga_q8_pack_pair_stores_enabled(void);
