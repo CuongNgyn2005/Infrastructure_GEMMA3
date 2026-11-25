@@ -6,15 +6,20 @@ import subprocess
 import tempfile
 
 source = (Path(__file__).resolve().parents[1] / 'ggml/src/ggml-cpu/fpga_host.cpp').read_text()
-def between(a, b, start=0):
-    i = source.index(a, start)
-    return source[i:source.index(b, i)]
-dispatch_start = source.index('static bool fpga_hw_q8_0_matmul_dma_to_ip(')
-dispatch = between('    if (use_pl_scale_path) {', '\n// Environment variables that are still honoured', dispatch_start)
+def definition(signature):
+    start = source.index(signature)
+    depth = 0
+    for pos in range(source.index('{', start), len(source)):
+        depth += (source[pos] == '{') - (source[pos] == '}')
+        if depth == 0:
+            return source[start:pos + 1]
+    raise AssertionError(signature)
+router = definition('static bool fpga_hw_q8_0_matmul_dma_to_ip(const')
+dispatch = router[router.index('    if (use_pl_scale_path) {'):]   # ends with the function's closing brace
 assert 'single_bank(' not in source
 assert 'qualify_tiles' not in source and 'FPGA_PIPELINE_' not in source
 # Initialization stops without ping-pong, before the pipeline is published.
-init = source[source.index('int fpga_init(void)'):source.index('void fpga_cleanup(void)')]
+init = definition('int fpga_init(void) {')
 assert (init.index('if (g_p2_init_requested && !g_pingpong_scheduler_enabled) {')
         < init.index('fpga_fatal("P2 pack DMA pipeline requires admitted ping-pong and the P2 scale stream");')
         < init.index('g_p2_pack_dma_pipeline_enabled = true;'))
