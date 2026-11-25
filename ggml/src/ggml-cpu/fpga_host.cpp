@@ -1025,6 +1025,14 @@ static long long g_p2_weight_prefetch_skip_geometry = 0;
 static long long g_p2_weight_prefetch_restarts = 0;
 static long long g_p2_weight_prefetch_hook_reads = 0;
 static long long g_p2_weight_prefetch_late_reads = 0;
+static bool      g_zdma_lean_setup_enabled = false;
+static long long g_zdma_lean_setup_desc = 0;
+static int       g_p2_hook_read_rows = 0;           // 0 = read the whole job in one hook call (TASK G behaviour)
+static long long g_p2_weight_prefetch_partial_reads = 0;
+static bool      g_p2_cycle_phases_enabled = false;
+static long long g_p2_cycle_count = 0;
+enum { P2CP_PRE, P2CP_DRAIN, P2CP_RELEASE, P2CP_ACT, P2CP_SUBMIT, P2CP_ADMIT, P2CP_PREFETCH, P2CP_TAIL, P2CP_STORE, P2CP_TOTAL, P2CP_COUNT };
+static long long g_p2_cycle_us[P2CP_COUNT] = {};
 static bool g_pack_stp_enabled = false;
 static bool g_result_ldp_enabled = false;
 static bool g_uncached_write_probe_enabled = false;
@@ -2943,6 +2951,7 @@ static bool fpga_dma_copy_one(uint64_t                         src_phys,
     const bool p2_transfer_detail =
         g_p2_init_requested &&
         (g_p2_tile_trace_enabled || (g_p2_first_act_dma_trace_active && tag != nullptr && strcmp(tag, "ACT") == 0));
+    const bool lean_setup = g_zdma_lean_setup_enabled && !g_dma_trace_enabled && !p2_transfer_detail;
     if (p2_transfer_detail) {
         ++g_p2_dma_transfer_sequence;
         g_p2_trace_dma_tag = tag ? tag : "?";
@@ -3027,16 +3036,19 @@ static bool fpga_dma_copy_one(uint64_t                         src_phys,
     g_dma->ZDMA_CH_DST_DSCR_WORD3 = 0U;
     mmio_fence();
 
-    uint32_t pre_status       = g_dma_trace_enabled || p2_descriptor_commit ? g_dma->ZDMA_CH_STATUS : 0U;
-    uint32_t pre_isr          = g_dma_trace_enabled || p2_descriptor_commit ? g_dma->ZDMA_CH_ISR : 0U;
-    uint32_t pre_ctrl2        = g_dma_trace_enabled || p2_descriptor_commit ? g_dma->ZDMA_CH_CTRL2 : 0U;
+    const bool pre_diag       = g_dma_trace_enabled || (p2_descriptor_commit && !lean_setup);
+    uint32_t pre_status       = pre_diag ? g_dma->ZDMA_CH_STATUS : 0U;
+    uint32_t pre_isr          = pre_diag ? g_dma->ZDMA_CH_ISR : 0U;
+    uint32_t pre_ctrl2        = pre_diag ? g_dma->ZDMA_CH_CTRL2 : 0U;
     uint32_t pre_vpu_status   = 0;
     uint32_t pre_vpu_progress = 0;
-    if (p2_descriptor_commit &&
-        !p2_zdma_verify_descriptor_commit(src_phys, dst_phys, bytes, pre_status, pre_isr, pre_ctrl2,
-                                          total_bytes_before_clear, p2_transfer_detail)) {
+    if (p2_descriptor_commit && !lean_setup && !p2_zdma_verify_descriptor_commit(src_phys, dst_phys, bytes, pre_status,
+                                                                                 pre_isr, pre_ctrl2,
+                                                                                 total_bytes_before_clear,
+                                                                                 p2_transfer_detail)) {
         return false;
     }
+    if (lean_setup) ++g_zdma_lean_setup_desc;
     if (g_dma_trace_enabled) {
         if (vpu_is_mapped()) {
             pre_vpu_status   = vpu_rd32(REG_STATUS);
@@ -3086,9 +3098,9 @@ static bool fpga_dma_copy_one(uint64_t                         src_phys,
     }
 
     const long long t1                         = now_us();
-    const uint32_t  total_bytes_after_transfer = g_dma->ZDMA_CH_TOTAL_BYTE;
-    const uint32_t  post_vpu_status            = vpu_is_mapped() ? vpu_rd32(REG_STATUS) : 0U;
-    const uint32_t  post_vpu_progress          = vpu_is_mapped() ? vpu_rd32(REG_PROGRESS) : 0U;
+    const uint32_t  total_bytes_after_transfer = lean_setup ? 0U : g_dma->ZDMA_CH_TOTAL_BYTE;
+    const uint32_t  post_vpu_status            = (!lean_setup && vpu_is_mapped()) ? vpu_rd32(REG_STATUS) : 0U;
+    const uint32_t  post_vpu_progress          = (!lean_setup && vpu_is_mapped()) ? vpu_rd32(REG_PROGRESS) : 0U;
     if (p2_transfer_detail) {
         fpga_p2_dma_breadcrumb(
             "step=completion edge=pass status=0x%08x isr=0x%08x ctrl2=0x%08x total_bytes=0x%08x bank_stat=0x%08x "
@@ -5753,6 +5765,21 @@ static void fpga_host_offload_configure() {
     if (g_p2_pack_helpers == 3 && !g_p2_pack_offload_enabled) {
         fpga_fatal("FPGA_P2_PACK_HELPERS=3 requires FPGA_P2_PACK_OFFLOAD=1");
     }
+    g_zdma_lean_setup_enabled = flag("FPGA_ZDMA_LEAN_SETUP");
+    g_p2_cycle_phases_enabled = flag("FPGA_P2_CYCLE_PHASES");
+    const char * hook_rows = getenv("FPGA_P2_HOOK_READ_ROWS");
+    if (!hook_rows || strcmp(hook_rows, "0") == 0) g_p2_hook_read_rows = 0;
+    else if (strcmp(hook_rows, "16") == 0) g_p2_hook_read_rows = 16;
+    else if (strcmp(hook_rows, "32") == 0) g_p2_hook_read_rows = 32;
+    else if (strcmp(hook_rows, "64") == 0) g_p2_hook_read_rows = 64;
+    else if (strcmp(hook_rows, "128") == 0) g_p2_hook_read_rows = 128;
+    else fpga_fatal("FPGA_P2_HOOK_READ_ROWS must be 0, 16, 32, 64 or 128");
+    if (g_p2_hook_read_rows > 0 && !g_p2_weight_prefetch_enabled) {
+        fpga_fatal("FPGA_P2_HOOK_READ_ROWS requires FPGA_P2_WEIGHT_PREFETCH=1");
+    }
+    if (g_p2_cycle_phases_enabled && !g_p2_weight_prefetch_enabled) {
+        fpga_fatal("FPGA_P2_CYCLE_PHASES=1 requires FPGA_P2_WEIGHT_PREFETCH=1");
+    }
     g_p2_weight_prefetch_jobs = 0;
     g_p2_weight_prefetch_consumed = 0;
     g_p2_weight_prefetch_bytes = 0;
@@ -5761,6 +5788,10 @@ static void fpga_host_offload_configure() {
     g_p2_weight_prefetch_restarts = 0;
     g_p2_weight_prefetch_hook_reads = 0;
     g_p2_weight_prefetch_late_reads = 0;
+    g_zdma_lean_setup_desc = 0;
+    g_p2_weight_prefetch_partial_reads = 0;
+    g_p2_cycle_count = 0;
+    for (int i = 0; i < P2CP_COUNT; ++i) g_p2_cycle_us[i] = 0;
     g_pack_stp_enabled = flag("FPGA_PACK_STP");
     g_result_ldp_enabled = flag("FPGA_RESULT_LDP");
     g_uncached_write_probe_enabled = flag("FPGA_UNCACHED_WRITE_PROBE");
@@ -5774,10 +5805,12 @@ static void fpga_host_offload_configure() {
     g_p2_pack_offload_helper_us[0] = g_p2_pack_offload_helper_us[1] = g_p2_pack_offload_helper_us[2] = 0;
     g_p2_pack_offload_helper_bytes[0] = g_p2_pack_offload_helper_bytes[1] = g_p2_pack_offload_helper_bytes[2] = 0;
     g_p2_pack_offload_finalize_wait_us = 0;
-    LOGINIT("HOST_IO_CONFIG pack_offload=%d pack_stp=%d result_ldp=%d write_probe=%d weight_prefetch=%d pack_helpers=%d",
+    LOGINIT("HOST_IO_CONFIG pack_offload=%d pack_stp=%d result_ldp=%d write_probe=%d weight_prefetch=%d pack_helpers=%d "
+            "zdma_lean_setup=%d hook_read_rows=%d cycle_phases=%d",
             g_p2_pack_offload_enabled ? 1 : 0, g_pack_stp_enabled ? 1 : 0,
             g_result_ldp_enabled ? 1 : 0, g_uncached_write_probe_enabled ? 1 : 0,
-            g_p2_weight_prefetch_enabled ? 1 : 0, g_p2_pack_helpers);
+            g_p2_weight_prefetch_enabled ? 1 : 0, g_p2_pack_helpers,
+            g_zdma_lean_setup_enabled ? 1 : 0, g_p2_hook_read_rows, g_p2_cycle_phases_enabled ? 1 : 0);
 }
 
 static void fpga_p3_split_scale_configure() {
@@ -6408,10 +6441,10 @@ static bool fpga_release_pl_scaled_q8_tile_job(fpga_tile_job_t & job, bool pendi
     return true;
 }
 
-static bool fpga_accumulate_pl_scaled_q8_tile_job(fpga_tile_job_t & job,
-                                                  std::vector<float> &    accum,
-                                                  fpga_stage_totals_t *   totals,
-                                                  bool release_after_read = true) {
+// Ownership, span and ldp-alignment checks before any SPU_OUT row is read.
+static bool fpga_p2_result_read_check(const fpga_tile_job_t & job,
+                                      const std::vector<float> & accum,
+                                      bool release_after_read) {
     if (!job.output_dma_ready || job.result_consumed || job.hardware_released == release_after_read) {
         LOGE("P2 result ownership violation before consume job=%u", job.job_id);
         return false;
@@ -6423,21 +6456,27 @@ static bool fpga_accumulate_pl_scaled_q8_tile_job(fpga_tile_job_t & job,
         LOGE("P2 result span rejected job=%u", job.job_id);
         return false;
     }
-    const long long result0   = now_us();
-    const long long event_host_read_accum0 = p2_event_now_us();
-    float *         accum_col = &accum[(size_t) (job.col * job.rows)];
     const volatile uint32_t * result_src = reinterpret_cast<const volatile uint32_t *>(
         ddr_ptr(SPU_OUT_BASE, (size_t) job.rows * 16U));
     if (g_result_ldp_enabled && (reinterpret_cast<uintptr_t>(result_src) & 15U) != 0U) {
         LOGE("P2 result ldp requires 16-byte SPU_OUT alignment job=%u", job.job_id);
         return false;
     }
+    return true;
+}
+
+// Reads rows [row_begin, row_end) of SPU_OUT and accumulates them into accum.
+// Rows are always consumed in ascending order, each exactly once per job.
+static bool fpga_p2_result_read_rows(fpga_tile_job_t & job, std::vector<float> & accum, int row_begin, int row_end) {
+    float *         accum_col = &accum[(size_t) (job.col * job.rows)];
+    const volatile uint32_t * result_src = reinterpret_cast<const volatile uint32_t *>(
+        ddr_ptr(SPU_OUT_BASE, (size_t) job.rows * 16U));
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     const bool wide_result = (reinterpret_cast<uintptr_t>(result_src) & 7U) == 0U;
 #else
     (void) result_src;
 #endif
-    for (int row = 0; row < job.rows; ++row) {
+    for (int row = row_begin; row < row_end; ++row) {
         uint16_t row_id = 0xffffU;
         int64_t q16;
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -6468,9 +6507,16 @@ static bool fpga_accumulate_pl_scaled_q8_tile_job(fpga_tile_job_t & job,
         }
         accum_col[(size_t) row] += (float) q16 * (1.0f / 65536.0f);
     }
-    const long long result1 = now_us();
+    return true;
+}
+
+// Accounting, trace events and optional release after every row was read.
+static bool fpga_p2_result_read_publish(fpga_tile_job_t &      job,
+                                        fpga_stage_totals_t *  totals,
+                                        long long              host_read_us,
+                                        long long              event_host_read_accum0,
+                                        bool                   release_after_read) {
     const long long event_host_read_accum_done = p2_event_now_us();
-    const long long host_read_us = result1 - result0;
     job.host_result_us = host_read_us;
     job.result_consumed = true;
     const int bank_index = job.bank & 1;
@@ -6493,6 +6539,17 @@ static bool fpga_accumulate_pl_scaled_q8_tile_job(fpga_tile_job_t & job,
     const long long finish_us = p2_event_now_us();
     p2_event_trace(job, "TILE_FINISH", finish_us, "submit_to_finish_us", finish_us - job.event_submit_begin_us);
     return true;
+}
+
+static bool fpga_accumulate_pl_scaled_q8_tile_job(fpga_tile_job_t & job,
+                                                  std::vector<float> &    accum,
+                                                  fpga_stage_totals_t *   totals,
+                                                  bool release_after_read = true) {
+    if (!fpga_p2_result_read_check(job, accum, release_after_read)) return false;
+    const long long result0 = now_us();
+    const long long event0  = p2_event_now_us();
+    if (!fpga_p2_result_read_rows(job, accum, 0, job.rows)) return false;
+    return fpga_p2_result_read_publish(job, totals, now_us() - result0, event0, release_after_read);
 }
 
 // The P2 contract is a tile-level transport/numerical qualification, not a
@@ -6549,6 +6606,10 @@ typedef struct {
     fpga_stage_totals_t * totals;
     bool                  done;
     bool                  ok;
+    bool                  started = false;  // check passed and chunked reading began
+    int                   next_row = 0;     // next row to read
+    long long             read_us = 0;      // total time spent in the read chunks
+    long long             event_read0 = 0;
 } fpga_p2_prefetch_read_ctx_t;
 
 static bool fpga_p2_prefetch_read_poll(void * context, long long elapsed_us) {
@@ -6560,6 +6621,45 @@ static bool fpga_p2_prefetch_read_poll(void * context, long long elapsed_us) {
     ctx->ok = fpga_accumulate_pl_scaled_q8_tile_job(*ctx->job, *ctx->accum, ctx->totals, false);
     if (ctx->ok) ++g_p2_weight_prefetch_hook_reads;
     return ctx->ok;
+}
+
+static bool fpga_p2_prefetch_read_poll_chunked(void * context, long long elapsed_us) {
+    (void) elapsed_us;
+    auto * const ctx = static_cast<fpga_p2_prefetch_read_ctx_t *>(context);
+    if (!ctx || !ctx->job || !ctx->accum || g_p2_hook_read_rows <= 0) return false;
+    if (ctx->done) return ctx->ok;
+    if (!ctx->started) {
+        ctx->started     = true;
+        ctx->next_row    = 0;
+        ctx->read_us     = 0;
+        ctx->event_read0 = p2_event_now_us();
+        if (!fpga_p2_result_read_check(*ctx->job, *ctx->accum, false)) { ctx->done = true; ctx->ok = false; return false; }
+    }
+    const int end = std::min(ctx->job->rows, ctx->next_row + g_p2_hook_read_rows);
+    const long long t0 = now_us();
+    const bool rows_ok = fpga_p2_result_read_rows(*ctx->job, *ctx->accum, ctx->next_row, end);
+    ctx->read_us += now_us() - t0;
+    if (!rows_ok) { ctx->done = true; ctx->ok = false; return false; }
+    ctx->next_row = end;
+    if (end < ctx->job->rows) return true;
+    ctx->done = true;
+    ctx->ok = fpga_p2_result_read_publish(*ctx->job, ctx->totals, ctx->read_us, ctx->event_read0, false);
+    if (ctx->ok) ++g_p2_weight_prefetch_hook_reads;
+    return ctx->ok;
+}
+
+// Only called when started && !done: reads the remaining rows in one go, then publishes.
+static bool fpga_p2_prefetch_read_finish(fpga_p2_prefetch_read_ctx_t & ctx) {
+    if (!ctx.started || ctx.done || !ctx.job || !ctx.accum) {
+        LOGE("P2 chunked result read finish precondition failed");
+        return false;
+    }
+    const long long t0 = now_us();
+    const bool rows_ok = fpga_p2_result_read_rows(*ctx.job, *ctx.accum, ctx.next_row, ctx.job->rows);
+    ctx.read_us += now_us() - t0;
+    ctx.done = true;
+    ctx.ok = rows_ok && fpga_p2_result_read_publish(*ctx.job, ctx.totals, ctx.read_us, ctx.event_read0, false);
+    return ctx.ok;
 }
 
 static bool fpga_p2_weight_prefetch_promote(fpga_p2_dma_pipeline_lookahead_t & lookahead,
@@ -6593,7 +6693,8 @@ static bool fpga_p2_weight_prefetch_dma(fpga_p2_dma_pipeline_lookahead_t & ready
              want_pre, rb_pre, job.job_id);
         return false;
     }
-    const fpga_dma_poll_hook_t hook = { fpga_p2_prefetch_read_poll, read_ctx };
+    const fpga_dma_poll_hook_t hook = {
+        g_p2_hook_read_rows > 0 ? fpga_p2_prefetch_read_poll_chunked : fpga_p2_prefetch_read_poll, read_ctx };
     const long long t0 = now_us();
     const bool dma_ok = fpga_dma_copy(DDR_BASE_PHYS + (uint64_t) job.weight_src_off,
                                       LMM_BASE_PHYS + (uint64_t) WEIGHT_BASE, job.weight_bytes, "PREFETCH_W",
@@ -6612,6 +6713,13 @@ static bool fpga_p2_weight_prefetch_dma(fpga_p2_dma_pipeline_lookahead_t & ready
     g_p2_weight_prefetch_bytes += (uint64_t) job.weight_bytes;
     g_p2_weight_prefetch_dma_us += dt;
     return true;
+}
+
+static inline void p2_cycle_mark(int phase, long long * last) {
+    if (*last == 0) return;
+    const long long t = now_us();
+    g_p2_cycle_us[phase] += t - *last;
+    *last = t;
 }
 
 static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *        src0,
@@ -6780,6 +6888,8 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
             // do not modify weight RAM. No validity survives a return/retry.
             bool weight_bank_loaded[2] = { false, false };
             for (int64_t col = 0; col < m; ++col) {
+                const long long cp_top = (g_p2_cycle_phases_enabled && weight_prefetch) ? now_us() : 0;
+                long long cp_last = cp_top;
                 const int            bank      = (int) (tile_id & 1U);
                 fpga_tile_job_t &    prepared  = slots[bank];
                 const block_q8_0_t * act_group = &act_blocks_all[(size_t) (col * nb + ib0)];
@@ -6855,9 +6965,11 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                         // it overlaps or must submit serially after drain.
                         g_p1_sched_summary.pingpong_pairs++;
                     }
+                    p2_cycle_mark(P2CP_PRE, &cp_last);
                     if (!fpga_wait_and_drain_q8_tile_job(*running, totals, tensor_name, layer_id, k, n, m, 0)) {
                         return false;
                     }
+                    p2_cycle_mark(P2CP_DRAIN, &cp_last);
                     if (overlap_results) {
                         if (!fpga_release_pl_scaled_q8_tile_job(*running, true)) {
                             return false;
@@ -6867,6 +6979,7 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                             return false;
                         }
                     }
+                    p2_cycle_mark(P2CP_RELEASE, &cp_last);
                     if (totals && running->event_launch_us > 0 && running->event_spu_finality_us > 0 &&
                         prepared.event_prep_begin_us > 0 && prepared.event_prep_done_us > 0) {
                         const long long overlap_begin = std::max(prepared.event_prep_begin_us, running->event_launch_us);
@@ -6890,6 +7003,7 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                         fpga_p2_dma_pipeline_invalidate(&lookahead);
                         return false;
                     }
+                    p2_cycle_mark(P2CP_ACT, &cp_last);
                     const fpga_dma_poll_hook_t poll_hook = {
                         fpga_p2_dma_pipeline_poll, lookahead.valid ? static_cast<void *>(&lookahead) : nullptr };
                     if (!fpga_submit_q8_tile_job(prepared, totals, tensor_name, layer_id, k, n, m, 0,
@@ -6897,6 +7011,7 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                         fpga_p2_dma_pipeline_invalidate(&lookahead);
                         return false;
                     }
+                    p2_cycle_mark(P2CP_SUBMIT, &cp_last);
                     if (weight_prefetch) {
                         fpga_p2_prefetch_read_ctx_t read_ctx = { running, &accum, totals, false, true };
                         if (!lookahead.valid && !(ready.valid && !ready.consumed)) {
@@ -6908,6 +7023,7 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                         }
                         const bool have_ready = ready.valid && !ready.consumed;
                         if (have_ready && !admit_next_tile(ready.job)) { fpga_p2_dma_pipeline_invalidate(&lookahead); return false; }
+                        p2_cycle_mark(P2CP_ADMIT, &cp_last);
                         if (have_ready) {
                             if (ready.job.group_beats == prepared.group_beats) {
                                 if (!fpga_p2_weight_prefetch_dma(ready, prepared, &read_ctx)) { fpga_p2_dma_pipeline_invalidate(&lookahead); return false; }
@@ -6915,12 +7031,19 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                                 ++g_p2_weight_prefetch_skip_geometry;
                             }
                         }
+                        p2_cycle_mark(P2CP_PREFETCH, &cp_last);
                         if (!read_ctx.done) {
-                            if (!fpga_accumulate_pl_scaled_q8_tile_job(*running, accum, totals, false)) return false;
-                            ++g_p2_weight_prefetch_late_reads;
+                            if (read_ctx.started) {
+                                if (!fpga_p2_prefetch_read_finish(read_ctx)) return false;
+                                ++g_p2_weight_prefetch_partial_reads;
+                            } else {
+                                if (!fpga_accumulate_pl_scaled_q8_tile_job(*running, accum, totals, false)) return false;
+                                ++g_p2_weight_prefetch_late_reads;
+                            }
                         } else if (!read_ctx.ok) {
                             return false;
                         }
+                        p2_cycle_mark(P2CP_TAIL, &cp_last);
                         if (totals) {
                             ++totals->result_overlap_jobs;
                             totals->result_overlap_host_us += running->host_result_us;
@@ -6929,6 +7052,8 @@ static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(const struct ggml_tensor *  
                             store_rows(running->row0, running->rows);
                             accum.assign((size_t) (m * rows), 0.0f);
                         }
+                        p2_cycle_mark(P2CP_STORE, &cp_last);
+                        if (cp_top) { g_p2_cycle_us[P2CP_TOTAL] += now_us() - cp_top; ++g_p2_cycle_count; }
                     } else {
                         if (overlap_results) {
                             // No MMIO writes for A after B starts; no B result DMA
@@ -8119,12 +8244,22 @@ void fpga_cleanup(void) {
         g_result_ldp_enabled ? "ldp" : "ldr64x2", g_p2_pack_offload_helper_us[2],
         (unsigned long long) g_p2_pack_offload_helper_bytes[2]);
     fpga_log_line(true, "P2_WEIGHT_PREFETCH", true,
-        "enabled=%d helpers=%d jobs=%lld consumed=%lld bytes=%llu dma_us=%lld skip_geometry=%lld restarts=%lld hook_reads=%lld late_reads=%lld",
+        "enabled=%d helpers=%d jobs=%lld consumed=%lld bytes=%llu dma_us=%lld skip_geometry=%lld restarts=%lld hook_reads=%lld late_reads=%lld partial_reads=%lld hook_read_rows=%d",
         g_p2_weight_prefetch_enabled ? 1 : 0, g_p2_pack_helpers,
         g_p2_weight_prefetch_jobs, g_p2_weight_prefetch_consumed,
         (unsigned long long) g_p2_weight_prefetch_bytes, g_p2_weight_prefetch_dma_us,
         g_p2_weight_prefetch_skip_geometry, g_p2_weight_prefetch_restarts,
-        g_p2_weight_prefetch_hook_reads, g_p2_weight_prefetch_late_reads);
+        g_p2_weight_prefetch_hook_reads, g_p2_weight_prefetch_late_reads,
+        g_p2_weight_prefetch_partial_reads, g_p2_hook_read_rows);
+    fpga_log_line(true, "P2_CYCLE_PHASES", true,
+        "enabled=%d cycles=%lld pre_us=%lld drain_us=%lld release_us=%lld act_us=%lld submit_us=%lld admit_us=%lld prefetch_us=%lld tail_us=%lld store_us=%lld total_us=%lld",
+        g_p2_cycle_phases_enabled ? 1 : 0, g_p2_cycle_count,
+        g_p2_cycle_us[P2CP_PRE], g_p2_cycle_us[P2CP_DRAIN], g_p2_cycle_us[P2CP_RELEASE],
+        g_p2_cycle_us[P2CP_ACT], g_p2_cycle_us[P2CP_SUBMIT], g_p2_cycle_us[P2CP_ADMIT],
+        g_p2_cycle_us[P2CP_PREFETCH], g_p2_cycle_us[P2CP_TAIL], g_p2_cycle_us[P2CP_STORE],
+        g_p2_cycle_us[P2CP_TOTAL]);
+    fpga_log_line(true, "ZDMA_LEAN_SETUP", true,
+        "enabled=%d lean_desc=%lld", g_zdma_lean_setup_enabled ? 1 : 0, g_zdma_lean_setup_desc);
     fpga_log_pack_breakdown("decode_total", -1, g_fpga_perf_decode.decode_tokens,
                             fpga_pack_detail_record(g_pack_detail_decode));
     fpga_log_pack_breakdown("process_total_including_startup", -1, -1,

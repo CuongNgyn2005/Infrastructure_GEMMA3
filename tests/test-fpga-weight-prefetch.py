@@ -81,6 +81,12 @@ long long g_p2_weight_prefetch_jobs, g_p2_weight_prefetch_consumed;
 uint64_t g_p2_weight_prefetch_bytes;
 long long g_p2_weight_prefetch_dma_us, g_p2_weight_prefetch_skip_geometry;
 long long g_p2_weight_prefetch_restarts, g_p2_weight_prefetch_hook_reads, g_p2_weight_prefetch_late_reads;
+bool g_zdma_lean_setup_enabled, g_p2_cycle_phases_enabled;
+int g_p2_hook_read_rows;
+long long g_p2_weight_prefetch_partial_reads, g_p2_cycle_count, g_zdma_lean_setup_desc;
+enum { P2CP_COUNT = 10 };
+long long g_p2_cycle_us[P2CP_COUNT];
+bool fpga_p2_prefetch_read_poll_chunked(void *, long long) { return true; }
 template<class... T> void LOGINIT(T...) {}
 template<class... T> void LOGE(T...) {}
 template<class... T> void fpga_fatal(const char * msg, T...) { throw std::runtime_error(msg); }

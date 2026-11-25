@@ -50,6 +50,9 @@ def extract_definition(signature: str) -> str:
 scheduler = extract_definition("static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(")
 release = extract_definition("static bool fpga_release_pl_scaled_q8_tile_job(")
 accumulate = extract_definition("static bool fpga_accumulate_pl_scaled_q8_tile_job(")
+read_check = extract_definition("static bool fpga_p2_result_read_check(")
+read_rows = extract_definition("static bool fpga_p2_result_read_rows(")
+read_publish = extract_definition("static bool fpga_p2_result_read_publish(")
 residency_align = extract_definition("static bool fpga_p2_residency_align_up(")
 residency_end = extract_definition("static bool fpga_p2_residency_range_end(")
 invalidate = extract_definition("static void fpga_p2_dma_pipeline_invalidate(")
@@ -216,7 +219,17 @@ struct fpga_p2_prefetch_read_ctx_t {
     std::vector<float> * accum;
     fpga_stage_totals_t * totals;
     bool done, ok;
+    bool started = false; int next_row = 0; long long read_us = 0, event_read0 = 0;
 };
+long long g_p2_weight_prefetch_partial_reads = 0;
+bool g_p2_cycle_phases_enabled = false;
+enum { P2CP_PRE, P2CP_DRAIN, P2CP_RELEASE, P2CP_ACT, P2CP_SUBMIT, P2CP_ADMIT, P2CP_PREFETCH, P2CP_TAIL, P2CP_STORE, P2CP_TOTAL, P2CP_COUNT };
+long long g_p2_cycle_us[P2CP_COUNT] = {};
+long long g_p2_cycle_count = 0;
+void p2_cycle_mark(int, long long *) {}
+bool fpga_p2_prefetch_read_finish(fpga_p2_prefetch_read_ctx_t &) {
+    throw "unexpected chunked read finish in baseline scheduler fixture";
+}
 bool fpga_p2_weight_prefetch_promote(fpga_p2_dma_pipeline_lookahead_t &, fpga_p2_dma_pipeline_lookahead_t &) {
     throw "unexpected prefetch in baseline scheduler fixture";
 }
@@ -652,7 +665,7 @@ void fpga_log_prompt_weight_reuse(const char *, int64_t, long long jobs, uint64_
 }
 '''
 
-harness += release + "\n" + accumulate + "\n" + scheduler
+harness += release + "\n" + read_check + "\n" + read_rows + "\n" + read_publish + "\n" + accumulate + "\n" + scheduler
 harness += r'''
 
 bool run_legacy(int columns, bool overlap, int failure, int rows = 7, int blocks = 5, int cache = 0) {
