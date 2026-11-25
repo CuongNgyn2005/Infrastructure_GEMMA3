@@ -35,13 +35,11 @@ def extract_definition(signature: str) -> str:
         search = body_start + 1
 
 
-PACK_BATCH = extract_definition("static bool fpga_p2_dma_pipeline_pack_batch(")
-POLL = extract_definition("static bool fpga_p2_dma_pipeline_poll(")
 INVALIDATE = extract_definition("static void fpga_p2_dma_pipeline_invalidate(")
 SLOT_RANGES = extract_definition("static bool fpga_p2_dma_pipeline_slot_ranges(")
 CONSUME = extract_definition("static bool fpga_p2_dma_pipeline_consume(")
 FINALIZE = extract_definition("static bool fpga_p2_dma_pipeline_finalize(")
-PAIR_SPLIT = extract_definition("static size_t fpga_p2_dma_pipeline_main_pair_count(")
+HELPER_SPLIT = extract_definition("static int fpga_p2_pack_helper_split(")
 WAIT_DISABLED = extract_definition("static bool zdma_wait_channel_disabled(")
 WAIT_COMPLETE = extract_definition("static bool zdma_wait_transfer_complete(")
 SCHEDULER = extract_definition("static bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(")
@@ -50,11 +48,11 @@ SCHEDULER = extract_definition("static bool fpga_hw_q8_0_matmul_dma_to_ip_pipeli
 # production bodies, while these checks catch accidental extraction drift.
 assert "fpga_p2_dma_pipeline_consume(lookahead, prepared" in SCHEDULER
 assert "fpga_p2_dma_pipeline_finalize(lookahead)" in SCHEDULER
-assert "candidate.helper_pair_begin      = fpga_p2_dma_pipeline_main_pair_count(pair_count, weight_bytes);" in SOURCE
+assert "fpga_p2_pack_helper_split(pair_count, P2_PACK_HELPERS, begin, end)" in SOURCE
+assert "fpga_p2_dma_pipeline_poll" not in SOURCE and "fpga_p2_dma_pipeline_pack_batch" not in SOURCE
 assert SCHEDULER.index("fpga_accumulate_pl_scaled_q8_tile_job(*running, accum, totals, false)") < SCHEDULER.index(
     "fpga_p2_dma_pipeline_finalize(lookahead)"
 )
-assert "Thời gian DMA phía host trong pipeline có bao gồm callback = 1" in SOURCE
 assert "const size_t scale_capacity_entries = lookahead.job.scale_bytes / sizeof(uint32_t);" in SOURCE
 
 
@@ -77,7 +75,6 @@ harness = r'''
 
 static constexpr int VPU_BLOCK_BEATS = 2;
 static constexpr int VPU_RESULT_PACK_LANES = 4;
-static constexpr size_t P2_PIPELINE_PACK_BATCH_PAIRS = 8;
 static constexpr uint32_t ACT_BASE = 0x00010000U, ACT_END = 0x00020000U;
 static constexpr uint32_t WEIGHT_BASE = 0x00100000U, WEIGHT_END = 0x00200000U;
 static constexpr uint32_t RESULT_BASE = 0x00200000U, RESULT_END = 0x00210000U;
@@ -214,32 +211,22 @@ static int g_fatal_count = 0, g_log_errors = 0, g_dump_count = 0, g_fences = 0;
 static int g_helper_waits = 0;
 static bool g_worker_ok = true;
 static uint64_t g_p2_weight_residency_epoch = 9;
-static long long g_p2_pack_dma_pipeline_residual_bytes = 0;
 static long long g_p2_pack_dma_pipeline_helper_us = 0;
 static long long g_p2_pack_offload_jobs = 0;
 static long long g_p2_pack_offload_helper_us[3] = {};
 static uint64_t g_p2_pack_offload_helper_bytes[3] = {};
 static long long g_p2_pack_offload_finalize_wait_us = 0;
 static long long g_p2_pack_dma_pipeline_helper_wait_us = 0;
-static long long g_p2_pack_dma_pipeline_residual_us = 0;
 static long long g_p2_pack_dma_pipeline_helper_publication_lead_us = 0;
 static long long g_p2_pack_dma_pipeline_helper_early_completions = 0;
-static uint64_t g_p2_pack_dma_pipeline_callback_bytes = 0;
-static long long g_p2_pack_dma_pipeline_callback_us = 0;
 static long long g_p2_pack_dma_pipeline_consumed_jobs = 0;
 
 // Measurement stubs are observers only: do not advance the host clock or
 // change the synthetic registers used by the production wait-loop checks.
-static unsigned profile_pack_begins = 0, profile_pack_ends = 0, profile_productive = 0;
 static unsigned profile_finalizes = 0;
 static std::vector<unsigned> profile_observations;
 static void fpga_dma_profile_observe(bool error, bool done, bool enabled) {
     profile_observations.push_back((error ? 4U : 0U) | (done ? 2U : 0U) | (enabled ? 1U : 0U));
-}
-static void fpga_dma_profile_pack_begin() { ++profile_pack_begins; }
-static void fpga_dma_profile_pack_end(bool ok, size_t before, size_t after) {
-    ++profile_pack_ends;
-    if (ok && after > before) ++profile_productive;
 }
 static void fpga_dma_profile_finalize_begin() {}
 static void fpga_dma_profile_finalize_end(long long, long long, long long, size_t, size_t) {
@@ -275,7 +262,7 @@ static long long monotonic_now_us() { return ++g_mono_clock; }
 
 static bool fpga_p2_pack_worker_wait(uint64_t generation, size_t * words, long long * service_us,
                                      long long * wait_us, size_t * scale_entries = nullptr,
-                                     long long * completion_mono_us = nullptr, int = 0) {
+                                     long long * completion_mono_us = nullptr, int worker = 0) {
     assert(generation != 0);
     if (completion_mono_us) *completion_mono_us = 0;
     ++g_helper_waits;
@@ -288,11 +275,16 @@ static bool fpga_p2_pack_worker_wait(uint64_t generation, size_t * words, long l
     if (g_worker_context && g_worker_pack_suffix) {
         auto & lookahead = *g_worker_context;
         size_t written_words = 0, written_scales = 0;
+        const size_t begin = worker == 0 ? lookahead.helper_pair_begin :
+                             worker == 1 ? lookahead.helper1_pair_begin : lookahead.helper2_pair_begin;
+        const size_t end = worker == 0 ? lookahead.helper1_pair_begin :
+                           (worker == 1 && lookahead.helper_count == 3) ? lookahead.helper2_pair_begin :
+                                                                          lookahead.pair_count;
         if (!fpga_pack_direct_weight_scale_pair_range(
                 lookahead.weight_words, lookahead.scale_words, lookahead.job.src0, lookahead.weight_data_base,
                 lookahead.job.act_group, lookahead.job.row0, lookahead.job.k_block0, lookahead.job.rows,
-                lookahead.job.group_blocks, lookahead.job.group_beats, lookahead.helper_pair_begin,
-                lookahead.pair_count, true, &written_words, &written_scales)) return false;
+                lookahead.job.group_blocks, lookahead.job.group_beats, begin, end, true, &written_words,
+                &written_scales)) return false;
         *words = written_words;
         if (scale_entries) *scale_entries = written_scales;
     }
@@ -300,7 +292,7 @@ static bool fpga_p2_pack_worker_wait(uint64_t generation, size_t * words, long l
 }
 '''
 harness += extract_definition("static size_t fpga_p2_pack_helper_scale_entries(") + "\n"
-harness += PAIR_SPLIT + "\n" + INVALIDATE + "\n" + PACK_BATCH + "\n" + POLL + "\n" + CONSUME + "\n" + FINALIZE + "\n" + WAIT_DISABLED + "\n" + WAIT_COMPLETE
+harness += HELPER_SPLIT + "\n" + INVALIDATE + "\n" + CONSUME + "\n" + FINALIZE + "\n" + WAIT_DISABLED + "\n" + WAIT_COMPLETE
 harness += r'''
 
 static void fill_source(std::vector<block_q8_0> & weights, std::vector<block_q8_0> & activations, unsigned seed) {
@@ -369,9 +361,15 @@ static fpga_p2_dma_pipeline_lookahead_t prepare_lookahead(
     lookahead.generation = 1;
     lookahead.source_epoch = g_p2_weight_residency_epoch;
     lookahead.pair_count = pair_count;
-    lookahead.helper_pair_begin = fpga_p2_dma_pipeline_main_pair_count(
-        pair_count, pair_count * words_per_pair * sizeof(uint32_t));
-    lookahead.main_pair_next = 0;
+    size_t begin[3], end[3];
+    lookahead.helper_count = fpga_p2_pack_helper_split(pair_count, 3, begin, end);
+    lookahead.helper_pair_begin = begin[0];
+    lookahead.helper1_pair_begin = begin[1];
+    lookahead.helper2_pair_begin = begin[2];
+    lookahead.worker1_submitted = true;
+    lookahead.worker2_submitted = lookahead.helper_count == 3;
+    lookahead.generation1 = 1;
+    lookahead.generation2 = 1;
     lookahead.words_per_pair = words_per_pair;
     lookahead.expected_words = pair_count * words_per_pair;
     lookahead.expected_scale_entries = entries;
@@ -436,25 +434,18 @@ static void test_two_slots_and_tails() {
 }
 
 static void test_pipeline_split_policy() {
-    assert(fpga_p2_dma_pipeline_main_pair_count(128U, 512U * 1024U) == 48U);
-    assert(fpga_p2_dma_pipeline_main_pair_count(64U, 256U * 1024U) == 24U);
-    assert(fpga_p2_dma_pipeline_main_pair_count(128U, 255U * 1024U) == 64U);
-    assert(fpga_p2_dma_pipeline_main_pair_count(3U, 512U * 1024U) == 1U);
-    assert(fpga_p2_dma_pipeline_main_pair_count(2U, 512U * 1024U) == 1U);
-    assert(fpga_p2_dma_pipeline_main_pair_count(1U, 512U * 1024U) == 0U);
-
     struct PipelineCase {
         int rows;
         int group_blocks;
-        int callback_mode; // 0=none, 1=some, 2=all
-        size_t expected_main_pairs;
+        int expected_helpers;
     };
     const PipelineCase cases[] = {
-        { 256, 64, 0, 48 },
-        { 128, 64, 1, 24 },
-        { 256, 24, 2, 64 },
-        { 255, 64, 2, 48 },
-        { 5, 4, 0, 1 },
+        { 256, 64, 3 },
+        { 128, 64, 3 },
+        { 256, 24, 3 },
+        { 255, 64, 3 },
+        { 5, 4, 3 },
+        { 3, 4, 2 },
     };
     unsigned seed = 131U;
     for (const PipelineCase & test : cases) {
@@ -471,7 +462,7 @@ static void test_pipeline_split_policy() {
         PackedTile expected = make_tile(pairs * words_per_pair, entries);
         fpga_stage_totals_t totals = {};
         auto lookahead = prepare_lookahead(tensor, weights, activations, actual, test.rows, test.group_blocks, totals);
-        assert(lookahead.helper_pair_begin == test.expected_main_pairs);
+        assert(lookahead.helper_count == test.expected_helpers && lookahead.helper_pair_begin == 0);
         size_t expected_words = 0, expected_scales = 0;
         assert(fpga_pack_direct_weight_scale_pair_range(
             expected.weight, expected.scale, &tensor, weights.data(), activations.data(), 1, 1, test.rows,
@@ -482,21 +473,8 @@ static void test_pipeline_split_policy() {
         g_worker_ok = true;
         g_worker_completion_mono_us = 1;
         g_worker_wait_us = 2;
-        g_p2_pack_dma_pipeline_callback_bytes = 0;
-        g_p2_pack_dma_pipeline_callback_us = 0;
-        if (test.callback_mode == 1) {
-            assert(fpga_p2_dma_pipeline_poll(&lookahead, 1));
-            assert(lookahead.callback_bytes > 0 && lookahead.main_pair_next < lookahead.helper_pair_begin);
-        } else if (test.callback_mode == 2) {
-            while (lookahead.main_pair_next < lookahead.helper_pair_begin)
-                assert(fpga_p2_dma_pipeline_poll(&lookahead, 1));
-            assert(lookahead.callback_bytes > 0 && lookahead.main_pair_next == lookahead.helper_pair_begin);
-        } else {
-            assert(lookahead.callback_bytes == 0);
-        }
         assert(fpga_p2_dma_pipeline_finalize(lookahead));
-        assert(lookahead.main_pair_next == lookahead.helper_pair_begin);
-        assert(lookahead.main_written_words == lookahead.helper_pair_begin * words_per_pair);
+        assert(!lookahead.worker_submitted && !lookahead.worker1_submitted && !lookahead.worker2_submitted);
         for (size_t i = 0; i < expected_words; ++i) assert(actual.weight[i] == expected.weight[i]);
         for (size_t i = 0; i < entries; ++i) assert(actual.scale[i] == expected.scale[i]);
         assert_canaries(actual, (entries + 3U) / 4U);
@@ -540,31 +518,31 @@ static void test_completion_telemetry() {
     assert(run_finalize(100, true)); // finalize starts at 101: positive lead
     assert(g_p2_pack_dma_pipeline_helper_publication_lead_us == 1);
     assert(g_p2_pack_dma_pipeline_helper_early_completions == 1);
-    assert(g_p2_pack_dma_pipeline_helper_wait_us == 3);
+    assert(g_p2_pack_dma_pipeline_helper_wait_us == 9);
 
     g_mono_clock = 200;
     assert(run_finalize(201, true)); // finalize starts at 201: on-time, no positive lead
     assert(g_p2_pack_dma_pipeline_helper_publication_lead_us == 1);
     assert(g_p2_pack_dma_pipeline_helper_early_completions == 1);
-    assert(g_p2_pack_dma_pipeline_helper_wait_us == 6);
+    assert(g_p2_pack_dma_pipeline_helper_wait_us == 18);
 
     g_mono_clock = 300;
     assert(run_finalize(302, true)); // helper publishes after finalization starts
     assert(g_p2_pack_dma_pipeline_helper_publication_lead_us == 1);
     assert(g_p2_pack_dma_pipeline_helper_early_completions == 1);
-    assert(g_p2_pack_dma_pipeline_helper_wait_us == 9);
+    assert(g_p2_pack_dma_pipeline_helper_wait_us == 27);
 
     g_mono_clock = -1;
     assert(run_finalize(1, true)); // invalid zero finalization timestamp
     assert(g_p2_pack_dma_pipeline_helper_publication_lead_us == 1);
     assert(g_p2_pack_dma_pipeline_helper_early_completions == 1);
-    assert(g_p2_pack_dma_pipeline_helper_wait_us == 12);
+    assert(g_p2_pack_dma_pipeline_helper_wait_us == 36);
 
     g_mono_clock = 400;
     assert(run_finalize(0, true)); // invalid monotonic publication timestamp
     assert(g_p2_pack_dma_pipeline_helper_publication_lead_us == 1);
     assert(g_p2_pack_dma_pipeline_helper_early_completions == 1);
-    assert(g_p2_pack_dma_pipeline_helper_wait_us == 15);
+    assert(g_p2_pack_dma_pipeline_helper_wait_us == 45);
 
     const long long lead_before_failure = g_p2_pack_dma_pipeline_helper_publication_lead_us;
     const long long early_before_failure = g_p2_pack_dma_pipeline_helper_early_completions;
@@ -578,7 +556,7 @@ static void test_completion_telemetry() {
     assert(profile_finalizes == finalizes_before_failure);
 }
 
-static void test_real_poll_and_cleanup() {
+static void test_helper_cleanup() {
     constexpr int rows = 33, group_blocks = 4;
     const size_t pairs = ((size_t) rows + 1U) / 2U;
     const size_t words_per_pair = (size_t) (group_blocks * VPU_BLOCK_BEATS) * 8U;
@@ -592,40 +570,17 @@ static void test_real_poll_and_cleanup() {
     PackedTile tile = make_tile(pairs * words_per_pair, entries);
     fpga_stage_totals_t totals;
     auto lookahead = prepare_lookahead(tensor, weights, activations, tile, rows, group_blocks, totals);
-    lookahead.worker_submitted = false;
-    lookahead.generation = 7;
-    g_p2_pack_dma_pipeline_callback_bytes = 0;
-    g_p2_pack_dma_pipeline_callback_us = 0;
-    profile_pack_begins = profile_pack_ends = profile_productive = 0;
-    while (lookahead.main_pair_next < lookahead.helper_pair_begin)
-        assert(fpga_p2_dma_pipeline_poll(&lookahead, 1));
-    assert(lookahead.main_pair_next == lookahead.helper_pair_begin);
-    assert(lookahead.callback_bytes > 0 && g_p2_pack_dma_pipeline_callback_bytes == lookahead.callback_bytes);
-    assert(profile_productive > 0 && profile_productive == profile_pack_begins &&
-           profile_pack_begins == profile_pack_ends);
-    const unsigned productive_before_noop = profile_productive;
-    assert(fpga_p2_dma_pipeline_poll(&lookahead, 1));
-    assert(profile_pack_begins == productive_before_noop && profile_pack_ends == productive_before_noop);
-    assert(!fpga_p2_dma_pipeline_poll(nullptr, 1));
-    assert(profile_pack_begins == productive_before_noop);
-
-    lookahead.valid = true;
-    lookahead.main_pair_next = 0;
-    lookahead.main_written_words = 0;
-    lookahead.main_scale_entries = 0;
-    lookahead.scale_words = nullptr;
-    assert(!fpga_p2_dma_pipeline_poll(&lookahead, 2));
-    assert(!lookahead.valid);
-
-    lookahead = prepare_lookahead(tensor, weights, activations, tile, rows, group_blocks, totals);
+    assert(lookahead.helper_count == 3);
     g_worker_context = &lookahead;
     const int waits_before = g_helper_waits;
     fpga_p2_dma_pipeline_invalidate(&lookahead);
-    assert(g_helper_waits == waits_before + 1 && !lookahead.valid && !lookahead.worker_submitted);
+    assert(g_helper_waits == waits_before + 3 && !lookahead.valid && !lookahead.worker_submitted &&
+           !lookahead.worker1_submitted && !lookahead.worker2_submitted);
     fpga_p2_dma_pipeline_invalidate(&lookahead);
-    assert(g_helper_waits == waits_before + 1);
+    assert(g_helper_waits == waits_before + 3);
 
     lookahead = prepare_lookahead(tensor, weights, activations, tile, rows, group_blocks, totals);
+    lookahead.worker1_submitted = lookahead.worker2_submitted = false;
     g_worker_context = &lookahead;
     g_worker_ok = false;
     fpga_p2_dma_pipeline_invalidate(&lookahead);
@@ -660,19 +615,14 @@ static void test_real_finalize_and_consume() {
     lookahead.scale_words[entries + 2U] = UINT32_C(0xDEADBEEF);
     g_worker_context = &lookahead;
     g_worker_pack_suffix = true;
-    g_p2_pack_dma_pipeline_residual_bytes = 0;
+    assert(lookahead.helper_count == 2);
     assert(fpga_p2_dma_pipeline_finalize(lookahead));
-    assert(!lookahead.worker_submitted && lookahead.valid);
-    assert(lookahead.main_pair_next == lookahead.helper_pair_begin);
-    assert(lookahead.main_written_words == lookahead.helper_pair_begin * words_per_pair);
-    assert(lookahead.main_scale_entries == entries - group_blocks);
+    assert(!lookahead.worker_submitted && !lookahead.worker1_submitted && lookahead.valid);
     for (size_t i = 0; i < expected_words; ++i) assert(result.weight[i] == expected.weight[i]);
     for (size_t i = 0; i < entries; ++i) assert(result.scale[i] == expected.scale[i]);
     for (size_t i = entries; i < capacity_entries; ++i) assert(result.scale[i] == 0U);
     assert(result.weight_storage[0] == UINT64_C(0xabababababababab) && result.weight_storage.back() == UINT64_C(0xabababababababab));
     assert(result.scale_storage[0] == UINT64_C(0xabababababababab) && result.scale_storage.back() == UINT64_C(0xabababababababab));
-    assert(g_p2_pack_dma_pipeline_residual_bytes ==
-           (long long) (lookahead.main_written_words * sizeof(uint32_t)));
 
     fpga_tile_job_t consumed = {};
     assert(fpga_p2_dma_pipeline_consume(lookahead, consumed, &totals, &tensor, weights.data(), 1, rows, 1,
@@ -684,10 +634,7 @@ static void test_real_finalize_and_consume() {
 
     // Source identity and residency epoch are mandatory consume keys.
     auto bad = prepare_lookahead(tensor, weights, activations, result, rows, group_blocks, totals);
-    bad.worker_submitted = false;
-    bad.main_pair_next = bad.helper_pair_begin;
-    bad.main_written_words = bad.helper_pair_begin * words_per_pair;
-    bad.main_scale_entries = entries - group_blocks;
+    bad.worker_submitted = bad.worker1_submitted = bad.worker2_submitted = false;
     ggml_tensor other = {};
     assert(!fpga_p2_dma_pipeline_consume(bad, consumed, &totals, &other, weights.data(), 1, rows, 1,
                                          group_blocks, 2, 7));
@@ -790,11 +737,11 @@ int main() {
     test_two_slots_and_tails();
     test_pipeline_split_policy();
     test_completion_telemetry();
-    test_real_poll_and_cleanup();
+    test_helper_cleanup();
     test_real_finalize_and_consume();
     test_zdma_wait_order();
     assert(g_fatal_count == 1);
-    puts("PASS: real pack/poll/finalize/consume; scale padding canaries; source identity/epoch; helper cleanup; ZDMA DONE/error/timeout/callback/quiescence ordering");
+    puts("PASS: real helper pack/finalize/consume; scale padding canaries; source identity/epoch; helper cleanup; ZDMA DONE/error/timeout/callback/quiescence ordering");
 }
 '''
 

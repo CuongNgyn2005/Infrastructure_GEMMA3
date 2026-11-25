@@ -16,8 +16,8 @@ struct fpga_perf_decode_data {
     int64_t decode_wall_us;
     int64_t fpga_matmuls;
     int64_t vpu_runs;
-    int64_t ip_compute_us; // -1 when FPGA_COMPUTE_WATCH=0; consult validity below.
-    // Completion-watcher timing (default ON); includes host polling overhead.
+    int64_t ip_compute_us; // always -1: the host has no independent IP compute timer.
+    // Always 0; consumers must not report IP compute time.
     int ip_compute_timing_valid;
     int64_t h2ip_dma_us;
     int64_t ip2host_dma_us;
@@ -47,9 +47,8 @@ struct fpga_perf_decode_data {
     int64_t residency_misses;
 };
 
-// Return values from fpga_try_matmul[_extended]().  CPU shadow is an explicit
-// contract mode: the VPU result is checked but GGML retains ownership of dst.
-// It is not a hardware-unavailable CPU fallback.
+// Return values from fpga_try_matmul[_extended]().  The host no longer returns
+// CONTRACT_CPU_SHADOW; the value stays because ggml-cpu.c still compares with it.
 enum fpga_matmul_route {
     FPGA_MATMUL_NOT_HANDLED          = 0,
     FPGA_MATMUL_FPGA_DST             = 1,
@@ -58,16 +57,6 @@ enum fpga_matmul_route {
 
 int  fpga_init(void);
 void fpga_cleanup(void);
-
-// Side-effect-free environment queries used before FPGA initialization.
-int fpga_p2_contract_check_requested(void);
-
-// P2 qualification is allowed to map and drive ZDMA/VPU only after llama-model-loader has
-// validated every model tensor.  This is a process-local handshake; it never
-// accesses board hardware or mutates model data.
-void fpga_mark_model_tensor_validation_passed(void);
-int  fpga_model_tensor_validation_passed(void);
-
 
 void fpga_set_context(int layer_id, int seq_pos, int is_attn);
 int  fpga_get_sequence_position(void);

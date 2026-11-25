@@ -56,7 +56,6 @@ constexpr int VPU_BLOCK_BEATS = 2;
 #include "quants.h"
 #include "fpga_q8_pack.h"
 
-static int g_p2_pack_workers_requested = 2;
 static long long now_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();

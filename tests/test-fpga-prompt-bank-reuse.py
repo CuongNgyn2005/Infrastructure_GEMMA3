@@ -53,6 +53,11 @@ accumulate = extract_definition("static bool fpga_accumulate_pl_scaled_q8_tile_j
 read_check = extract_definition("static bool fpga_p2_result_read_check(")
 read_rows = extract_definition("static bool fpga_p2_result_read_rows(")
 read_publish = extract_definition("static bool fpga_p2_result_read_publish(")
+ctx_end = SOURCE.index("} fpga_p2_prefetch_read_ctx_t;")
+read_ctx_type = SOURCE[SOURCE.rfind("typedef struct {", 0, ctx_end):ctx_end + len("} fpga_p2_prefetch_read_ctx_t;")]
+read_chunked = extract_definition("static bool fpga_p2_prefetch_read_poll_chunked(")
+read_finish = extract_definition("static bool fpga_p2_prefetch_read_finish(")
+promote = extract_definition("static bool fpga_p2_weight_prefetch_promote(")
 residency_align = extract_definition("static bool fpga_p2_residency_align_up(")
 residency_end = extract_definition("static bool fpga_p2_residency_range_end(")
 invalidate = extract_definition("static void fpga_p2_dma_pipeline_invalidate(")
@@ -67,13 +72,15 @@ scheduler = scheduler.replace(
 # Keep the test tied to the production handoff order.  Runtime assertions below
 # execute the extracted scheduler; these guards only make an accidental source
 # extraction of an older/partial scheduler fail early.
-assert "fpga_p2_dma_pipeline_consume(lookahead, prepared" in scheduler
+assert "fpga_p2_dma_pipeline_consume(ready, prepared" in scheduler
 assert "fpga_p2_dma_pipeline_finalize(lookahead)" in scheduler
-running = scheduler[scheduler.index("                if (running) {") :]
-assert running.index("fpga_accumulate_pl_scaled_q8_tile_job(*running, accum, totals, false)") < running.index(
-    "fpga_p2_dma_pipeline_finalize(lookahead)"
-)
-
+assert "const bool weight_prefetch = pipeline_route && overlap_results;" in scheduler
+prefetch_branch = scheduler[scheduler.index("                    if (weight_prefetch) {\n                        fpga_p2_prefetch_read_ctx_t"):]
+assert (prefetch_branch.index("fpga_p2_weight_prefetch_promote(lookahead, ready)")
+        < prefetch_branch.index("fpga_p2_weight_prefetch_dma(ready, prepared, &read_ctx)")
+        < prefetch_branch.index("fpga_p2_prefetch_read_finish(read_ctx)")
+        < prefetch_branch.index("fpga_accumulate_pl_scaled_q8_tile_job(*running, accum, totals, false)")
+        < prefetch_branch.index("store_rows(running->row0, running->rows);"))
 
 harness = r'''
 #include <algorithm>
@@ -207,36 +214,20 @@ int configured_max_rows = 3, configured_max_blocks = 2;
 bool configured_descriptor = true;
 int max_blocks = 2, test_blocks = 0, test_columns = 0, test_rows = 0;
 bool g_p1_sched_summary_enabled = true;
-bool g_p2_result_overlap_enabled = false, g_vpu_descriptor_supported = true;
-bool g_result_ldp_enabled = false;
+bool test_overlap = false, g_vpu_descriptor_supported = true;
 bool g_pingpong_timing_enabled = false;
 bool g_p2_pack_dma_pipeline_enabled = false, pipeline_resident = false;
-bool g_p2_weight_prefetch_enabled = false;
 long long g_p2_weight_prefetch_restarts = 0, g_p2_weight_prefetch_skip_geometry = 0;
-long long g_p2_weight_prefetch_late_reads = 0;
-struct fpga_p2_prefetch_read_ctx_t {
-    fpga_tile_job_t * job;
-    std::vector<float> * accum;
-    fpga_stage_totals_t * totals;
-    bool done, ok;
-    bool started = false; int next_row = 0; long long read_us = 0, event_read0 = 0;
-};
-long long g_p2_weight_prefetch_partial_reads = 0;
+long long g_p2_weight_prefetch_late_reads = 0, g_p2_weight_prefetch_partial_reads = 0;
+long long g_p2_weight_prefetch_hook_reads = 0;
+static constexpr int P2_HOOK_READ_ROWS = 32;
+// 0: hook reads the whole result; 1: one hook call, the rest after the DMA; 2: DMA ends before the hook runs.
+int hook_mode = 0;
 bool g_p2_cycle_phases_enabled = false;
 enum { P2CP_PRE, P2CP_DRAIN, P2CP_RELEASE, P2CP_ACT, P2CP_SUBMIT, P2CP_ADMIT, P2CP_PREFETCH, P2CP_TAIL, P2CP_STORE, P2CP_TOTAL, P2CP_COUNT };
 long long g_p2_cycle_us[P2CP_COUNT] = {};
 long long g_p2_cycle_count = 0;
 void p2_cycle_mark(int, long long *) {}
-bool fpga_p2_prefetch_read_finish(fpga_p2_prefetch_read_ctx_t &) {
-    throw "unexpected chunked read finish in baseline scheduler fixture";
-}
-bool fpga_p2_weight_prefetch_promote(fpga_p2_dma_pipeline_lookahead_t &, fpga_p2_dma_pipeline_lookahead_t &) {
-    throw "unexpected prefetch in baseline scheduler fixture";
-}
-bool fpga_p2_weight_prefetch_dma(fpga_p2_dma_pipeline_lookahead_t &, const fpga_tile_job_t &,
-                                  fpga_p2_prefetch_read_ctx_t *) {
-    throw "unexpected prefetch in baseline scheduler fixture";
-}
 bool g_p2_weight_residency_enabled = false;
 long long g_p2_weight_residency_budget_mb = 1;
 uint32_t g_p2_residency_next_off = 0;
@@ -246,7 +237,6 @@ std::vector<int> g_p2_resident_tiles(128);
 bool g_p3_matmul_active = false;
 constexpr uint32_t REG_P3_REJECT_COUNT = 0x218U;
 uint32_t vpu_rd32(uint32_t) { throw "unexpected P3 MMIO in P2 fixture"; }
-bool g_p2_act_bank_reuse_enabled = false; // Preserve the original ACT-transfer fixture.
 uint64_t g_p2_act_bank_reused_jobs = 0, g_p2_act_bank_avoided_bytes = 0;
 long long g_p2_pack_dma_pipeline_eligible_jobs = 0;
 long long g_p2_pack_dma_pipeline_consumed_jobs = 0;
@@ -345,7 +335,7 @@ size_t allocation_bytes(int rows, int blocks) {
 }
 bool expect_cross(int rows) {
     const size_t available = P2_WEIGHT_RESIDENCY_END - g_p2_residency_next_off;
-    return test_columns == 1 && g_p2_result_overlap_enabled && g_vpu_descriptor_supported &&
+    return test_columns == 1 && g_vpu_descriptor_supported &&
            (!g_p2_weight_residency_enabled || g_p2_residency_next_slot == 128 ||
             available < allocation_bytes(rows, std::min(max_blocks, test_blocks)));
 }
@@ -390,7 +380,7 @@ bool fpga_p2_dma_pipeline_admit(fpga_p2_dma_pipeline_lookahead_t & lookahead, co
     if (!step()) return false;
     assert(!pending_generation);
     if (active_job && active != -1) {
-        assert(&lookahead.job != active_job && bank == active);
+        assert(&lookahead.job != active_job);
         assert(key(*active_job) == key(active_snapshot) && active_job->job_id == active_snapshot.job_id);
     }
     assert(weight_src_off == WEIGHT_BASE + (tile_id & 1U) * P2_PIPELINE_WEIGHT_SLOT_BYTES);
@@ -486,14 +476,12 @@ bool fpga_p2_dma_pipeline_finalize(fpga_p2_dma_pipeline_lookahead_t & lookahead)
     if (!step()) return false;
     if (!lookahead.valid || lookahead.consumed) return false;
     assert(lookahead.worker_submitted && pending_generation == lookahead.generation);
-    assert(pending_result == -1);
     size_t words = 0; long long service = 0, wait = 0;
     assert(fpga_p2_pack_worker_wait(lookahead.generation, &words, &service, &wait));
     ++pipeline_finalized;
     lookahead.worker_submitted = false;
     return true;
 }
-bool fpga_p2_dma_pipeline_poll(void *, long long) { return true; }
 
 void store_dst_value(const ggml_tensor *, int64_t row, int64_t col, float value) {
     assert(row >= 0 && row < test_rows && col >= 0 && col < test_columns);
@@ -551,11 +539,10 @@ harness += residency_align + "\n" + residency_end
 # RAM-only stubs.
 weight_transfer = SOURCE[
     SOURCE.index("    if (weight_dma_needed &&", SOURCE.index("static bool fpga_submit_q8_tile_job(")) :
-    SOURCE.index("\n    const long long event_dma_weight_done", SOURCE.index("static bool fpga_submit_q8_tile_job("))
+    SOURCE.index("\n    const long long dma_weight1", SOURCE.index("static bool fpga_submit_q8_tile_job("))
 ]
 harness += r'''
 bool weight_transfer(fpga_tile_job_t & job) {
-    const fpga_dma_poll_hook_t * poll_hook = nullptr;
     const bool weight_dma_needed = !job.weight_bank_reused && !job.weight_prefetched;
 ''' + weight_transfer + r'''
     return true;
@@ -565,7 +552,8 @@ bool transfer(fpga_tile_job_t & job) {
     ++activations;
     const int before = loads;
     assert(weight_transfer(job));
-    if (job.weight_bank_reused) {
+    assert(!(job.weight_prefetched && job.weight_bank_reused));
+    if (job.weight_bank_reused || job.weight_prefetched) {
         assert(loads == before && valid[job.bank] && banks[job.bank] == key(job));
     } else {
         assert(loads == before + 1);
@@ -643,13 +631,11 @@ bool fpga_write_post_spu_descriptor(const fpga_tile_job_t & job, int, int, unsig
     active = -1;
     return true;
 }
-bool fpga_submit_q8_tile_job(fpga_tile_job_t & job, fpga_stage_totals_t *, const char *, int,
-                             int64_t, int64_t, int64_t, int, const fpga_dma_poll_hook_t * poll_hook) {
+bool fpga_submit_q8_tile_job(fpga_tile_job_t & job, fpga_stage_totals_t *) {
     event("submit", job.tile_id);
     if (!step()) return false;
     assert(active == -1);
     assert(transfer(job));
-    if (poll_hook && poll_hook->fn) assert(poll_hook->fn(poll_hook->context, 0));
     assert(valid[job.bank] && banks[job.bank] == key(job));
     ++scales;
     ++launches;
@@ -665,7 +651,28 @@ void fpga_log_prompt_weight_reuse(const char *, int64_t, long long jobs, uint64_
 }
 '''
 
-harness += release + "\n" + read_check + "\n" + read_rows + "\n" + read_publish + "\n" + accumulate + "\n" + scheduler
+prefetch_mock = r'''
+// RAM model of the PREFETCH_W transfer (the production body is covered by test-fpga-weight-prefetch).
+bool fpga_p2_weight_prefetch_dma(fpga_p2_dma_pipeline_lookahead_t & ready, const fpga_tile_job_t & running,
+                                 fpga_p2_prefetch_read_ctx_t * read_ctx) {
+    event("prefetch", ready.job.tile_id);
+    if (!step()) return false;
+    assert(ready.valid && !ready.consumed && !ready.worker_submitted && !ready.job.weight_prefetched);
+    assert(active == (running.bank & 1) && (ready.job.bank & 1) != active);   // never the bank the IP reads
+    ++loads;
+    banks[ready.job.bank] = key(ready.job);
+    valid[ready.job.bank] = true;
+    ready.job.weight_prefetched = true;
+    if (read_ctx && read_ctx->job && hook_mode != 2) {
+        do {
+            if (!fpga_p2_prefetch_read_poll_chunked(read_ctx, 0)) return false;
+        } while (hook_mode == 0 && !read_ctx->done);
+    }
+    return true;
+}
+'''
+harness += release + "\n" + read_check + "\n" + read_rows + "\n" + read_publish + "\n" + accumulate + "\n"
+harness += read_ctx_type + "\n" + read_chunked + "\n" + read_finish + "\n" + promote + "\n" + prefetch_mock + scheduler
 harness += r'''
 
 bool run_legacy(int columns, bool overlap, int failure, int rows = 7, int blocks = 5, int cache = 0) {
@@ -686,8 +693,8 @@ bool run_legacy(int columns, bool overlap, int failure, int rows = 7, int blocks
     g_packed_q8_result_words = std::max(1, (g_vpu_max_rows * g_packed_q8_max_blocks + VPU_RESULT_PACK_LANES - 1) /
                                               VPU_RESULT_PACK_LANES);
     g_p2_pack_dma_pipeline_enabled = false;
-    g_p2_result_overlap_enabled = overlap;
-    g_vpu_descriptor_supported = configured_descriptor;
+    test_overlap = overlap;
+    g_vpu_descriptor_supported = configured_descriptor && test_overlap;
     g_p2_weight_residency_enabled = cache != 0;
     g_p2_weight_residency_budget_mb = (P2_WEIGHT_RESIDENCY_END - WEIGHT_CACHE_BASE) / (1024U * 1024U);
     g_p2_residency_next_slot = cache == 3 ? 128 : 0;
@@ -734,7 +741,7 @@ bool run_legacy(int columns, bool overlap, int failure, int rows = 7, int blocks
 }
 
 bool run_pipeline_case(int rows, int blocks, bool enabled, bool resident, int failure = 0,
-                       bool stale = false, bool overlap = true) {
+                       bool stale = false) {
     assert(pending_generation == 0);
     failed = false; events.clear(); active_job = nullptr;
     helper_submissions = helper_completions = 0;
@@ -750,8 +757,9 @@ bool run_pipeline_case(int rows, int blocks, bool enabled, bool resident, int fa
     g_vpu_max_rows = 256; max_blocks = 64;
     g_packed_q8_max_blocks = 64; g_packed_q8_result_words = 4096;
     g_p2_pack_dma_pipeline_enabled = enabled;
-    g_p2_result_overlap_enabled = overlap;
     g_vpu_descriptor_supported = true;
+    g_p2_weight_prefetch_restarts = g_p2_weight_prefetch_skip_geometry = 0;
+    g_p2_weight_prefetch_late_reads = g_p2_weight_prefetch_partial_reads = g_p2_weight_prefetch_hook_reads = 0;
     g_p2_weight_residency_enabled = resident;
     g_p2_residency_next_slot = 0;
     g_p2_residency_next_off = WEIGHT_CACHE_BASE;
@@ -778,24 +786,51 @@ bool run_pipeline_case(int rows, int blocks, bool enabled, bool resident, int fa
         return false;
     }
     assert(ok && !failed);
-    // Each consumed B with a running A attempts C exactly once, before A's
-    // drain, even when final/tail/row-carry exclusions make admission a no-op.
-    for (size_t i = 0; i < events.size(); ++i) {
-        if (std::strcmp(events[i].name, "consume") != 0) continue;
-        const uint32_t b = events[i].tile;
-        size_t attempt = events.size(), drain = events.size(), act = events.size();
-        int attempts = 0;
-        for (size_t j = i + 1; j < events.size(); ++j) {
-            if (events[j].tile == b && std::strcmp(events[j].name, "attempt") == 0) {
-                attempt = j; ++attempts;
+    // Order contract per tile B that follows a running job A:
+    //   drain A, release A < ACT B < submit B, and every read of A is complete before B is drained.
+    // A prefetched C is finalized (promote) before its transfer, which happens while B owns the IP
+    // and before C is consumed.
+    const auto find = [&](const char * name, uint32_t tile, bool last) {
+        size_t found = events.size();
+        for (size_t j = 0; j < events.size(); ++j) {
+            if (events[j].tile == tile && std::strcmp(events[j].name, name) == 0) {
+                found = j;
+                if (!last) break;
             }
-            if (events[j].tile + 1 == b && std::strcmp(events[j].name, "drain") == 0) drain = j;
-            if (events[j].tile == b && std::strcmp(events[j].name, "act") == 0) act = j;
         }
-        assert(attempts == 1 && act < events.size());
-        if (events[i].active_bank != -1) assert(attempt < drain && drain < act);
-        else assert(act < attempt);
+        return found;
+    };
+    for (uint32_t b = 1; b < (uint32_t) launches; ++b) {
+        const size_t submit = find("submit", b, false), drain_a = find("drain", b - 1, false);
+        const size_t release_a = find("release", b - 1, false), drain_b = find("drain", b, false);
+        const size_t last_read_a = find("read", b - 1, true);
+        assert(submit < events.size() && drain_a < release_a && release_a < submit);
+        assert(release_a < last_read_a && last_read_a < drain_b);
+        const size_t act = find("act", b, false);
+        if (act < events.size()) assert(release_a < act && act < submit);
     }
+    int prefetches = 0;
+    for (size_t i = 0; i < events.size(); ++i) {
+        if (std::strcmp(events[i].name, "prefetch") != 0) continue;
+        const uint32_t c = events[i].tile;
+        ++prefetches;
+        assert(c >= 1 && events[i].active_bank == (int) ((c - 1U) & 1U));
+        assert(find("submit", c - 1, false) < i && find("finalize", c, false) < i);
+        assert(i < find("consume", c, false) && find("consume", c, false) < find("submit", c, false));
+    }
+    if (enabled && !resident) {
+        // Every handoff with a running job takes exactly one of the three read paths.
+        const long long handoffs = g_p2_weight_prefetch_hook_reads + g_p2_weight_prefetch_partial_reads +
+                                   g_p2_weight_prefetch_late_reads;
+        assert(handoffs == launches - 1);
+        assert(prefetches + g_p2_weight_prefetch_skip_geometry <= (long long) pipeline_consumed_k.size());
+        if (hook_mode == 2) assert(g_p2_weight_prefetch_hook_reads == 0 && g_p2_weight_prefetch_partial_reads == 0);
+        if (hook_mode == 0) assert(g_p2_weight_prefetch_partial_reads == 0);
+    } else {
+        assert(prefetches == 0);
+    }
+    // Each launched tile had its WEIGHT loaded exactly once, by prefetch or by submit.
+    if (!resident) assert(loads == launches);
     assert(active == -1 && pending_result == -1 && consumed_jobs == launches && release_writes == launches);
     for (int count : stores) assert(count == 1);
     if (!enabled || resident) {
@@ -926,23 +961,32 @@ int main() {
     assert(pipeline_consumed_k.size() == 3);
     for (size_t i = 0; i < pipeline_admitted_rows.size(); ++i) assert(pipeline_admitted_rows[i] < 256);
 
-    // With row carry disabled, admission stops at each row boundary. K-group
-    // overlap still exercises an early successful no-op on the final group.
-    assert(run_pipeline_case(512, 216, true, false, 0, false, false));
-    assert(pipeline_admitted_k.size() == 6);
+    // A stale record is rejected at consume and every submitted helper is joined.
     assert(run_pipeline_case(256, 216, true, false, 0, true) == false);
-    assert(helper_submissions == 1 && helper_completions == 1 && launches == 1);
+    assert(helper_submissions == 2 && helper_completions == 2 && launches == 1);
 
     // Sweep every fallible operation with the pipeline active, including
     // admission/consume/ACT/finalize and all A result reads. Cleanup executes
     // production invalidation and the production scope guard. step() rejects
     // any later operation (including a launch) after the injected failure.
+    // The three result-read paths must all produce bit-identical rows (checked in store_dst_value).
+    long long partial_seen = 0, late_seen = 0, hook_seen = 0;
+    for (hook_mode = 0; hook_mode < 3; ++hook_mode) {
+        assert(run_pipeline_case(1152, 216, true, false));
+        assert(launches == 20);
+        hook_seen += g_p2_weight_prefetch_hook_reads;
+        partial_seen += g_p2_weight_prefetch_partial_reads;
+        late_seen += g_p2_weight_prefetch_late_reads;
+        completed_case();
+    }
+    assert(hook_seen > 0 && partial_seen > 0 && late_seen > 0);
     phase = "pipeline failure sweep";
     report_progress();
+    bool pending_drain = false, pending_release = false, pending_act = false, pending_prefetch = false;
+    bool pending_submit = false, pending_finalize = false, failed_early_admit = false;
+    for (hook_mode = 0; hook_mode < 3; ++hook_mode) {
     assert(run_pipeline_case(259, 216, true, false));
     const int pipeline_operations = (int) operations;
-    bool pending_drain = false, pending_release = false, pending_act = false;
-    bool pending_submit = false, pending_finalize = false, failed_early_admit = false;
     for (int failure = 1; failure <= pipeline_operations; ++failure) {
         assert(!run_pipeline_case(259, 216, true, false, failure));
         // Cleanup may append a join, so locate the last operation event.
@@ -955,14 +999,18 @@ int main() {
         pending_act |= e.pending && std::strcmp(e.name, "act") == 0;
         pending_submit |= e.pending && e.tile > 0 && std::strcmp(e.name, "submit") == 0;
         pending_finalize |= e.pending && e.tile >= 2 && std::strcmp(e.name, "finalize") == 0;
+        pending_prefetch |= e.pending && std::strcmp(e.name, "prefetch") == 0;
         failed_early_admit |= e.active_bank != -1 && std::strcmp(e.name, "admit") == 0;
         completed_case();
     }
+    }
+    hook_mode = 0;
     assert(pending_drain && pending_release && pending_act && pending_submit && pending_finalize && failed_early_admit);
+    assert(pending_prefetch);
     phase = "complete";
     report_progress();
 
-    std::printf("PASS: %d scheduler cases; early helper order, pending-helper cleanup, stale consume, rows/K/tails, disabled/resident paths\n", cases);
+    std::printf("PASS: %d scheduler cases; prefetch order, three read paths, pending-helper cleanup, stale consume, rows/K/tails, disabled/resident paths\n", cases);
 }
 '''
 

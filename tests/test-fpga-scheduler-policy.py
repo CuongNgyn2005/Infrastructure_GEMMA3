@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RAM-only production routing and exact tile-qualification boundary regression."""
+# RAM-only production routing regression: mandatory ping-pong and decode/prompt stream mode.
 import os
 from pathlib import Path
 import subprocess
@@ -9,131 +9,63 @@ source = (Path(__file__).resolve().parents[1] / 'ggml/src/ggml-cpu/fpga_host.cpp
 def between(a, b, start=0):
     i = source.index(a, start)
     return source[i:source.index(b, i)]
-runner = between('static bool fpga_hw_q8_0_matmul_dma_to_ip_pl_scale_qualify_tiles(',
-                 'static bool fpga_hw_q8_0_matmul_dma_to_ip(')
-assert 'store_dst_value' not in runner and ' dst' not in runner
-assert 'P2_SINGLE_BANK_TILE' in runner and 'scope=qualification' in runner
-policy = between('    const bool pipeline_enable_env ', '    g_q8_source_audit_only =')
-assert source.index(policy) < source.index('phase=mapping begin')
-reject_enable = between('        if (pipeline_enable_env) {', '        if (g_weight_cache_enabled)')
 dispatch_start = source.index('static bool fpga_hw_q8_0_matmul_dma_to_ip(')
-dispatch = between('    if (use_pl_scale_path) {', '    uint32_t tile_id', dispatch_start)
+dispatch = between('    if (use_pl_scale_path) {', '\n// Environment variables that are still honoured', dispatch_start)
 assert 'single_bank(' not in source
-active = between('    g_active_matmul_pingpong   =', ';', dispatch_start) + ';'
+assert 'qualify_tiles' not in source and 'FPGA_PIPELINE_' not in source
+# Initialization stops without ping-pong, before the pipeline is published.
+init = source[source.index('int fpga_init(void)'):source.index('void fpga_cleanup(void)')]
+assert (init.index('if (g_p2_init_requested && !g_pingpong_scheduler_enabled) {')
+        < init.index('fpga_fatal("P2 pack DMA pipeline requires admitted ping-pong and the P2 scale stream");')
+        < init.index('g_p2_pack_dma_pipeline_enabled = true;'))
 code = r'''
-#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
-#include <stdexcept>
 #include <string>
 #include <vector>
 template<class... T> void logline(T...) {}
 #define LOGE logline
-#define LOGINIT logline
-#define LOGSTAGE logline
 struct ggml_tensor { float data[4] = {91,92,93,94}; };
 struct block_q8_0_t {};
-struct fpga_weight_cache_entry_t {};
-struct fpga_stage_totals_t {};
-struct fpga_tile_job_t {};
-struct { std::vector<float> contract_actual; } g_scratch;
-int g_pl_scale_contract_check_limit, g_contract_check_limit, g_p2_tile_limit;
-int g_vpu_max_rows = 1;
-long long g_p2_tile_q16_checks, g_pl_scale_jobs, g_pl_scale_banks;
-bool g_p2_tile_contract_boundary_reached, g_pingpong_scheduler_enabled;
-bool g_p2_init_requested, g_active_matmul_pingpong, enable_env, disable_env;
-bool verify_ok = true;
+struct fpga_stage_totals_t { long long p3_mode_switches = 0; };
+bool g_pingpong_scheduler_enabled = false, g_p3_matmul_active = false;
+long long g_p3_mode_switches = 0;
 std::string events;
-const void * expected_source;
-bool env_flag_enabled(const char * name) {
-    return std::strcmp(name,"FPGA_PIPELINE_ENABLE") == 0 ? enable_env : disable_env;
-}
-template<class... T> void fpga_fatal(T...) { throw std::runtime_error("policy"); }
-bool fpga_enforce_p2_stream_mode(const char *) { events += 'E'; return true; }
-bool fpga_p2_cumulative_tile_limit_reached(long long count, int limit) { return limit > 0 && count >= limit; }
-bool fpga_p2_cumulative_tile_state_consistent(long long count, int limit, bool boundary) {
-    return count <= limit && boundary == (count == limit);
-}
-int packed_q8_group_blocks_for_rows(int, int) { return 1; }
-bool should_log_detail_run(uint32_t) { return true; }
-template<class... T> bool fpga_prepare_q8_tile_job(fpga_tile_job_t &, const ggml_tensor *, const void * ptr, T...) {
-    assert(ptr == expected_source); events += 'P'; return true;
-}
-template<class... T> bool fpga_submit_q8_tile_job(T...) { events += 'S'; return true; }
-template<class... T> bool fpga_wait_and_drain_q8_tile_job(T...) { events += 'D'; return true; }
-template<class... T> bool fpga_pl_scale_contract_verify_q16_tile(fpga_tile_job_t &, const void * ptr, T...) {
-    assert(ptr == expected_source); events += 'V'; return verify_ok;
-}
-bool fpga_accumulate_pl_scaled_q8_tile_job(fpga_tile_job_t &, std::vector<float> &, fpga_stage_totals_t *) {
-    assert(g_p2_tile_q16_checks == g_pl_scale_jobs); events += 'R'; return true;
-}
-template<class... T> bool fpga_p2_complete_tile_contract_boundary(T...) {
-    assert(events.back() == 'R' && g_p2_tile_q16_checks == g_p2_tile_limit);
-    events += 'B'; g_p2_tile_contract_boundary_reached = true; return true;
+unsigned last_mode = 99;
+bool stream_ok = true;
+bool fpga_enforce_p2_stream_mode(const char *, void *, uint32_t mode) {
+    events += 'E'; last_mode = mode; ++g_p3_mode_switches; return stream_ok;
 }
 template<class... T> bool fpga_hw_q8_0_matmul_dma_to_ip_pipelined(T...) { events += 'G'; return true; }
-'''
-code += runner
-code += '\nvoid configure() {\n' + policy + '\nif (g_pl_scale_contract_check_limit > 0) {\n' + reject_enable + '}\n}\n'
-code += '\nvoid active_route() {\n' + active + '\n}\n'
-code += r'''
-bool route(bool use_pl_scale_path, bool pl_scale_contract_active) {
+bool route(bool use_pl_scale_path, int64_t m, fpga_stage_totals_t * totals) {
     ggml_tensor tensor;
     const ggml_tensor * src0 = &tensor, * dst = &tensor;
     std::vector<block_q8_0_t> act_blocks_all(8);
     std::vector<float> act_scales, accum;
-    fpga_weight_cache_entry_t * weight_cache = nullptr;
-    const void * weight_data_base = expected_source;
-    fpga_stage_totals_t * totals = nullptr;
     const char * tensor_name = "test";
     int layer_id = 0;
-    int64_t k=32, n=1, m=1, nb=1;
+    int64_t k=32, n=1, nb=1;
 '''
-code += dispatch + "    events += 'C'; return true;\n}\n"
+code += dispatch
 code += r'''
-void reset(int limit=3) {
-    events.clear(); g_pl_scale_contract_check_limit=1; g_contract_check_limit=0;
-    g_p2_tile_limit=limit; g_p2_tile_q16_checks=0; g_pl_scale_jobs=0; g_pl_scale_banks=0;
-    g_p2_tile_contract_boundary_reached=false; verify_ok=true;
-}
 int main() {
-    for (int p2=0; p2<2; ++p2) for (int raw=0; raw<2; ++raw)
-    for (int qual=0; qual<2; ++qual) for (int en=0; en<2; ++en) for (int dis=0; dis<2; ++dis) {
-        g_p2_init_requested=p2; g_contract_check_limit=raw; g_pl_scale_contract_check_limit=qual;
-        enable_env=en; disable_env=dis;
-        bool rejected=false;
-        try { configure(); } catch (const std::runtime_error &) { rejected=true; }
-        assert(rejected == ((en && dis) || (dis && p2 && !raw && !qual) || (en && qual)));
-        for (int admitted=0; admitted<2; ++admitted) {
-            g_pingpong_scheduler_enabled=admitted; active_route();
-            assert(g_active_matmul_pingpong == (admitted && !raw && !qual));
+    for (int64_t m : {int64_t(1), int64_t(2), int64_t(7)}) {
+        for (int admitted = 0; admitted < 2; ++admitted) {
+            events.clear(); g_pingpong_scheduler_enabled = admitted; stream_ok = true;
+            fpga_stage_totals_t totals;
+            assert(route(true, m, &totals) == bool(admitted));
+            assert(events == (admitted ? "EG" : "E"));            // no serialized fallback
+            assert(last_mode == (m == 1 ? 1U : 0U));              // decode P3, prompt P2
+            assert(g_p3_matmul_active == (m == 1));
+            assert(totals.p3_mode_switches == 1);
         }
     }
-    int immutable=7; expected_source=&immutable;
-    reset(); g_pl_scale_contract_check_limit=0;
-    g_pingpong_scheduler_enabled=true; assert(route(true,false)); assert(events=="EG");
-    events.clear(); g_pingpong_scheduler_enabled=false; assert(!route(true,false)); assert(events=="E");
-    events.clear(); assert(route(false,false)); assert(events=="C");
-    for (int admitted=0; admitted<2; ++admitted) {
-        reset(1); g_pingpong_scheduler_enabled=admitted;
-        assert(route(true,true)); assert(events=="EEPSDVRB");
-    }
-    ggml_tensor src;
-    std::vector<block_q8_0_t> acts(8); std::vector<float> accum;
-    auto qualify = [&](int columns) {
-        return fpga_hw_q8_0_matmul_dma_to_ip_pl_scale_qualify_tiles(
-            &src, acts, nullptr, expected_source, nullptr, "test", 0, 32, 1, columns, 1, accum);
-    };
-    reset(3);
-    assert(qualify(2)); assert(events=="EPSDVRPSDVR" && g_p2_tile_q16_checks==2);
-    events.clear(); assert(qualify(4)); assert(events=="EPSDVRB" && g_p2_tile_q16_checks==3);
-    events.clear(); assert(!qualify(1)); assert(events.empty());
-    reset(); verify_ok=false; assert(!qualify(2)); assert(events=="EPSDV" && g_p2_tile_q16_checks==0);
-    reset(0); assert(!qualify(1)); assert(events.empty());
-    reset(); g_pl_scale_contract_check_limit=0; assert(!qualify(1)); assert(events.empty());
-    std::puts("PASS: production ping-pong policy, pre-mapping rejection, raw compatibility, exact qualification boundary/order");
+    events.clear(); g_pingpong_scheduler_enabled = true; stream_ok = false;
+    assert(!route(true, 1, nullptr) && events == "E");
+    events.clear(); stream_ok = true;
+    assert(!route(false, 1, nullptr) && events.empty());          // no raw route
+    std::puts("PASS: mandatory ping-pong route; decode P3 / prompt P2 stream mode; no raw or serialized fallback");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='fpga-scheduler-policy-') as tmp:

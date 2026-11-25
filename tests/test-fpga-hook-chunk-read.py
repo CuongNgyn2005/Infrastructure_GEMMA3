@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RAM-only TASK H checks: chunked poll-hook result read, bit-identical accumulation, lean ZDMA setup source order."""
+"""RAM-only checks: 32-row poll-hook result read, bit-identical accumulation, lean ZDMA setup source order."""
 
 import os
 from pathlib import Path
@@ -37,8 +37,6 @@ a_rows = accumulate.index("fpga_p2_result_read_rows(job, accum, 0, job.rows)")
 a_pub = accumulate.index("fpga_p2_result_read_publish(")
 assert a_check < a_rows < a_pub
 
-assert "p2_descriptor_commit && !lean_setup && !p2_zdma_verify_descriptor_commit(" in dma_copy_one
-assert "const bool lean_setup = g_zdma_lean_setup_enabled && !g_dma_trace_enabled && !p2_transfer_detail;" in dma_copy_one
 start = dma_copy_one.index("g_dma->ZDMA_CH_CTRL2 = ZDMA_CTRL2_START;")
 for needle in ('zdma_wait_channel_disabled(tag, "before_descriptor")', "zdma_total_byte_clear()",
                "fpga_p2_ddr_sync(src_ddr_off", "zdma_clear_isr_for_new_transfer(tag)"):
@@ -46,18 +44,22 @@ for needle in ('zdma_wait_channel_disabled(tag, "before_descriptor")', "zdma_tot
 word3 = dma_copy_one.index("g_dma->ZDMA_CH_DST_DSCR_WORD3 = 0U;")
 fence = dma_copy_one.index("mmio_fence();", word3)
 assert word3 < fence < start
-# Lean setup must not read the post-DMA diagnostics on the success path.
-assert "lean_setup ? 0U : g_dma->ZDMA_CH_TOTAL_BYTE" in dma_copy_one
-assert "(!lean_setup && vpu_is_mapped()) ? vpu_rd32(REG_STATUS)" in dma_copy_one
-assert "(!lean_setup && vpu_is_mapped()) ? vpu_rd32(REG_PROGRESS)" in dma_copy_one
-# The failure path keeps its full diagnostic reads.
+# No diagnostic MMIO between the last descriptor word and START.
+assert "g_dma->" not in dma_copy_one[word3 + len("g_dma->ZDMA_CH_DST_DSCR_WORD3 = 0U;"):start]
+assert "vpu_rd32(" not in dma_copy_one[:start]
+# Lean setup must not read post-DMA diagnostics on the success path.
+success = dma_copy_one[dma_copy_one.index("const long long t1"):]
+assert "ZDMA_CH_TOTAL_BYTE" not in success and "vpu_rd32(" not in success
+# The failure path keeps its full diagnostic reads and now prints them.
 fail_branch = dma_copy_one[dma_copy_one.index("if (!completed) {"):dma_copy_one.index("const long long t1")]
-assert "g_dma->ZDMA_CH_TOTAL_BYTE" in fail_branch and "vpu_rd32(REG_STATUS)" in fail_branch
+for needle in ("g_dma->ZDMA_CH_TOTAL_BYTE", "vpu_rd32(REG_STATUS)", "vpu_rd32(REG_PROGRESS)",
+               "total_bytes=0x%08x", "total_bytes_after_transfer, post_vpu_status, post_vpu_progress"):
+    assert needle in fail_branch, needle
 
-for message in ("FPGA_P2_HOOK_READ_ROWS must be 0, 16, 32, 64 or 128",
-                "FPGA_P2_HOOK_READ_ROWS requires FPGA_P2_WEIGHT_PREFETCH=1",
-                "FPGA_P2_CYCLE_PHASES=1 requires FPGA_P2_WEIGHT_PREFETCH=1"):
-    assert f'fpga_fatal("{message}")' in configure, message
+# The chunk size is fixed; the retired switches are no longer read.
+assert "static constexpr int P2_HOOK_READ_ROWS = 32;" in SOURCE
+for retired in ("FPGA_P2_HOOK_READ_ROWS", "FPGA_ZDMA_LEAN_SETUP", "FPGA_P2_WEIGHT_PREFETCH"):
+    assert retired not in SOURCE, retired
 
 # Scheduler: the three counters, chunk finish and phase marks exist only on the weight-prefetch path.
 assert "fpga_p2_prefetch_read_finish(read_ctx)" in scheduler
@@ -82,8 +84,7 @@ PRELUDE = r'''
 #include <vector>
 struct fpga_stage_totals_t {};
 long long g_p2_weight_prefetch_hook_reads = 0;
-int g_p2_hook_read_rows = 0;
-bool g_result_ldp_enabled = false;
+static constexpr int P2_HOOK_READ_ROWS = 32;
 template<class... T> void LOGE(T...) {}
 long long now_us() { static long long c = 0; return ++c; }
 long long p2_event_now_us() { return 7; }
@@ -103,7 +104,7 @@ bool fpga_p2_result_read_rows(fpga_tile_job_t &, std::vector<float> &, int b, in
     ranges.push_back({b, e});
     return true;
 }
-bool fpga_p2_result_read_publish(fpga_tile_job_t &, fpga_stage_totals_t *, long long us, long long, bool release) {
+bool fpga_p2_result_read_publish(fpga_tile_job_t &, fpga_stage_totals_t *, long long us, bool release) {
     ++publish_calls; publish_release = release; publish_read_us = us; return publish_ok;
 }
 ''' + chunked + "\n" + finish + r'''
@@ -116,10 +117,11 @@ int main() {
     int cases = 0;
     fpga_tile_job_t job;
     std::vector<float> accum(1);
-    for (int chunk : {16, 32, 64, 128}) for (int rows : {1, 15, 16, 17, 100, 255, 256}) {
+    constexpr int chunk = P2_HOOK_READ_ROWS;
+    for (int rows : {1, 15, 31, 32, 33, 100, 255, 256}) {
         const int full = (rows + chunk - 1) / chunk;
         for (int k = 0; k <= full + 2; ++k) {
-            reset(); g_p2_hook_read_rows = chunk; job.rows = rows;
+            reset(); job.rows = rows;
             fpga_p2_prefetch_read_ctx_t ctx{&job, &accum, nullptr, false, true};
             for (int i = 0; i < k; ++i) assert(fpga_p2_prefetch_read_poll_chunked(&ctx, i));
             const bool done_in_hook = ctx.done;
@@ -149,7 +151,7 @@ int main() {
         }
     }
     // Failure: rows fails on the second chunk.
-    reset(); g_p2_hook_read_rows = 16; job.rows = 100; fail_rows_call = 1;
+    reset(); job.rows = 100; fail_rows_call = 1;
     { fpga_p2_prefetch_read_ctx_t ctx{&job, &accum, nullptr, false, true};
       assert(fpga_p2_prefetch_read_poll_chunked(&ctx, 0));
       assert(!fpga_p2_prefetch_read_poll_chunked(&ctx, 1));
@@ -163,7 +165,7 @@ int main() {
       assert(!fpga_p2_prefetch_read_poll_chunked(&ctx, 1));
       assert(rows_calls == 0 && publish_calls == 0); }
     // Failure: publish fails at the last chunk, and in finish.
-    reset(); publish_ok = false; job.rows = 16;
+    reset(); publish_ok = false; job.rows = 32;
     { fpga_p2_prefetch_read_ctx_t ctx{&job, &accum, nullptr, false, true};
       assert(!fpga_p2_prefetch_read_poll_chunked(&ctx, 0));
       assert(publish_calls == 1 && g_p2_weight_prefetch_hook_reads == 0); }
@@ -176,11 +178,8 @@ int main() {
     { fpga_p2_prefetch_read_ctx_t ctx{&job, &accum, nullptr, false, true};
       assert(fpga_p2_prefetch_read_poll_chunked(&ctx, 0));
       assert(!fpga_p2_prefetch_read_finish(ctx)); assert(publish_calls == 0 && ctx.done && !ctx.ok); }
-    // Disabled chunking and precondition failures.
-    reset(); g_p2_hook_read_rows = 0; job.rows = 100;
-    { fpga_p2_prefetch_read_ctx_t ctx{&job, &accum, nullptr, false, true};
-      assert(!fpga_p2_prefetch_read_poll_chunked(&ctx, 0)); assert(!ctx.started && rows_calls == 0); }
-    g_p2_hook_read_rows = 32;
+    // Precondition failures.
+    reset(); job.rows = 100;
     { fpga_p2_prefetch_read_ctx_t ctx{&job, &accum, nullptr, false, true};
       assert(!fpga_p2_prefetch_read_finish(ctx)); }                  // !started
     { fpga_p2_prefetch_read_ctx_t ctx{nullptr, &accum, nullptr, false, true};
@@ -216,7 +215,7 @@ int main() {
             std::vector<float> full = init;
             const bool full_ok = fpga_p2_result_read_rows(job, full, 0, rows);
             assert(full_ok == (bad_row < 0));
-            for (int chunk : {16, 32, 64, 128}) {
+            for (int chunk : {P2_HOOK_READ_ROWS}) {
                 std::vector<float> got = init;
                 bool ok = true;
                 for (int b = 0; b < rows && ok; b += chunk) ok = fpga_p2_result_read_rows(job, got, b, std::min(rows, b + chunk));

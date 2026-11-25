@@ -23,7 +23,6 @@ def definition(signature):
 
 split = definition("static int fpga_p2_pack_helper_split(")
 scale_entries = definition("static size_t fpga_p2_pack_helper_scale_entries(")
-poll = definition("static bool fpga_p2_prefetch_read_poll(")
 promote = definition("static bool fpga_p2_weight_prefetch_promote(")
 dma = definition("static bool fpga_p2_weight_prefetch_dma(")
 configure = definition("static void fpga_host_offload_configure(")
@@ -35,16 +34,22 @@ ctx = SOURCE[SOURCE.rfind("typedef struct {", 0, ctx_end):ctx_end + len("} fpga_
 # The pre-readback failure branch also restores the bank; rindex selects the
 # normal post-DMA restoration. Runtime cases below cover both restoration paths.
 assert dma.index("vpu_select_banks(job.bank, run_bank)") < dma.index("vpu_rd32(REG_BANK)") < dma.index('"PREFETCH_W"') < dma.rindex("vpu_select_banks(run_bank, run_bank)")
-weight_call = submit.index('job.weight_bytes, "WEIGHT", poll_hook)')
+weight_call = submit.index('job.weight_bytes, "WEIGHT")')
 assert submit.rfind("if (weight_dma_needed &&", 0, weight_call) >= 0
 assert "const bool weight_dma_needed = !job.weight_bank_reused && !job.weight_prefetched;" in submit
 for forbidden in ("CTRL_CLEAR_DONE", "configure_vpu", "vpu_write_tile_descriptor", "SPU_PARAM_BASE", "SPU_SCRATCH_BASE"):
     assert forbidden not in dma
 assert scheduler.count("if (ready.job.group_beats == prepared.group_beats)") == 2
-assert scheduler.count("!weight_prefetch && lookahead.valid ? &poll_hook : nullptr") == 2
-assert "pipeline_route && overlap_results && g_p2_weight_prefetch_enabled" in scheduler
+assert "poll_hook" not in scheduler and "poll_hook" not in submit
+assert "const bool weight_prefetch = pipeline_route && overlap_results;" in scheduler
 assert "const bool pipeline_route = g_p2_pack_dma_pipeline_enabled && m == 1;" in scheduler
 assert "if (!weight_prefetch || !pipeline_prepared) prepared.weight_prefetched = false;" in scheduler
+# Host I/O policy is fixed: configure() reads only the cycle-phase switch.
+assert configure.count('"FPGA_') == 1 and 'flag("FPGA_P2_CYCLE_PHASES")' in configure
+assert "static constexpr int P2_PACK_HELPERS   = 3;" in SOURCE
+assert "static constexpr int P2_HOOK_READ_ROWS = 32;" in SOURCE
+assert "fpga_p2_pack_helper_split(pair_count, P2_PACK_HELPERS, begin, end)" in SOURCE
+assert "const fpga_dma_poll_hook_t hook = { fpga_p2_prefetch_read_poll_chunked, read_ctx };" in dma
 
 harness = r'''
 #include <algorithm>
@@ -72,25 +77,23 @@ struct fpga_p2_dma_pipeline_lookahead_t {
 };
 struct fpga_dma_poll_hook_t { bool (*fn)(void *, long long); void * context; };
 struct { bool created = false; } g_p2_pack_workers[3];
-bool g_p2_pack_offload_enabled, g_p2_weight_prefetch_enabled;
-bool g_pack_stp_enabled, g_result_ldp_enabled, g_uncached_write_probe_enabled;
-int g_p2_pack_helpers = 2;
+static constexpr int P2_PACK_HELPERS = 3, P2_HOOK_READ_ROWS = 32;
+static constexpr bool k_fpga_pair_mem_ops = false;
 long long g_p2_pack_offload_jobs, g_p2_pack_offload_helper_us[3], g_p2_pack_offload_finalize_wait_us;
 uint64_t g_p2_pack_offload_helper_bytes[3];
 long long g_p2_weight_prefetch_jobs, g_p2_weight_prefetch_consumed;
 uint64_t g_p2_weight_prefetch_bytes;
 long long g_p2_weight_prefetch_dma_us, g_p2_weight_prefetch_skip_geometry;
 long long g_p2_weight_prefetch_restarts, g_p2_weight_prefetch_hook_reads, g_p2_weight_prefetch_late_reads;
-bool g_zdma_lean_setup_enabled, g_p2_cycle_phases_enabled;
-int g_p2_hook_read_rows;
+bool g_p2_cycle_phases_enabled;
 long long g_p2_weight_prefetch_partial_reads, g_p2_cycle_count, g_zdma_lean_setup_desc;
 enum { P2CP_COUNT = 10 };
 long long g_p2_cycle_us[P2CP_COUNT];
-bool fpga_p2_prefetch_read_poll_chunked(void *, long long) { return true; }
-template<class... T> void LOGINIT(T...) {}
+template<class... T> void LOGI(T...) {}
 template<class... T> void LOGE(T...) {}
 template<class... T> void fpga_fatal(const char * msg, T...) { throw std::runtime_error(msg); }
-void fpga_q8_pack_set_pair_stores(bool) {}
+int pair_store_calls = 0;
+void fpga_q8_pack_set_pair_stores(bool enabled) { assert(enabled == k_fpga_pair_mem_ops); ++pair_store_calls; }
 constexpr uint64_t DDR_BASE_PHYS = 0x800000000ULL, LMM_BASE_PHYS = 0xa0000000ULL;
 constexpr uint32_t WEIGHT_BASE = 0x100000U, REG_BANK = 0x100U;
 int reads = 0, dma_calls = 0, bank_reads = 0, finalize_calls = 0;
@@ -114,6 +117,7 @@ bool fpga_p2_dma_pipeline_finalize(fpga_p2_dma_pipeline_lookahead_t & record) {
     if (finalize_ok) record.worker_submitted = record.worker1_submitted = record.worker2_submitted = false;
     return finalize_ok;
 }
+bool fpga_p2_prefetch_read_poll_chunked(void *, long long);
 bool fpga_dma_copy(uint64_t src, uint64_t dst, size_t bytes, const char * tag, const fpga_dma_poll_hook_t * hook) {
     ++dma_calls; events.push_back("dma");
     assert(src == DDR_BASE_PHYS + 0x100000 && dst == LMM_BASE_PHYS + WEIGHT_BASE && bytes == 256);
@@ -124,7 +128,18 @@ bool fpga_dma_copy(uint64_t src, uint64_t dst, size_t bytes, const char * tag, c
     return dma_ok;
 }
 '''
-harness += ctx + "\n" + split + "\n" + scale_entries + "\n" + poll + "\n" + promote + "\n" + dma + "\n" + configure
+consume_once = r'''
+bool fpga_p2_prefetch_read_poll_chunked(void * context, long long) {
+    auto * const ctx = static_cast<fpga_p2_prefetch_read_ctx_t *>(context);
+    if (!ctx || !ctx->job || !ctx->accum) return false;
+    if (ctx->done) return ctx->ok;
+    ctx->done = true;
+    ctx->ok = fpga_accumulate_pl_scaled_q8_tile_job(*ctx->job, *ctx->accum, ctx->totals, false);
+    if (ctx->ok) ++g_p2_weight_prefetch_hook_reads;
+    return ctx->ok;
+}
+'''
+harness += ctx + "\n" + consume_once + split + "\n" + scale_entries + "\n" + promote + "\n" + dma + "\n" + configure
 harness += r'''
 void reset_mocks() {
     reads = dma_calls = bank_reads = finalize_calls = mismatch = 0;
@@ -159,19 +174,6 @@ int main() {
     }
     fpga_tile_job_t prior, running;
     std::vector<float> accum(1);
-    for (bool ok : {false,true}) {
-        reset_mocks(); read_ok = ok;
-        fpga_p2_prefetch_read_ctx_t ctx{&prior, &accum, nullptr, false, true};
-        for (int i = 0; i < 5; ++i) assert(fpga_p2_prefetch_read_poll(&ctx, i) == ok);
-        assert(reads == 1 && ctx.done && ctx.ok == ok);
-        assert(g_p2_weight_prefetch_hook_reads == (ok ? 1 : 0));
-    }
-    fpga_p2_prefetch_read_ctx_t empty{nullptr, &accum, nullptr, false, true};
-    assert(!fpga_p2_prefetch_read_poll(&empty, 0));
-    assert(!fpga_p2_prefetch_read_poll(nullptr, 0));
-    empty.job = &prior; empty.accum = nullptr;
-    assert(!fpga_p2_prefetch_read_poll(&empty, 0));
-
     for (int fault = 0; fault < 12; ++fault) {
         reset_mocks();
         fpga_p2_dma_pipeline_lookahead_t ready;
@@ -212,27 +214,23 @@ int main() {
     ready.valid = false; finalize_ok = false;
     assert(!fpga_p2_weight_prefetch_promote(lookahead, ready) && lookahead.valid && !ready.valid);
 
+    // Retired switches are inert: garbage values must neither fail nor change the policy.
     for (const char * name : {"FPGA_P2_PACK_OFFLOAD","FPGA_P2_WEIGHT_PREFETCH","FPGA_P2_PACK_HELPERS",
-                              "FPGA_PACK_STP","FPGA_RESULT_LDP","FPGA_UNCACHED_WRITE_PROBE"}) unsetenv(name);
+                              "FPGA_PACK_STP","FPGA_RESULT_LDP","FPGA_ZDMA_LEAN_SETUP","FPGA_P2_HOOK_READ_ROWS",
+                              "FPGA_UNCACHED_WRITE_PROBE"}) setenv(name, "garbage", 1);
+    unsetenv("FPGA_P2_CYCLE_PHASES");
+    g_p2_weight_prefetch_jobs = g_p2_weight_prefetch_consumed = 5;
     fpga_host_offload_configure();
-    assert(!g_p2_weight_prefetch_enabled && g_p2_pack_helpers == 2);
+    assert(pair_store_calls == 1 && !g_p2_cycle_phases_enabled);
     assert(!g_p2_weight_prefetch_jobs && !g_p2_weight_prefetch_consumed && !g_p2_weight_prefetch_bytes);
-    setenv("FPGA_P2_WEIGHT_PREFETCH","1",1);
-    reject_config("FPGA_P2_WEIGHT_PREFETCH=1 requires FPGA_P2_PACK_OFFLOAD=1");
-    unsetenv("FPGA_P2_WEIGHT_PREFETCH"); setenv("FPGA_P2_PACK_HELPERS","3",1);
-    reject_config("FPGA_P2_PACK_HELPERS=3 requires FPGA_P2_PACK_OFFLOAD=1");
-    setenv("FPGA_P2_PACK_OFFLOAD","1",1); setenv("FPGA_P2_WEIGHT_PREFETCH","1",1);
-    for (const char * value : {"2","3"}) {
-        setenv("FPGA_P2_PACK_HELPERS",value,1); fpga_host_offload_configure();
-        assert(g_p2_weight_prefetch_enabled && g_p2_pack_helpers == value[0]-'0');
-    }
-    for (const char * value : {"","1","4","03","3x"," 3","2 "}) {
-        setenv("FPGA_P2_PACK_HELPERS",value,1);
-        reject_config("FPGA_P2_PACK_HELPERS must be 2 or 3");
-    }
+    setenv("FPGA_P2_CYCLE_PHASES", "1", 1); fpga_host_offload_configure(); assert(g_p2_cycle_phases_enabled);
+    setenv("FPGA_P2_CYCLE_PHASES", "0", 1); fpga_host_offload_configure(); assert(!g_p2_cycle_phases_enabled);
+    setenv("FPGA_P2_CYCLE_PHASES", "yes", 1);
+    reject_config("%s must be 0 or 1");
+    unsetenv("FPGA_P2_CYCLE_PHASES");
     g_p2_pack_workers[2].created = true;
     reject_config("Host I/O policy cannot change while pack helpers exist");
-    std::printf("PASS test-fpga-weight-prefetch (%d split cases; hook once/failure; bank restoration; promote; strict config)\n", cases);
+    std::printf("PASS test-fpga-weight-prefetch (%d split cases; hook once/failure; bank restoration; promote; fixed config)\n", cases);
 }
 '''
 with tempfile.TemporaryDirectory(prefix="fpga-weight-prefetch-") as tmp:

@@ -2,10 +2,6 @@
 
 #include "ggml.h"
 
-#ifdef USE_FPGA
-#include "../ggml/src/ggml-cpu/fpga_host.h"
-#endif
-
 #include <array>
 #include <cinttypes>
 #include <cstring>
@@ -15,19 +11,6 @@
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
-
-// P2 qualification deliberately executes model GEMVs through ZDMA/VPU. Validate the
-// active GGUF during model loading first, so a malformed Q8 scale cannot waste
-// a long board run or be misdiagnosed as a transfer/IP failure. This remains
-// opt-in at the runtime level: P2 PL-scale qualification.
-static bool llama_fpga_source_validation_required() {
-    const char * const pl_scale_contract = std::getenv("FPGA_PL_SCALE_CONTRACT_CHECK");
-    if (pl_scale_contract && std::strtol(pl_scale_contract, nullptr, 0) > 0) {
-        return true;
-    }
-
-    return false;
-}
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -491,10 +474,6 @@ llama_model_loader::llama_model_loader(
         bool check_tensors,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p) {
-    if (!check_tensors && llama_fpga_source_validation_required()) {
-        check_tensors = true;
-        LLAMA_LOG_INFO("%s: enabling tensor validation for FPGA P2 qualification before accelerator execution\n", __func__);
-    }
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -946,7 +925,6 @@ bool llama_model_loader::load_all_data(
         llama_progress_callback progress_callback,
         void * progress_callback_user_data) {
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
-    const bool fpga_source_validation_required = llama_fpga_source_validation_required();
 
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
@@ -1170,17 +1148,6 @@ bool llama_model_loader::load_all_data(
             return false;
         }
     }
-
-#ifdef USE_FPGA
-    if (fpga_source_validation_required && size_done >= size_data) {
-        // Reaching this point proves that all async ggml_validate_row_data()
-        // futures completed, final progress was accepted, and the model load
-        // was not cancelled. Tell the deferred qualification host that mapping
-        // MY_IP/ZDMA is now safe for this process.
-        fpga_mark_model_tensor_validation_passed();
-        LLAMA_LOG_INFO("%s: FPGA P2 qualification tensor-validation handshake complete\n", __func__);
-    }
-#endif
 
     return true;
 }

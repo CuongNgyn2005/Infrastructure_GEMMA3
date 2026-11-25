@@ -312,10 +312,7 @@ int main(int argc, char ** argv) {
     const int64_t fpga_init_start_us = timing_us();
 #ifdef USE_FPGA
     {
-        // Qualification cần loader kiểm tra tensor trước khi host ánh xạ UIO.
-        if (fpga_p2_contract_check_requested()) {
-            LOG_INF("%s: FPGA P2 qualification requested; host hardware initialization deferred until model tensor validation completes\n", __func__);
-        } else if (fpga_init() == 0) {
+        if (fpga_init() == 0) {
             LOG_INF("%s: FPGA host initialized (UIO mode)\n", __func__);
         } else {
             LOG_WRN("%s: FPGA host init failed; FPGA execution is unavailable and the configured fail-closed policy applies\n",

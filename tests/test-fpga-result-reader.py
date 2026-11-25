@@ -17,13 +17,11 @@ harness = r'''
 #include <stdexcept>
 #include <initializer_list>
 alignas(16) static uint8_t memory[64];
-static unsigned markers = 0;
 [[noreturn]] static void fpga_fatal(const char *, ...) { throw std::runtime_error("reject"); }
 static uint8_t * ddr_ptr(uint32_t off, size_t bytes) {
     if (off > sizeof(memory) || bytes > sizeof(memory) - off) fpga_fatal("range");
     return memory + off;
 }
-static void fpga_p2_boundary_marker(const char *, ...) { ++markers; }
 '''
 harness += reader
 harness += r'''
@@ -45,15 +43,11 @@ int main() {
             for (unsigned b = 0; b < 8; ++b)
                 memory[off + 2 + b] = static_cast<uint8_t>(bits >> (b * 8));
             // Remaining bytes deliberately retain arbitrary padding.
-            for (bool trace : {false, true}) {
-                markers = 0;
-                uint16_t actual_id = 0;
-                assert(ddr_read_spu_q16_row(off, &actual_id, trace) == expected);
-                assert(actual_id == id);
-                assert(markers == (trace ? 6U : 0U));
-                assert(ddr_read_spu_q16_row(off, nullptr, trace) == expected);
-                ++cases;
-            }
+            uint16_t actual_id = 0;
+            assert(ddr_read_spu_q16_row(off, &actual_id) == expected);
+            assert(actual_id == id);
+            assert(ddr_read_spu_q16_row(off, nullptr) == expected);
+            ++cases;
         }
     }
     for (uint32_t off : {1U, 2U, 3U, 52U, UINT32_MAX}) {
@@ -62,7 +56,7 @@ int main() {
         catch (const std::runtime_error &) { rejected = true; }
         assert(rejected);
     }
-    printf("PASS: %u reader cases; signed extremes, padding, aligned/scalar/trace paths, null ID, bounds rejection\n", cases);
+    printf("PASS: %u reader cases; signed extremes, padding, aligned/scalar paths, null ID, bounds rejection\n", cases);
 }
 '''
 with tempfile.TemporaryDirectory(prefix="fpga-reader-") as directory:
